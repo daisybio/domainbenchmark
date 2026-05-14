@@ -185,7 +185,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 *.log*
-work*/
+work/
 *.sqlite*
 *.fasta
 *.tsv
@@ -202,7 +202,7 @@ Miniforge3.sh
 old_nf/
 mapra.yml
 test_out*/*
-work*/*
+work/*
 other_scripts/*
 test-eval-env/*
 *.txt
