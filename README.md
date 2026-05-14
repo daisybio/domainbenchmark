@@ -67,10 +67,17 @@ flowchart LR
 ### Single database
 
 ```bash
+<<<<<<< HEAD
 nextflow run main.nf \
     -profile <singularity/docker/conda> \
     --db /path/to/database_split \
     --outdir results
+=======
+nextflow run daisybio/domainbenchmark \
+   -profile <docker/singularity/.../institute> \
+   --input samplesheet.csv \
+   --outdir <OUTDIR>
+>>>>>>> TEMPLATE
 ```
 
 ### Multiple databases (scatter + combined evaluation)

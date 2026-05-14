@@ -93,7 +93,7 @@
             },
             "mentions": [
                 {
-                    "@id": "#43ca37cb-0291-49a3-bc02-1e773d4116da"
+                    "@id": "#c0ece652-ec4d-451c-8103-9df814ebd1f5"
                 }
             ],
             "name": "daisybio/domainbenchmark"
@@ -132,7 +132,7 @@
                 }
             ],
             "dateCreated": "",
-            "dateModified": "2026-05-04T16:29:51Z",
+            "dateModified": "2026-05-14T15:54:22Z",
             "dct:conformsTo": "https://bioschemas.org/profiles/ComputationalWorkflow/1.0-RELEASE/",
             "keywords": [
                 "nf-core",
@@ -171,11 +171,11 @@
             "version": "!>=25.10.4"
         },
         {
-            "@id": "#43ca37cb-0291-49a3-bc02-1e773d4116da",
+            "@id": "#c0ece652-ec4d-451c-8103-9df814ebd1f5",
             "@type": "TestSuite",
             "instance": [
                 {
-                    "@id": "#7100362e-fbfc-4800-86f7-db1d7b4f3a6c"
+                    "@id": "#69dfa38d-8251-412f-b674-be7dcfe9ad38"
                 }
             ],
             "mainEntity": {
@@ -184,7 +184,7 @@
             "name": "Test suite for daisybio/domainbenchmark"
         },
         {
-            "@id": "#7100362e-fbfc-4800-86f7-db1d7b4f3a6c",
+            "@id": "#69dfa38d-8251-412f-b674-be7dcfe9ad38",
             "@type": "TestInstance",
             "name": "GitHub Actions workflow for testing daisybio/domainbenchmark",
             "resource": "repos/daisybio/domainbenchmark/actions/workflows/nf-test.yml",
@@ -305,6 +305,7 @@
         {
             "@id": "https://orcid.org/0009-0003-3891-2005",
             "@type": "Person",
+            "email": "konstantin.pelz@tum.de",
             "name": "Konstantin Pelz"
         },
         {
