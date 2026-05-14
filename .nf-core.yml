@@ -30,11 +30,8 @@ template:
   name: domainbenchmark
   description: Benchmarking Pipeline for Domain-Domain Interaction Prediction Methods
   author: Konstantin Pelz, Chiara Thomas, Christian Romberg
-  description: Benchmarking Pipeline for Domain-Domain Interaction Prediction Methods
   force: false
   is_nfcore: false
-  name: domainbenchmark
-  org: daisybio
   outdir: .
   skip_features:
     - igenomes
