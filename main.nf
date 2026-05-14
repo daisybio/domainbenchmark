@@ -13,7 +13,7 @@
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-//include { COBINET-BENCHMARKING-PIPELINE  } from './workflows/cobinet-benchmarking-pipeline'
+include { COBINET-BENCHMARKING-PIPELINE  } from './workflows/cobinet-benchmarking-pipeline'
 include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
 include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
 include { PER_DB_BENCHMARK } from './subworkflows/local/per_db_benchmark/main.nf'
