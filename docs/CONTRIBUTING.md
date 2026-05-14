@@ -31,8 +31,6 @@ To contribute code to any nf-core pipeline:
 
 If you are not used to this workflow with Git, see the [GitHub documentation](https://help.github.com/en/github/collaborating-with-issues-and-pull-requests) or [Git resources](https://try.github.io/) for more information.
 
-
-
 ### GitHub Codespaces
 
 You can contribute to daisybio/cobinet-benchmarking-pipeline without installing a local development environment on your machine by using [GitHub Codespaces](https://github.com/codespaces).
