@@ -24,6 +24,14 @@ include { GRAPH_MODEL                                   } from '../../../modules
 include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 
 
+def csvToList(s) {
+    s instanceof List ? s.findAll { it } : (s ? s.tokenize(',')*.trim().findAll { it } : [])
+}
+
+def powerSet(List lst) {
+    lst.inject([[]] as List) { acc, e -> acc + acc.collect { it + e } }
+}
+
 workflow PER_DB_BENCHMARK {
 
     take:
@@ -33,8 +41,6 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         // Feature filtering (constant per pipeline run)
         // ---------------------------------------------------------------
-        def csvToList = { s -> s instanceof List ? s.findAll { it } : (s ? s.tokenize(',')*.trim().findAll { it } : []) }
-        def powerSet  = { List lst -> lst.inject([[]] as List) { acc, e -> acc + acc.collect { it + e } } }
 
         def skip_features        = csvToList(params.skip)
         def all_features         = csvToList(params.machine_learning_features)

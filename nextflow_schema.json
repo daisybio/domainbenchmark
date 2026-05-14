@@ -42,15 +42,6 @@
                     "default": "./results",
                     "fa_icon": "fas fa-folder-open"
                 },
-                "publish_dir_mode": {
-                    "type": "string",
-                    "default": "copy",
-                    "description": "Method used to save pipeline results to output directory.",
-                    "help_text": "See https://www.nextflow.io/docs/latest/process.html#publishdir for details.",
-                    "fa_icon": "fas fa-copy",
-                    "enum": ["symlink", "rellink", "link", "copy", "copyNoFollow", "move"],
-                    "hidden": true
-                },
                 "email": {
                     "type": "string",
                     "description": "Email address for completion summary.",
