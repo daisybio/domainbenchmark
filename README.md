@@ -130,8 +130,8 @@ CI and by `nf-test`.
 | `--outdir` | `./results` | Output directory. |
 | `--modeljson` | `${projectDir}/assets` | Directory of model hyperparameter JSONs. |
 | `--skip` | `''` | Comma-separated feature/model names to skip. |
-| `--graph_models` | `[kgiddi, ddiparsimony, kgiddi_random]` | Graph models to run. |
-| `--machine_learning_features` | `[aacomp, aaencode, prott5_*, esm3_*, esmc_*]` | Feature encodings to compute. |
+| `--graph_models` | `kgiddi, ddiparsimony, kgiddi_random` | Graph models to run. |
+| `--machine_learning_features` | `aacomp, aaencode, prott5_*, esm3_*, esmc_*` | Feature encodings to compute. |
 | `--max_machine_learning_features` | `2` | Max features combined per ML run. |
 | `--seed` | `42` | Global RNG seed. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
