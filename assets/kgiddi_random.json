@@ -1,0 +1,15 @@
+{
+    "model_name": "kgiddi",
+    "data": ["DDI", "PD", "PPI", "PGO"],
+    "parameter_list": {
+        "chi_square_cutoff": [0.1, 0.3, 0.5, 0.7, 0.9, 1.0],
+        "bicluster_cutoff": [0.5, 0.6, 0.7, 0.8],
+        "threshold": 3,
+        "go_graph": "/nfs/home/students/c.thomas/CoBiNet/go-basic.obo"
+    },
+    "permutation": true,
+    "optimized": {
+        "chi_square_cutoff": 0.9,
+        "bicluster_cutoff": 0.6
+    }
+}

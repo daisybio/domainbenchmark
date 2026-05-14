@@ -10,24 +10,46 @@
             "type": "object",
             "fa_icon": "fas fa-terminal",
             "description": "Define where the pipeline should find input data and save output data.",
-            "required": ["input", "outdir"],
+            "required": ["outdir"],
             "properties": {
-                "input": {
+                 "input": {
                     "type": "string",
                     "format": "file-path",
                     "exists": true,
                     "schema": "assets/schema_input.json",
                     "mimetype": "text/csv",
                     "pattern": "^\\S+\\.csv$",
-                    "description": "Path to comma-separated file containing information about the samples in the experiment.",
-                    "help_text": "You will need to create a design file with information about the samples in your experiment before running the pipeline. Use this parameter to specify its location. It has to be a comma-separated file with 3 columns, and a header row.",
+                    "description": "Path to comma-separated samplesheet listing database splits to run.",
+                    "help_text": "Optional. CSV with one row per database split (columns: id, db_path). Use this OR --db / --db_list, not both.",
                     "fa_icon": "fas fa-file-csv"
+                },
+                "db": {
+                    "type": "string",
+                    "format": "directory-path",
+                    "description": "Path to a single database split directory containing train.sqlite3, test.sqlite3, optimization.sqlite3.",
+                    "fa_icon": "fas fa-folder"
+                },
+                "db_list": {
+                    "type": "string",
+                    "description": "Comma-separated list of database split directories to run as a scatter.",
+                    "help_text": "Mutually exclusive with --db. Each entry must contain train.sqlite3 / test.sqlite3 / optimization.sqlite3.",
+                    "fa_icon": "fas fa-folder-tree"
                 },
                 "outdir": {
                     "type": "string",
                     "format": "directory-path",
-                    "description": "The output directory where the results will be saved. You have to use absolute paths to storage on Cloud infrastructure.",
+                    "description": "The output directory where the results will be saved.",
+                    "default": "./results",
                     "fa_icon": "fas fa-folder-open"
+                },
+                "publish_dir_mode": {
+                    "type": "string",
+                    "default": "copy",
+                    "description": "Method used to save pipeline results to output directory.",
+                    "help_text": "See https://www.nextflow.io/docs/latest/process.html#publishdir for details.",
+                    "fa_icon": "fas fa-copy",
+                    "enum": ["symlink", "rellink", "link", "copy", "copyNoFollow", "move"],
+                    "hidden": true
                 },
                 "email": {
                     "type": "string",
@@ -35,11 +57,68 @@
                     "fa_icon": "fas fa-envelope",
                     "help_text": "Set this parameter to your e-mail address to get a summary e-mail with details of the run sent to you when the workflow exits. If set in your user config file (`~/.nextflow/config`) then you don't need to specify this on the command line for every run.",
                     "pattern": "^([a-zA-Z0-9_\\-\\.]+)@([a-zA-Z0-9_\\-\\.]+)\\.([a-zA-Z]{2,5})$"
-                },
-                "multiqc_title": {
+                }
+            }
+        },
+        "pipeline_options": {
+            "title": "Pipeline behaviour options",
+            "type": "object",
+            "fa_icon": "fas fa-cogs",
+            "description": "Toggles for which stages, models, and features run.",
+            "properties": {
+                "skip": {
                     "type": "string",
-                    "description": "MultiQC report title. Printed as page header, used for filename if not otherwise specified.",
-                    "fa_icon": "fas fa-file-signature"
+                    "description": "Comma-separated list of feature or graph-model names to skip.",
+                    "help_text": "Names must match either entries in --machine_learning_features or --graph_models.",
+                    "fa_icon": "fas fa-forward"
+                },
+                "graph_models": {
+                    "type": "string",
+                    "default": "kgiddi,ddiparsimony,kgiddi_random",
+                    "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
+                    "description": "Comma-separated list of graph-based DDI models to run.",
+                    "fa_icon": "fas fa-project-diagram"
+                },
+                "machine_learning_features": {
+                    "type": "string",
+                    "default": "aacomp,aaencode,prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
+                    "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
+                    "description": "Comma-separated list of feature encodings to compute and feed into the ML / RF classifiers.",
+                    "fa_icon": "fas fa-vector-square"
+                },
+                "large_features": {
+                    "type": "string",
+                    "default": "prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
+                    "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
+                    "description": "Comma-separated list of features whose embedding dim makes ML / RF tasks need the heavy GPU label (process_gpu_large).",
+                    "fa_icon": "fas fa-weight-hanging"
+                },
+                "max_machine_learning_features": {
+                    "type": "integer",
+                    "default": 2,
+                    "minimum": 1,
+                    "description": "Maximum number of feature encodings combined per ML run (powerset cap).",
+                    "fa_icon": "fas fa-layer-group"
+                },
+                "modeljson": {
+                    "type": "string",
+                    "format": "directory-path",
+                    "description": "Directory containing per-model hyperparameter JSON files.",
+                    "help_text": "Filename must match the model_name field inside the JSON. Defaults to ${projectDir}/assets.",
+                    "fa_icon": "fas fa-file-code",
+                    "hidden": true
+                },
+                "old_report": {
+                    "type": "string",
+                    "default": "evaluation",
+                    "description": "Path to a prior evaluation/ directory used as a baseline for the MultiQC report.",
+                    "fa_icon": "fas fa-history"
+                },
+                "seed": {
+                    "type": "integer",
+                    "default": 42,
+                    "description": "Global RNG seed (numpy / torch / cuML).",
+                    "fa_icon": "fas fa-dice"
                 }
             }
         },

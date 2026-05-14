@@ -35,6 +35,9 @@ workflow PIPELINE_INITIALISATION {
     help              // boolean: Display help message and exit
     help_full         // boolean: Show the full help message
     show_hidden       // boolean: Show hidden parameters in the help message
+    // pipeline-specific input
+    db_list           //  string: Comma-separated list of databases to benchmark
+    db                //  string: Single database to benchmark (alternative to --db_list or --input samplesheet)
 
     main:
 
@@ -82,31 +85,40 @@ workflow PIPELINE_INITIALISATION {
     )
 
     //
-    // Create channel from input file provided through params.input
+    // Custom tests
     //
-
-    channel
-        .fromList(samplesheetToList(input, "${projectDir}/assets/schema_input.json"))
-        .map {
-            meta, fastq_1, fastq_2 ->
-                if (!fastq_2) {
-                    return [ meta.id, meta + [ single_end:true ], [ fastq_1 ] ]
-                } else {
-                    return [ meta.id, meta + [ single_end:false ], [ fastq_1, fastq_2 ] ]
-                }
-        }
-        .groupTuple()
-        .map { samplesheet ->
-            validateInputSamplesheet(samplesheet)
-        }
-        .map {
-            meta, fastqs ->
-                return [ meta, fastqs.flatten() ]
-        }
-        .set { ch_samplesheet }
+    def db_ch
+    if (params.input) {
+        db_ch = Channel
+            .fromPath(params.input, checkIfExists: true)
+            .splitCsv(header: true)
+            .map { row ->
+                def db_path = file(row.db_path, checkIfExists: true)
+                def id      = row.id ?: db_path.getName()
+                tuple([ id: id, db: id ], db_path)
+            }
+    } else if (params.db_list) {
+        def items = params.db_list instanceof List
+            ? params.db_list
+            : params.db_list.tokenize(',')*.trim().findAll { it }
+        db_ch = Channel
+            .fromList(items)
+            .map { p ->
+                def db_path = file(p, checkIfExists: true)
+                tuple([ id: db_path.getName(), db: db_path.getName() ], db_path)
+            }
+    } else if (params.db) {
+        def db_path = file(params.db, checkIfExists: true)
+        db_ch = Channel.value(tuple(
+            [ id: db_path.getName(), db: db_path.getName() ],
+            db_path
+        ))
+    } else {
+        error "No input provided: set --input <samplesheet.csv>, --db_list <csv>, or --db <path>"
+    }
 
     emit:
-    samplesheet = ch_samplesheet
+    db_ch       = db_ch
     versions    = ch_versions
 }
 

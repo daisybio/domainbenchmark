@@ -1,0 +1,42 @@
+FROM mambaorg/micromamba:1.5.10
+
+# Build/tag as konstantinpelz/cobinet-general:1.0.0 — synced with environments/general.yml
+LABEL org.opencontainers.image.source="https://github.com/cobinet/cobinet"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.description="cobinet general CPU container (multiqc, scikit-learn, networkx, h5py)"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Install procps (provides `ps`) at system level for Nextflow metrics collection
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends procps \
+ && rm -rf /var/lib/apt/lists/*
+USER $MAMBA_USER
+
+ENV ENV_NAME=general
+ENV PATH=/opt/conda/envs/${ENV_NAME}/bin:$PATH
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN micromamba create -y -n ${ENV_NAME} \
+    -c conda-forge -c bioconda \
+    python=3.13.3 \
+    numpy=2.2.6 \
+    pandas=2.3.0 \
+    scipy=1.16.3 \
+    h5py=3.14.0 \
+    scikit-learn=1.7.2 \
+    matplotlib=3.10.8 \
+    networkx=3.5 \
+    sqlite=3.50.4 \
+    goatools=1.5.2 \
+    multiqc=1.32 \
+    tqdm \
+    psutil \
+    pyarrow \
+    fastparquet \
+ && micromamba clean --all --yes
+
+ENTRYPOINT ["micromamba", "run", "-n", "general"]
+CMD ["python"]

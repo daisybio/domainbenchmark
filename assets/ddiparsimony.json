@@ -1,0 +1,27 @@
+{
+    "model_name": "ddiparsimony",
+    "data": [
+        "PPI",
+        "DDI",
+        "PD"
+    ],
+    "parameter_list": {
+        "reliability_rate": [
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+            0.9,
+            1.0
+        ],
+        "pw_score_threshold": [
+            0.7,
+            0.8,
+            0.9
+        ]
+    },
+    "optimized": {
+        "reliability_rate": 0.5,
+        "pw_cutoff": 0.7
+    }
+}

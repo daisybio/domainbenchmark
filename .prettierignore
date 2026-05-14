@@ -12,3 +12,25 @@ bin/
 ro-crate-metadata.json
 modules/nf-core/
 subworkflows/nf-core/
+
+.code-review-graph/
+.ruff_cache/
+.venv/
+
+# Lock files
+*.lock
+
+# Test data + fixtures
+tests/data/
+
+# Build artefacts
+docker/build/
+*.sif
+*.img
+
+# Conda envs that prettier mangles
+environments/*.yml
+modules/local/**/environment.yml
+
+# CHANGELOG handled manually
+CHANGELOG.md

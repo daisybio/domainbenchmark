@@ -1,0 +1,47 @@
+FROM mambaorg/micromamba:1.5.10
+
+# Build/tag as konstantinpelz/cobinet-ml:1.0.0 — synced with environments/ml.yml
+LABEL org.opencontainers.image.source="https://github.com/cobinet/cobinet"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.description="cobinet GPU container (CUDA 12.8, cuML 26.02, torch 2.7, skorch)"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Install procps (provides `ps`) at system level for Nextflow metrics collection
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends procps \
+ && rm -rf /var/lib/apt/lists/*
+USER $MAMBA_USER
+
+ENV ENV_NAME=ml
+ENV PATH=/opt/conda/envs/${ENV_NAME}/bin:$PATH
+ENV CONDA_PREFIX=/opt/conda/envs/${ENV_NAME}
+ENV CUPY_CUDA_PATH=/opt/conda/envs/${ENV_NAME}
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_DEFAULT_TIMEOUT=100
+
+ENV NVIDIA_TF32_OVERRIDE=0
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+RUN micromamba create -y -n ${ENV_NAME} -c rapidsai -c conda-forge -c nvidia \
+    python=3.12.2 \
+    numpy=2.2.6 \
+    pandas=2.2.3 \
+    h5py=3.14.0 \
+    scikit-learn=1.6.1 \
+    cuml=26.02.00 \
+    cuda-version=12.8 \
+    cudnn=9 \
+    pip=25.0 \
+    && micromamba clean --all --yes
+
+RUN micromamba run -n ${ENV_NAME} pip install \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    --extra-index-url https://pypi.org/simple \
+    torch==2.7.0 \
+    skorch==1.1.0
+
+ENTRYPOINT ["micromamba", "run", "-n", "ml"]
+CMD ["python"]

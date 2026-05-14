@@ -13,9 +13,11 @@
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-include { COBINET-BENCHMARKING-PIPELINE  } from './workflows/cobinet-benchmarking-pipeline'
+//include { COBINET-BENCHMARKING-PIPELINE  } from './workflows/cobinet-benchmarking-pipeline'
 include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
 include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
+include { PER_DB_BENCHMARK } from './subworkflows/local/per_db_benchmark/main.nf'
+include { AGGREGATE_EVAL   } from './subworkflows/local/aggregate_eval/main.nf'
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     NAMED WORKFLOWS FOR PIPELINE
@@ -28,22 +30,16 @@ include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_cobi
 workflow DAISYBIO_COBINET-BENCHMARKING-PIPELINE {
 
     take:
-    samplesheet // channel: samplesheet read in from --input
+        db_ch   // channel: tuple(meta, db_path)
 
     main:
+        PER_DB_BENCHMARK(db_ch)
+        AGGREGATE_EVAL(PER_DB_BENCHMARK.out.report)
 
-    //
-    // WORKFLOW: Run pipeline
-    //
-    COBINET-BENCHMARKING-PIPELINE (
-        samplesheet,
-        params.multiqc_config,
-        params.multiqc_logo,
-        params.multiqc_methods_description,
-        params.outdir,
-    )
     emit:
-    multiqc_report = COBINET-BENCHMARKING-PIPELINE.out.multiqc_report // channel: /path/to/multiqc_report.html
+        per_db_report = PER_DB_BENCHMARK.out.report
+        combined      = AGGREGATE_EVAL.out.report
+        versions      = PER_DB_BENCHMARK.out.versions.mix(AGGREGATE_EVAL.out.versions)
 }
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -67,13 +63,16 @@ workflow {
         params.help,
         params.help_full,
         params.show_hidden
+        // pipeline-specific input
+        params.db_list,
+        params.db
     )
 
     //
     // WORKFLOW: Run main workflow
     //
     DAISYBIO_COBINET-BENCHMARKING-PIPELINE (
-        PIPELINE_INITIALISATION.out.samplesheet
+        PIPELINE_INITIALISATION.out.db_ch
     )
     //
     // SUBWORKFLOW: Run completion tasks
@@ -84,7 +83,7 @@ workflow {
         params.plaintext_email,
         params.outdir,
         params.monochrome_logs,
-        DAISYBIO_COBINET-BENCHMARKING-PIPELINE.out.multiqc_report
+        DAISYBIO_COBINET-BENCHMARKING-PIPELINE.out.combined
     )
 }
 
