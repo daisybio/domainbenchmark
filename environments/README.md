@@ -1,4 +1,4 @@
-# daisybio/cobinet-benchmarking-pipeline conda environments
+# daisybio/domainbenchmark conda environments
 
 Two environments are the single source of truth for runtime dependencies.
 

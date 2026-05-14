@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-CoBiNet is a Nextflow pipeline for benchmarking domain-domain interaction (DDIs) methods with protein data. It runs ML classifiers and graph-based models across multiple database splits, then produces a combined MultiQC evaluation report.
+DomainBenchmark is a Nextflow pipeline for benchmarking domain-domain interaction (DDIs) methods with protein data. It runs ML classifiers and graph-based models across multiple database splits, then produces a combined MultiQC evaluation report.
 
 - Root (`main.nf` / `wrapper.nf`) — training, graph models, evaluation.
 

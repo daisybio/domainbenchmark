@@ -1,7 +1,7 @@
 FROM mambaorg/micromamba:1.5.10
 
 # Build/tag as konstantinpelz/cobinet-ml:1.0.0 — synced with environments/ml.yml
-LABEL org.opencontainers.image.source="https://github.com/cobinet/cobinet"
+LABEL org.opencontainers.image.source="https://github.com/daisybio/domainbenchmark"
 LABEL org.opencontainers.image.version="1.0.0"
 LABEL org.opencontainers.image.description="cobinet GPU container (CUDA 12.8, cuML 26.02, torch 2.7, skorch)"
 

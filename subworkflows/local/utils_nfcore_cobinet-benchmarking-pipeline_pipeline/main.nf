@@ -1,5 +1,5 @@
 //
-// Subworkflow with functionality specific to the daisybio/cobinet-benchmarking-pipeline pipeline
+// Subworkflow with functionality specific to the daisybio/domainbenchmark pipeline
 //
 
 /*

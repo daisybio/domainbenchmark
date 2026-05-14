@@ -1,7 +1,7 @@
 FROM mambaorg/micromamba:1.5.10
 
 # Build/tag as konstantinpelz/cobinet-general:1.0.0 — synced with environments/general.yml
-LABEL org.opencontainers.image.source="https://github.com/cobinet/cobinet"
+LABEL org.opencontainers.image.source="https://github.com/daisybio/domainbenchmark"
 LABEL org.opencontainers.image.version="1.0.0"
 LABEL org.opencontainers.image.description="cobinet general CPU container (multiqc, scikit-learn, networkx, h5py)"
 

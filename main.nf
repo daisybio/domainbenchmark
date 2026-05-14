@@ -1,9 +1,9 @@
 #!/usr/bin/env nextflow
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    daisybio/cobinet-benchmarking-pipeline
+    daisybio/domainbenchmark
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Github : https://github.com/daisybio/cobinet-benchmarking-pipeline
+    Github : https://github.com/daisybio/domainbenchmark
 ----------------------------------------------------------------------------------------
 */
 
@@ -13,9 +13,9 @@
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-include { COBINET_BENCHMARKING_PIPELINE  } from './workflows/cobinet-benchmarking-pipeline'
-include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
-include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
+include { DOMAINBENCHMARK  } from './workflows/domainbenchmark'
+include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_domainbenchmark_pipeline'
+include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_domainbenchmark_pipeline'
 include { PER_DB_BENCHMARK } from './subworkflows/local/per_db_benchmark/main.nf'
 include { AGGREGATE_EVAL   } from './subworkflows/local/aggregate_eval/main.nf'
 /*
@@ -27,7 +27,7 @@ include { AGGREGATE_EVAL   } from './subworkflows/local/aggregate_eval/main.nf'
 //
 // WORKFLOW: Run main analysis pipeline depending on type of input
 //
-workflow DAISYBIO_COBINET_BENCHMARKING_PIPELINE {
+workflow DAISYBIO_DOMAINBENCHMARK {
 
     take:
         db_ch   // channel: tuple(meta, db_path)
@@ -71,7 +71,7 @@ workflow {
     //
     // WORKFLOW: Run main workflow
     //
-    DAISYBIO_COBINET_BENCHMARKING_PIPELINE (
+    DAISYBIO_DOMAINBENCHMARK (
         PIPELINE_INITIALISATION.out.db_ch
     )
     //
@@ -83,7 +83,7 @@ workflow {
         params.plaintext_email,
         params.outdir,
         params.monochrome_logs,
-        DAISYBIO_COBINET_BENCHMARKING_PIPELINE.out.combined
+        DAISYBIO_DOMAINBENCHMARK.out.combined
     )
 }
 

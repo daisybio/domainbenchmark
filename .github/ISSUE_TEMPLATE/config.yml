@@ -2,6 +2,6 @@ contact_links:
   - name: Join nf-core
     url: https://nf-co.re/join
     about: Please join the nf-core community here
-  - name: "Slack #cobinet-benchmarking-pipeline channel"
-    url: https://nfcore.slack.com/channels/cobinet-benchmarking-pipeline
-    about: Discussion about the daisybio/cobinet-benchmarking-pipeline pipeline
+  - name: "Slack #domainbenchmark channel"
+    url: https://nfcore.slack.com/channels/domainbenchmark
+    about: Discussion about the daisybio/domainbenchmark pipeline

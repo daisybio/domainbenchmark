@@ -1,6 +1,6 @@
 {
-    "name": "daisybio/cobinet-benchmarking-pipeline",
-    "homePage": "https://github.com/daisybio/cobinet-benchmarking-pipeline",
+    "name": "daisybio/domainbenchmark",
+    "homePage": "https://github.com/daisybio/domainbenchmark",
     "repos": {
         "https://github.com/nf-core/modules.git": {
             "modules": {
