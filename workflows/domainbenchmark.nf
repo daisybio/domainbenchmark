@@ -7,7 +7,7 @@ include { MULTIQC                } from '../modules/nf-core/multiqc/main'
 include { paramsSummaryMap       } from 'plugin/nf-schema'
 include { paramsSummaryMultiqc   } from '../subworkflows/nf-core/utils_nfcore_pipeline'
 include { softwareVersionsToYAML } from '../subworkflows/nf-core/utils_nfcore_pipeline'
-include { methodsDescriptionText } from '../subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
+include { methodsDescriptionText } from '../subworkflows/local/utils_nfcore_domainbenchmark_pipeline'
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -15,7 +15,7 @@ include { methodsDescriptionText } from '../subworkflows/local/utils_nfcore_cobi
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-workflow COBINET-BENCHMARKING-PIPELINE {
+workflow DOMAINBENCHMARK {
 
     take:
     ch_samplesheet // channel: samplesheet read in from --input
@@ -53,7 +53,7 @@ workflow COBINET-BENCHMARKING-PIPELINE {
         .mix(topic_versions_string)
         .collectFile(
             storeDir: "${outdir}/pipeline_info",
-            name:  'cobinet-benchmarking-pipeline_software_'  + 'mqc_'  + 'versions.yml',
+            name:  'domainbenchmark_software_'  + 'mqc_'  + 'versions.yml',
             sort: true,
             newLine: true
         )
@@ -73,7 +73,7 @@ workflow COBINET-BENCHMARKING-PIPELINE {
     MULTIQC(
         ch_multiqc_files.flatten().collect().map { files ->
             [
-                [id: 'cobinet-benchmarking-pipeline'],
+                [id: 'domainbenchmark'],
                 files,
                 multiqc_config
                     ? file(multiqc_config, checkIfExists: true)

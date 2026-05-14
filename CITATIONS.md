@@ -1,4 +1,4 @@
-# daisybio/cobinet-benchmarking-pipeline: Citations
+# daisybio/domainbenchmark: Citations
 
 ## [nf-core](https://pubmed.ncbi.nlm.nih.gov/32055031/)
 

@@ -1,4 +1,4 @@
-# daisybio/cobinet-benchmarking-pipeline: Output
+# daisybio/domainbenchmark: Output
 
 ## Introduction
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env nextflow
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    daisybio/cobinet-benchmarking-pipeline
+    daisybio/domainbenchmark
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Github : https://github.com/daisybio/cobinet-benchmarking-pipeline
+    Github : https://github.com/daisybio/domainbenchmark
 ----------------------------------------------------------------------------------------
 */
 
@@ -13,9 +13,9 @@
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-include { COBINET-BENCHMARKING-PIPELINE  } from './workflows/cobinet-benchmarking-pipeline'
-include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
-include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_cobinet-benchmarking-pipeline_pipeline'
+include { DOMAINBENCHMARK  } from './workflows/domainbenchmark'
+include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_domainbenchmark_pipeline'
+include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_domainbenchmark_pipeline'
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     NAMED WORKFLOWS FOR PIPELINE
@@ -25,7 +25,7 @@ include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_cobi
 //
 // WORKFLOW: Run main analysis pipeline depending on type of input
 //
-workflow DAISYBIO_COBINET-BENCHMARKING-PIPELINE {
+workflow DAISYBIO_DOMAINBENCHMARK {
 
     take:
     samplesheet // channel: samplesheet read in from --input
@@ -35,7 +35,7 @@ workflow DAISYBIO_COBINET-BENCHMARKING-PIPELINE {
     //
     // WORKFLOW: Run pipeline
     //
-    COBINET-BENCHMARKING-PIPELINE (
+    DOMAINBENCHMARK (
         samplesheet,
         params.multiqc_config,
         params.multiqc_logo,
@@ -43,7 +43,7 @@ workflow DAISYBIO_COBINET-BENCHMARKING-PIPELINE {
         params.outdir,
     )
     emit:
-    multiqc_report = COBINET-BENCHMARKING-PIPELINE.out.multiqc_report // channel: /path/to/multiqc_report.html
+    multiqc_report = DOMAINBENCHMARK.out.multiqc_report // channel: /path/to/multiqc_report.html
 }
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -72,7 +72,7 @@ workflow {
     //
     // WORKFLOW: Run main workflow
     //
-    DAISYBIO_COBINET-BENCHMARKING-PIPELINE (
+    DAISYBIO_DOMAINBENCHMARK (
         PIPELINE_INITIALISATION.out.samplesheet
     )
     //
@@ -84,7 +84,7 @@ workflow {
         params.plaintext_email,
         params.outdir,
         params.monochrome_logs,
-        DAISYBIO_COBINET-BENCHMARKING-PIPELINE.out.multiqc_report
+        DAISYBIO_DOMAINBENCHMARK.out.multiqc_report
     )
 }
 
