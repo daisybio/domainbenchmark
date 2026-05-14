@@ -87,7 +87,6 @@ workflow PIPELINE_INITIALISATION {
     //
     // Custom tests
     //
-    def db_ch
     if (params.input) {
         db_ch = Channel
             .fromPath(params.input, checkIfExists: true)
