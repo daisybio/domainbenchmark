@@ -15,7 +15,7 @@ include { methodsDescriptionText } from '../subworkflows/local/utils_nfcore_cobi
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-workflow COBINET-BENCHMARKING-PIPELINE {
+workflow COBINET_BENCHMARKING_PIPELINE {
 
     take:
     ch_samplesheet // channel: samplesheet read in from --input
