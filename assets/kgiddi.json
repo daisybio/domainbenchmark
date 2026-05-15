@@ -5,7 +5,7 @@
         "chi_square_cutoff": [0.1, 0.3, 0.5, 0.7, 0.9, 1.0],
         "bicluster_cutoff": [0.5, 0.6, 0.7, 0.8],
         "threshold": 3,
-        "go_graph": "/nfs/home/students/c.thomas/CoBiNet/go-basic.obo"
+        "go_graph": "/nfs/data/CoBiNet_Masterpraktikum/go-basic.obo"
     },
     "permutation": false,
     "optimized": {
