@@ -25,7 +25,11 @@ include { EVAL_ONE; EVALUATION                          } from '../../../modules
 
 
 def csvToList(s) {
-    s instanceof List ? s.findAll { it } : (s ? s.tokenize(',')*.trim().findAll { it } : [])
+    // Accept either a List or a comma-separated String. Filter out blanks
+    // and the sentinel 'none' so callers can disable a list cleanly with
+    // `--graph_models none` (or `--graph_models ''` once nf-schema allows it).
+    def items = s instanceof List ? s : (s ? s.tokenize(',') : [])
+    items*.trim().findAll { it && it.toLowerCase() != 'none' }
 }
 
 def powerSet(List lst) {

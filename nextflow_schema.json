@@ -66,8 +66,8 @@
                 "graph_models": {
                     "type": "string",
                     "default": "kgiddi,ddiparsimony,kgiddi_random",
-                    "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
-                    "description": "Comma-separated list of graph-based DDI models to run.",
+                    "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
+                    "description": "Comma-separated list of graph-based DDI models to run. Pass 'none' (or an empty string) to disable.",
                     "fa_icon": "fas fa-project-diagram"
                 },
                 "machine_learning_features": {
