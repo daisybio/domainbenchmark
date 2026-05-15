@@ -4,61 +4,70 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-DomainBenchmark is a Nextflow pipeline for benchmarking domain-domain interaction (DDIs) methods with protein data. It runs ML classifiers and graph-based models across multiple database splits, then produces a combined MultiQC evaluation report.
-
-- Root (`main.nf` / `wrapper.nf`) — training, graph models, evaluation.
+DomainBenchmark is a Nextflow DSL2 pipeline for benchmarking domain-domain interaction (DDI) prediction methods. Built from the `nf-core/tools 4.0.2` template. For each database split it runs feature extraction → ML classifiers (RF, NN) → graph-based models (KGIDDI, DDIParsimony) → MultiQC evaluation, then aggregates across splits.
 
 ## Common commands
 
 ```bash
-# full run across all db splits in nextflow.config, then combined eval
-bash wrapper.sh
+# full run across all database splits in the samplesheet
+nextflow run . --input assets/samplesheet.csv -profile slurm,singularity -resume
 
-# single-database run (results in results/<db_name>)
-nextflow run main.nf
+# stub run (smoke test)
+nextflow run . -profile test,singularity -stub-run
 
-# combined evaluation only (after multiple main.nf runs)
-nextflow run wrapper.nf --report_list <comma-sep dirs> --out_dir results
+# single-database run via direct param
+nextflow run . --input assets/samplesheet.csv -profile slurm,singularity --skip kgiddi,ddiparsimony
 
-# profiles: standard (local, default), slurm
-nextflow run main.nf -profile slurm -resume
+# lint
+nf-core pipelines lint --dir .
 
+# nf-test
+nf-test test tests/default.nf.test
 ```
 
-`wrapper.sh` reads `params.db_list` and `params.out_dir` from `nextflow.config`, calls `main.nf` for each database, then runs `wrapper.nf` to combine reports. Supported CLI overrides: `-profile`, `-c`, `-resume`, `--skip`, `--out_dir`.
+Samplesheet schema (`assets/schema_input.json`): array of `{id, db_path}` rows. `db_path` must be a directory containing `train.sqlite3`, `test.sqlite3`, `optimization.sqlite3`. Skip stages via `--skip aacomp,kgiddi` (comma-separated, matches feature or graph model names).
 
-No test suite, no linter config, no `pyproject.toml` / `requirements.txt`. Python deps managed via conda (`fopra.yml` top-level, per-module `environment.yml` files).
+Python deps managed via conda — `environments/general.yml` (extraction/RF/graph/eval) and `environments/ml.yml` (PyTorch CU128 + cuML for NN training). No `pyproject.toml` / `requirements.txt`.
 
 ## Architecture
 
 ### Top-level layout
-- `main.nf` — orchestrates per-database workflow. Includes modules for feature extraction, ML training, random forest, graph models (KGIDDI, DDI parsimony), DDI extraction, data loading, evaluation. Parses model JSON configs from `assets/` at runtime.
-- `wrapper.nf` / `wrapper.sh` — iterate database splits, then aggregate evaluation across them.
-- `nextflow.config` — single source of truth for `db_list`, `graph_models`, `machine_learning_features`, `skip`, `out_dir`, and executor profiles.
-- `assets/<ModelName>.json` — per-model hyperparameter grid and search config. Filename **must** match `model_name` field and the Python script in `bin/`.
-- `modules/local/<stage>/main.nf` — Nextflow process definitions. Each stage may ship its own `environment.yml`.
-- `bin/` — Python scripts invoked by modules (`run_models.py`, `random_forest.py`, `run_graph_models.py`, `kgiddi.py`, `ddiparsimony.py`, `extract_features.py`, `eval_multiqc.py`, `combine_eval.py`, `load_data_gm.py`, etc.). Must be executable and on `PATH` (Nextflow handles this from `bin/`).
-- `bin/features/` — feature encoding implementations (`aacomp`, `aaencode`, `protdcal`, `embeddings`, `esm3_*`, `esmc_*`, `prott5_*`). New feature = new file here + entry in `params.machine_learning_features`.
-- `environments/general.yml`, `fopra.yml`, `tower.yml` — conda / Tower configs.
-- `docker/` — container definitions.
+- `main.nf` — entry. Defines `DOMAINBENCHMARK` workflow (MultiQC + versions/methods boilerplate) and `DAISYBIO_DOMAINBENCHMARK` (the science workflow).
+- `workflows/domainbenchmark.nf` — wires sample channel → `PER_DB_BENCHMARK` (scattered per DB) → `AGGREGATE_EVAL`.
+- `subworkflows/local/per_db_benchmark/main.nf` — scatter: `DDI_EXTRACTION` → `FEATURE_EXTRACTION` (fan-out feature × split) → `MACHINE_LEARNING` + `RANDOM_FOREST` (powerset capped at `params.max_machine_learning_features`) + `GRAPH_MODEL` → `EVAL_ONE` (per-prediction) → `EVALUATION` (per-DB MultiQC reduce).
+- `subworkflows/local/aggregate_eval/main.nf` — runs `COMBINE_EVAL` across per-DB reports to produce `results/evaluation/ddi_report.html`.
+- `subworkflows/local/utils_nfcore_domainbenchmark_pipeline/main.nf` — nf-core boilerplate (initialise, completion, citations).
+- `nextflow.config` — single source of truth for `db_list` (legacy), `graph_models`, `machine_learning_features`, `large_features`, `max_machine_learning_features`, `skip`, `out_dir`, profiles.
+- `conf/{base,slurm,test,test_full,modules}.config` — layered config. `conf/base.config` carries retry strategy and per-label resources.
+- `assets/<ModelName>.json` — per-model hyperparameter grid + search config. Filename must match `model_name` and the Python script in `bin/`.
+- `modules/local/<stage>/main.nf` — Nextflow process defs (`ddi_extraction`, `feature_extraction`, `machine_learning`, `random_forest`, `graph_model`, `evaluation`).
+- `bin/` — Python entrypoints invoked by modules (`run_models.py`, `random_forest.py`, `run_graph_models.py`, `kgiddi.py`, `ddiparsimony.py`, `extract_features.py`, `eval_one.py`, `eval_multiqc.py`, `combine_eval.py`, `load_data_gm.py`). Auto on `PATH` from Nextflow.
+- `bin/features/` — feature encoders (`aacomp`, `aaencode`, `dummy`, `embeddings`, `protdcal`, `esm3_*`, `esmc_*`, `prott5_*`). New feature = new file here + entry in `params.machine_learning_features`. Heavy ones go in `params.large_features` → routed to `process_gpu_large`.
+- `docker/`, `containers_{docker,singularity,conda_lock}_{amd64,arm64}.config` — container/lock matrices.
 
 ### Data flow
-1. Input: database split directory with `train.sqlite3`, `test.sqlite3`, `optimization.sqlite3` (tables: DDI, DGO, PD, DomSeq, PPI, PGO, Embeddings).
-2. `feature_extraction` → writes per-feature `train/test/optimization.h5` under `results/<db>/data/<feature>/`.
-3. `machine_learning` / `random_forest` consume `.h5` features, grid-search via the model JSON, emit predictions to `results/<db>/ml_output/`.
-4. `graph_model` stages (KGIDDI, DDI parsimony) run independently against the sqlite splits, output under `results/<db>/graph_models/<model>/`.
-5. `evaluation` (MultiQC) combines everything into `results/<db>/evaluation/evaluation.html`; `wrapper.nf` merges across DBs into `results/evaluation/ddi_report.html`.
+1. Input: samplesheet of `{id, db_path}`. Each `db_path` contains `train/test/optimization.sqlite3` (tables: DDI, DGO, PD, DomSeq, PPI, PGO, Embeddings).
+2. `DDI_EXTRACTION` → SQL → CSV per split.
+3. `FEATURE_EXTRACTION` (fan-out per feature × split) → per-feature `train/test/optimization.h5` under `results/<db>/data/<feature>/`.
+4. `MACHINE_LEARNING` / `RANDOM_FOREST` consume `.h5`, grid-search via model JSON, predictions to `results/<db>/ml_output/`.
+5. `GRAPH_MODEL` (KGIDDI, DDIParsimony, KGIDDI_RANDOM) runs independently against sqlite splits → `results/<db>/graph_models/<model>/`.
+6. `EVAL_ONE` per-prediction → `EVALUATION` per-DB MultiQC → `results/<db>/evaluation/evaluation.html`.
+7. `AGGREGATE_EVAL` / `COMBINE_EVAL` → `results/evaluation/ddi_report.html`.
+
+The scatter design (`EVAL_ONE` → `EVALUATION` reduce) replaced a monolithic evaluation that hit 300 GB OOM. See comment in `modules/local/evaluation/main.nf`.
 
 ### Adding things
-- **New ML model:** add `assets/<Name>.json` (must include `model_name`, `data`, `search_parameters`, `model_parameters`) and matching logic in the ML module. Name is auto-picked up by `main.nf`.
-- **New feature encoding:** add `bin/features/<name>.py` and append `<name>` to `params.machine_learning_features` in `nextflow.config`.
-- **Skip stages:** set `--skip aacomp,kgiddi` (comma-sep, matches feature or graph model names).
+- **New ML model:** add `assets/<Name>.json` (must include `model_name`, `data`, `search_parameters`, `model_parameters`) + matching Python file in `bin/`. Picked up automatically.
+- **New feature encoding:** add `bin/features/<name>.py` and append `<name>` to `params.machine_learning_features` in `nextflow.config`. Append to `params.large_features` if it needs GPU/big memory.
+- **Skip stages:** `--skip aacomp,kgiddi` (comma-separated; matches feature or graph model names).
 
 ### Profiles
 - `standard`: local executor, conda enabled.
-- `slurm`: slurm executor, 8 cpus / 200 GB / 48h per process, singularity cache at `/nfs/scratch/singularity_cache`.
+- `slurm`: slurm executor, per-label resources via `conf/slurm.config`, singularity cache at `/nfs/scratch/singularity_cache`.
+- `test` / `test_full`: minimal SQLite triplet under `tests/data/`, single feature.
+- `daisybio`: site-specific defaults.
 
-Default paths in `nextflow.config` point at `/nfs/data/CoBiNet_Masterpraktikum/databases/...` — override with `--db` / `--db_list` for local runs.
+Default DB paths in `nextflow.config` point at `/nfs/data/CoBiNet_Masterpraktikum/databases/...` — override via samplesheet for local runs.
 
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph

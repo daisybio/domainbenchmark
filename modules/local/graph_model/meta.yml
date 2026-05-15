@@ -1,0 +1,59 @@
+name: graph_model
+description: |
+  Run a graph-based DDI predictor (KGIDDI, DDIParsimony, or
+  KGIDDI_RANDOM) against a database split using the model JSON config.
+  Operates directly on the sqlite splits — no feature extraction needed.
+keywords:
+  - graph model
+  - kgiddi
+  - ddiparsimony
+  - knowledge graph
+  - link prediction
+tools:
+  - networkx:
+      description: Graph algorithms backing KGIDDI / DDIParsimony.
+      homepage: https://networkx.org
+      documentation: https://networkx.org/documentation/stable/
+      licence:
+        - "BSD-3-Clause"
+input:
+  - - meta:
+        type: map
+        description: |
+          Groovy Map with database and model information,
+          e.g. [ id:'random_denoise', model:'kgiddi' ]
+    - database:
+        type: directory
+        description: Database split directory containing the sqlite triples.
+        pattern: "*"
+    - model_json:
+        type: file
+        description: Model hyperparameter JSON from `assets/<model>.json`.
+        pattern: "*.json"
+output:
+  predictions:
+    - - meta:
+          type: map
+          description: Groovy Map with database and model info.
+      - "${meta.model}/predictions.parquet":
+          type: file
+          description: Per-prediction parquet table.
+          pattern: "*.parquet"
+  model:
+    - - meta:
+          type: map
+          description: Groovy Map with database and model info.
+      - "${meta.model}/model/":
+          type: directory
+          description: Trained graph-model artefacts.
+  versions:
+    - - ${task.process}:
+          type: string
+          description: The process the versions were collected from
+      - python:
+          type: string
+          description: Python interpreter version
+authors:
+  - "@konstantinpelz"
+maintainers:
+  - "@konstantinpelz"

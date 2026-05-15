@@ -1,0 +1,51 @@
+name: ddi_extraction
+description: |
+  Extract domain-domain interaction (DDI) tables from a database split.
+  Reads one or more `<train|test|optimization>.sqlite3` files and writes
+  per-split CSV tables of `(domain_1, domain_2, interaction)` rows for
+  downstream feature extraction and model training.
+keywords:
+  - ddi
+  - sqlite
+  - domain-domain interaction
+  - benchmark
+tools:
+  - python:
+      description: SQL → CSV extraction script.
+      homepage: https://www.python.org
+      documentation: https://docs.python.org
+      licence:
+        - "PSF-2.0"
+input:
+  - - meta:
+        type: map
+        description: |
+          Groovy Map containing database information,
+          e.g. [ id:'random_denoise' ]
+    - database_dir:
+        type: directory
+        description: |
+          Directory containing `train.sqlite3`, `test.sqlite3`,
+          `optimization.sqlite3`. A single `.sqlite3` file is also
+          accepted; in that case only the `test` split is produced.
+        pattern: "*"
+output:
+  ddi:
+    - - meta:
+          type: map
+          description: Groovy Map containing database information
+      - "${meta.id}/DDI":
+          type: directory
+          description: Per-split DDI CSV directory with train/test/optimization tables.
+          pattern: "DDI"
+  versions:
+    - - ${task.process}:
+          type: string
+          description: The process the versions were collected from
+      - python:
+          type: string
+          description: Python interpreter version
+authors:
+  - "@konstantinpelz"
+maintainers:
+  - "@konstantinpelz"

@@ -1,0 +1,37 @@
+name: utils_nfcore_domainbenchmark_pipeline
+description: |
+  Utility helpers for the daisybio/domainbenchmark pipeline:
+  initialisation, completion handlers, parameter validation, citation /
+  methods description rendering, and other nf-core boilerplate.
+keywords:
+  - utility
+  - nf-core
+  - initialisation
+  - completion
+components:
+  - utils_nextflow_pipeline
+  - utils_nfcore_pipeline
+  - utils_nfschema_plugin
+  - completionemail
+  - completionsummary
+input:
+  - nextflow_cli_args:
+      type: list
+      description: |
+        Positional CLI arguments passed to Nextflow. Validated by
+        `validateInputParameters`.
+  - outdir:
+      type: string
+      description: Output directory for the pipeline run.
+  - input:
+      type: string
+      description: Path to the samplesheet CSV.
+output:
+  - samplesheet:
+      type: channel
+      description: |
+        Channel of validated samplesheet rows parsed by `samplesheetToList`.
+authors:
+  - "Konstantin Pelz"
+maintainers:
+  - "Konstantin Pelz"

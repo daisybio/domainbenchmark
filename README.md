@@ -2,10 +2,13 @@
 
 [![Open in GitHub Codespaces](https://img.shields.io/badge/Open_In_GitHub_Codespaces-black?labelColor=grey&logo=github)](https://github.com/codespaces/new/daisybio/domainbenchmark)
 [![GitHub Actions CI Status](https://github.com/daisybio/domainbenchmark/actions/workflows/nf-test.yml/badge.svg)](https://github.com/daisybio/domainbenchmark/actions/workflows/nf-test.yml)
-[![GitHub Actions Linting Status](https://github.com/daisybio/domainbenchmark/actions/workflows/linting.yml/badge.svg)](https://github.com/daisybio/domainbenchmark/actions/workflows/linting.yml)[![Cite with Zenodo](http://img.shields.io/badge/DOI-10.5281/zenodo.XXXXXXX-1073c8?labelColor=000000)](https://doi.org/10.5281/zenodo.XXXXXXX)
+[![GitHub Actions Linting Status](https://github.com/daisybio/domainbenchmark/actions/workflows/linting.yml/badge.svg)](https://github.com/daisybio/domainbenchmark/actions/workflows/linting.yml)
 [![nf-test](https://img.shields.io/badge/unit_tests-nf--test-337ab7.svg)](https://www.nf-test.com)
 
-[![Nextflow](https://img.shields.io/badge/version-%E2%89%A525.10.4-green?style=flat&logo=nextflow&logoColor=white&color=%230DC09D&link=https%3A%2F%2Fnextflow.io)](https://www.nextflow.io/)
+<!-- Zenodo DOI badge will be added after the v1.0.0 release. -->
+
+
+[![Nextflow](https://img.shields.io/badge/version-%E2%89%A525.10.2-green?style=flat&logo=nextflow&logoColor=white&color=%230DC09D&link=https%3A%2F%2Fnextflow.io)](https://www.nextflow.io/)
 [![nf-core template version](https://img.shields.io/badge/nf--core_template-4.0.2-green?style=flat&logo=nfcore&logoColor=white&color=%2324B064&link=https%3A%2F%2Fnf-co.re)](https://github.com/nf-core/tools/releases/tag/4.0.2)
 [![run with conda](http://img.shields.io/badge/run%20with-conda-3EB049?labelColor=000000&logo=anaconda)](https://docs.conda.io/en/latest/)
 [![run with docker](https://img.shields.io/badge/run%20with-docker-0db7ed?labelColor=000000&logo=docker)](https://www.docker.com/)
@@ -56,46 +59,40 @@ flowchart LR
 ```
 
 
-<!-- TODO nf-core: Include a figure that guides the user through the major workflow steps. Many nf-core
-     workflows use the "tube map" design for that. See https://nf-co.re/docs/community/brand/workflow-schematics#examples for examples.   -->
 
 ## Usage
 
 > [!NOTE]
 > If you are new to Nextflow and nf-core, please refer to [this page](https://nf-co.re/docs/get_started/environment_setup/overview) on how to set-up Nextflow. Make sure to [test your setup](https://nf-co.re/docs/get_started/run-your-first-pipeline) with `-profile test` before running the workflow on actual data.
 
-### Single database
+### Samplesheet (recommended entry)
 
 ```bash
-<<<<<<< HEAD
-nextflow run main.nf \
-    -profile <singularity/docker/conda> \
-    --db /path/to/database_split \
-    --outdir results
-=======
-nextflow run daisybio/domainbenchmark \
-   -profile <docker/singularity/.../institute> \
-   --input samplesheet.csv \
-   --outdir <OUTDIR>
->>>>>>> TEMPLATE
-```
-
-### Multiple databases (scatter + combined evaluation)
-
-```bash
-nextflow run main.nf \
-    -profile <singularity/docker/conda> \
-    --db_list "/path/to/db1,/path/to/db2,/path/to/db3" \
+nextflow run . \
+    -profile <docker/singularity/conda>,slurm \
+    --input assets/samplesheet.csv \
     --outdir results
 ```
+
+The samplesheet is a CSV with one row per database split:
+
+```csv
+id,db_path
+random_denoise,/path/to/random_denoise
+random_ddi,/path/to/random_ddi
+```
+
+Schema in `assets/schema_input.json`. Each `db_path` must contain
+`train.sqlite3`, `test.sqlite3`, `optimization.sqlite3`.
 
 ### Cluster (Slurm + Singularity)
 
 ```bash
-nextflow run main.nf \
+nextflow run . \
     -profile slurm,singularity \
-    --db_list "/nfs/data/CoBiNet_Masterpraktikum/databases/random_denoise,..." \
-    --outdir /nfs/scratch/cobinet/results
+    --input assets/samplesheet.csv \
+    --outdir /nfs/scratch/cobinet/results \
+    -resume
 ```
 
 ### Skipping stages
@@ -105,18 +102,19 @@ names. For example, to skip the heavy embedding-based features and the
 two parsimony graph models:
 
 ```bash
-nextflow run main.nf \
+nextflow run . \
     -profile slurm,singularity \
+    --input assets/samplesheet.csv \
     --skip "kgiddi,ddiparsimony,prott5_protein_domain_embeddings,esm3_protein_domain_embeddings"
 ```
 
 ### Test profile (in-repo fixture)
 
 ```bash
-nextflow run main.nf -profile test,singularity --outdir results-test
+nextflow run . -profile test,singularity --outdir results-test
 ```
 
-The `test` profile points `--db` at a tiny in-repo SQLite triple under
+The `test` profile points at a tiny in-repo SQLite triple under
 `tests/data/` and disables every heavy feature except `aacomp`. Used by
 CI and by `nf-test`.
 
@@ -124,20 +122,19 @@ CI and by `nf-test`.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--input` | `null` | Optional samplesheet CSV (one row per database split). |
-| `--db` | `null` | Path to a single database split directory. |
-| `--db_list` | `null` | Comma-separated list of database splits. |
+| `--input` | `null` | **Required.** Samplesheet CSV (one row per database split). |
 | `--outdir` | `./results` | Output directory. |
 | `--modeljson` | `${projectDir}/assets` | Directory of model hyperparameter JSONs. |
 | `--skip` | `''` | Comma-separated feature/model names to skip. |
-| `--graph_models` | `kgiddi, ddiparsimony, kgiddi_random` | Graph models to run. |
-| `--machine_learning_features` | `aacomp, aaencode, prott5_*, esm3_*, esmc_*` | Feature encodings to compute. |
+| `--graph_models` | `kgiddi,ddiparsimony,kgiddi_random` | Graph models to run. |
+| `--machine_learning_features` | `aacomp,aaencode,prott5_*,esm3_*,esmc_*` | Feature encodings to compute. |
+| `--large_features` | `prott5_*,esm3_*,esmc_*` | Features routed to `process_gpu_large`. |
 | `--max_machine_learning_features` | `2` | Max features combined per ML run. |
 | `--seed` | `42` | Global RNG seed. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
 
 Full schema with defaults, types, and descriptions: `nextflow_schema.json`.
-Run `nextflow run main.nf --help` for a CLI summary.
+Run `nextflow run . --help` for a CLI summary.
 
 ## Pipeline output
 
@@ -166,8 +163,8 @@ For each database split processed, a subdirectory under `--outdir/<db_name>/`:
     └── multiqc_report.html
 ```
 
-When `--db_list` is set, a top-level cross-database report is also written:
-`<outdir>/evaluation/ddi_report.html`.
+When the samplesheet contains more than one database, a top-level
+cross-database report is also written: `<outdir>/evaluation/ddi_report.html`.
 
 A full description of each output is in [`docs/output.md`](docs/output.md).
 
@@ -205,10 +202,10 @@ If you would like to contribute to this pipeline, please see the [contributing g
 
 ## Citations
 
-<!-- TODO nf-core: Add citation for pipeline after first release. Uncomment lines below and update Zenodo doi and badge at the top of this file. -->
-<!-- If you use daisybio/domainbenchmark for your analysis, please cite it using the following doi: [10.5281/zenodo.XXXXXX](https://doi.org/10.5281/zenodo.XXXXXX) -->
-
-An extensive list of references for the tools used by the pipeline can be found in the [`CITATIONS.md`](CITATIONS.md) file.
+A Zenodo DOI for daisybio/domainbenchmark will be issued at the v1.0.0
+release; this section will be updated then. An extensive list of
+references for the tools used by the pipeline can be found in the
+[`CITATIONS.md`](CITATIONS.md) file.
 
 This pipeline uses code and infrastructure developed and maintained by the [nf-core](https://nf-co.re) community, reused here under the [MIT license](https://github.com/nf-core/tools/blob/main/LICENSE).
 
