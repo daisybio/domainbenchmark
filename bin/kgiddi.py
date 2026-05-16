@@ -156,6 +156,7 @@ def process_go_term(go_term, subgraph, bicluster_cutoff):
 
 def evaluate_params(
     args,
+    threads: int = 1,
 ):  # -> tuple[float | Literal[0], Any, Any, float | Literal[0]]:
     (
         chi_square_cutoff,
@@ -179,7 +180,7 @@ def evaluate_params(
         for entry in group_ddis
     }
     predicted_ddis, fold, fp_rate = network_expansion(
-        shared_go_domains, ddi_network_edges, known_ddis, all_domains, bicluster_cutoff
+        shared_go_domains, ddi_network_edges, known_ddis, all_domains, bicluster_cutoff, threads
     )
     # Save predicted DDIs for this training step
     with open(
@@ -198,6 +199,7 @@ def network_expansion(
     known_ddis: set[tuple[str, str]],
     all_domains: set[str],
     bicluster_cutoff: float,
+    threads: int = 1,
 ):
 
     go_ddi_subgraphs = extract_go_guided_ddi_subgraphs(
@@ -216,7 +218,7 @@ def network_expansion(
     processed = 0
     for chunk_idx in range(num_chunks):
         chunk = go_items[processed : processed + chunk_size]
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        with ProcessPoolExecutor(max_workers=threads) as executor:
             futures = {
                 executor.submit(
                     process_go_term, go_term, subgraph, bicluster_cutoff
@@ -466,7 +468,7 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold):
     return connected_components, group_ddi_chi2
 
 
-def run_kgiddi(database_path, params_file, out_dir, out_predictions):
+def run_kgiddi(database_path, params_file, out_dir, out_predictions, threads=1):
 
     db_train = Path(os.path.join(database_path, "train.sqlite3"))
     db_test = Path(os.path.join(database_path, "test.sqlite3"))
@@ -553,7 +555,7 @@ def run_kgiddi(database_path, params_file, out_dir, out_predictions):
         for args in tqdm(
             param_grid, total=len(param_grid), desc="Parameter grid search"
         ):
-            results.append(evaluate_params(args))
+            results.append(evaluate_params(args, threads))
 
         for fold, chi_square_cutoff, bicluster_cutoff, fp_rate in results:
             if fold > best_fold:
@@ -627,6 +629,7 @@ def run_kgiddi(database_path, params_file, out_dir, out_predictions):
         known_ddis_test,
         all_domains_test,
         best_params["bicluster_cutoff"],
+        threads,
     )
 
     logging.info(

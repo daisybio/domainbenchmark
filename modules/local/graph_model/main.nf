@@ -24,7 +24,8 @@ process GRAPH_MODEL {
             --model ${meta.model} \\
             --params ${model_json} \\
             --out_dir ${output_model_dir} \\
-            --out_predictions ${output_predictions}
+            --out_predictions ${output_predictions} \\
+            --threads ${task.cpus}
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":

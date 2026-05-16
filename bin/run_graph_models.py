@@ -27,29 +27,32 @@ if __name__ == "__main__":
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only).",
     )
+    parser.add_argument(
+        "--threads", type=int, default=1,
+        help="Number of worker threads/processes (from task.cpus).",
+    )
     args = parser.parse_args()
     if args.run_id:
         print(f"[run_graph_models] run_id={args.run_id}")
 
     if args.model == "kgiddi":
         json_file = os.path.join(args.params, "kgiddi.json")
-        # Call kgiddi with appropriate parameters
         print(
             f"Run KGIDDI graph model with database {args.database} and parameters from {json_file}, output to {args.out_dir} and predictions to {args.out_predictions}"
         )
-        run_kgiddi(args.database, json_file, args.out_dir, args.out_predictions)
+        run_kgiddi(args.database, json_file, args.out_dir, args.out_predictions, threads=args.threads)
     elif args.model == "kgiddi_random":
         json_file = os.path.join(args.params, "kgiddi_random.json")
         print(
             f"Run KGIDDI_RANDOM graph model with database {args.database} and parameters from {json_file}, output to {args.out_dir} and predictions to {args.out_predictions}"
         )
-        run_kgiddi(args.database, json_file, args.out_dir, args.out_predictions)
+        run_kgiddi(args.database, json_file, args.out_dir, args.out_predictions, threads=args.threads)
     elif args.model == "ddiparsimony":
         json_file = os.path.join(args.params, "ddiparsimony.json")
         print(
             f"Run DDIParsimony graph model with database {args.database} and parameters from {json_file}, output to {args.out_dir} and predictions to {args.out_predictions}"
         )
-        run_ddiparsimony(args.database, json_file, args.out_dir, args.out_predictions)
+        run_ddiparsimony(args.database, json_file, args.out_dir, args.out_predictions, threads=args.threads)
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
