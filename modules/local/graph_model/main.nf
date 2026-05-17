@@ -2,18 +2,18 @@ process GRAPH_MODEL {
     tag "${meta.id}"
     label 'process_medium'
 
-    // kgiddi_random is the permutation control. It runs the same pipeline as
-    // kgiddi but on shuffled GO->protein assignments, which tends to leave more
-    // biclusters surviving the chi-square filter and pushes network_expansion
-    // well past `process_medium`'s 8h/6cpu/36GB envelope. On the last cluster
-    // run both kgiddi_random tasks hit SLURM time limit (exit 140) on attempt
-    // 1 and only finished after a retry. Start kgiddi_random at the envelope
-    // that `process_medium` would have reached after two retries (3x baseline),
-    // then keep the normal task.attempt scaling on top so a hard outlier can
-    // still grow further.
-    cpus   = { meta.model == 'kgiddi_random' ? 18                    : 6     * task.attempt }
-    memory = { meta.model == 'kgiddi_random' ? 108.GB * task.attempt : 36.GB * task.attempt }
-    time   = { meta.model == 'kgiddi_random' ? 24.h   * task.attempt : 8.h   * task.attempt }
+    // Graph models all share one fat envelope. kgiddi spends ~5h in
+    // build_ddi_network alone before network_expansion runs, and kgiddi_random
+    // (permutation control) is heavier still because shuffled GO->protein
+    // assignments leave more biclusters surviving the chi-square filter. The
+    // prior conditional override on meta.model did not take effect at submit
+    // time, so every graph task ran with `process_medium`'s 6cpu/36GB/8h slot
+    // and kgiddi, kgiddi_random both hit SLURM exit 140 on the last run.
+    // Size for the slowest model unconditionally; ddiparsimony finishes in
+    // well under the cap so the over-allocation is cheap.
+    cpus   = 18
+    memory = { 108.GB * task.attempt }
+    time   = { 24.h   * task.attempt }
 
     conda "${projectDir}/environments/general.yml"
     container "docker://konstantinpelz/cobinet-general:1.0.0"

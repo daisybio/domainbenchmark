@@ -15,8 +15,19 @@ import math
 import sys
 
 
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+
+# Force spawn-based workers. The default 'fork' start method has each worker
+# inherit the parent's entire memory image via copy-on-write; once workers
+# start mutating Python objects the shared pages get duplicated and the per-
+# worker RSS balloons toward the parent's footprint. With ~16 GB resident
+# after preprocessing and several workers, that previously tripped a cgroup
+# OOM kill mid-pool and surfaced as `BrokenProcessPool` in network_expansion.
+# Spawn workers start clean and only receive the pickled task args, keeping
+# each worker's RSS bounded to the size of the subgraph it processes.
+_MP_CTX = mp.get_context("spawn")
 
 from kgiddi_functions import (
     approx_bimax,
@@ -218,7 +229,7 @@ def network_expansion(
     processed = 0
     for chunk_idx in range(num_chunks):
         chunk = go_items[processed : processed + chunk_size]
-        with ProcessPoolExecutor(max_workers=threads) as executor:
+        with ProcessPoolExecutor(max_workers=threads, mp_context=_MP_CTX) as executor:
             futures = {
                 executor.submit(
                     process_go_term, go_term, subgraph, bicluster_cutoff
