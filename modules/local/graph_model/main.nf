@@ -1,19 +1,13 @@
 process GRAPH_MODEL {
     tag "${meta.id}"
-    label 'process_medium'
-
-    // Graph models all share one fat envelope. kgiddi spends ~5h in
-    // build_ddi_network alone before network_expansion runs, and kgiddi_random
-    // (permutation control) is heavier still because shuffled GO->protein
-    // assignments leave more biclusters surviving the chi-square filter. The
-    // prior conditional override on meta.model did not take effect at submit
-    // time, so every graph task ran with `process_medium`'s 6cpu/36GB/8h slot
-    // and kgiddi, kgiddi_random both hit SLURM exit 140 on the last run.
-    // Size for the slowest model unconditionally; ddiparsimony finishes in
-    // well under the cap so the over-allocation is cheap.
-    cpus   = 18
-    memory = { 108.GB * task.attempt }
-    time   = { 24.h   * task.attempt }
+    // Dedicated label `process_graph` (18cpu / 108GB / 24h, scaled by
+    // task.attempt). The previous setup used `process_medium` plus inline
+    // cpus/memory/time overrides in this process body, but `withLabel`
+    // directives in conf/base.config take precedence over per-process
+    // directives in Nextflow, so the inline overrides were silently dropped
+    // and every graph task ran in `process_medium`'s 6cpu/36GB/8h slot —
+    // kgiddi and kgiddi_random both hit SLURM exit 140 on the last run.
+    label 'process_graph'
 
     conda "${projectDir}/environments/general.yml"
     container "docker://konstantinpelz/cobinet-general:1.0.0"
