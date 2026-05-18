@@ -1,13 +1,6 @@
 process GRAPH_MODEL {
     tag "${meta.id}"
-    // Dedicated label `process_graph` (18cpu / 108GB / 24h, scaled by
-    // task.attempt). The previous setup used `process_medium` plus inline
-    // cpus/memory/time overrides in this process body, but `withLabel`
-    // directives in conf/base.config take precedence over per-process
-    // directives in Nextflow, so the inline overrides were silently dropped
-    // and every graph task ran in `process_medium`'s 6cpu/36GB/8h slot —
-    // kgiddi and kgiddi_random both hit SLURM exit 140 on the last run.
-    label 'process_graph'
+    label 'process_high'
 
     conda "${projectDir}/environments/general.yml"
     container "docker://konstantinpelz/cobinet-general:1.0.0"

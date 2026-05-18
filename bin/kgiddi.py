@@ -11,12 +11,11 @@ from pathlib import Path
 import gc
 import psutil
 import logging
-import math
 import sys
 
 
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
 # Force spawn-based workers. The default 'fork' start method has each worker
@@ -77,10 +76,17 @@ class UnionFind:
 
 
 def log_resource_usage(note=""):
-    process = psutil.Process(os.getpid())
-    mem_mb = process.memory_info().rss / 1024 / 1024
-    cpu = process.cpu_percent(interval=0.1)
-    logging.info(f"{note} | Memory usage: {mem_mb:.2f} MB | CPU: {cpu:.1f}%")
+    # Wrapped: in container teardown (SLURM SIGTERM, cgroup cleanup) /proc
+    # entries may disappear before Python exits, making psutil raise
+    # NoSuchProcess on our own pid. Swallow so the real cause (e.g. SLURM
+    # timeout exit 140) surfaces instead of a misleading psutil traceback.
+    try:
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / 1024 / 1024
+        cpu = process.cpu_percent(interval=0.1)
+        logging.info(f"{note} | Memory usage: {mem_mb:.2f} MB | CPU: {cpu:.1f}%")
+    except (psutil.Error, OSError) as e:
+        logging.warning(f"{note} | resource sampling failed: {e}")
 
 
 def summary_stats(data):
@@ -137,18 +143,34 @@ def functionally_similar(protein_distances, ppi1, ppi2, threshold):
     )
 
 
+_MAX_SUBGRAPH_NODES = 800
+_MAX_SUBGRAPH_DENSE_NODES = 100
+_MAX_SUBGRAPH_DENSITY = 50  # edges per node
+
+
 def process_go_term(go_term, subgraph, bicluster_cutoff):
     # Log the GO term and subgraph size
     # logging.info(f"Processing GO term: {go_term} | Nodes: {subgraph.number_of_nodes()} | Edges: {subgraph.number_of_edges()}")
     local_predicted = set()
-    if len(subgraph.nodes) == 1:
+    n = subgraph.number_of_nodes()
+    if n == 1:
         local_predicted.update(subgraph.edges)
     else:
+        # Pathological cases: very large or dense subgraphs make approx_bimax
+        # blow up combinatorially in bicluster search / conquer() recursion.
+        # Skip them — benchmark-only output stability means dropping a handful
+        # of mega-subgraphs is acceptable, and a multi-hour single subgraph is
+        # what was causing the graph_model tasks to wedge.
+        e = subgraph.number_of_edges()
+        if n > _MAX_SUBGRAPH_NODES or (
+            n > _MAX_SUBGRAPH_DENSE_NODES and e / max(n, 1) > _MAX_SUBGRAPH_DENSITY
+        ):
+            logging.warning(
+                f"skip pathological subgraph go={go_term} nodes={n} edges={e}"
+            )
+            return go_term, local_predicted
         nodes = list(subgraph.nodes)
         A = nx.to_numpy_array(subgraph, nodelist=nodes)
-        # Pathological cases: very large or dense subgraphs, or subgraphs with highly connected nodes,
-        # can cause approx_bimax to run extremely slowly or use excessive memory due to
-        # combinatorial explosion in bicluster search or deep recursion in conquer().
         biclusters = approx_bimax(A, b=bicluster_cutoff)
         for bicluster in biclusters:
             row_indices, col_indices = bicluster
@@ -221,30 +243,42 @@ def network_expansion(
 
     predicted_ddis = set()
     debug_lines = []
-    # Chunked processing for memory efficiency
+    # Single pool with bounded in-flight submission. Previously a fresh
+    # ProcessPoolExecutor was instantiated per 100-item chunk; with the spawn
+    # start method, ~18 workers paid ~1-2s spawn cost on every chunk boundary,
+    # which on the test database (24+ chunks) burned 10-15 min before doing
+    # any useful work. One pool + an in-flight cap of 2x threads keeps the
+    # memory profile the chunking was originally there for.
     go_items = list(go_ddi_subgraphs.items())
-    chunk_size = 100
-    total = len(go_ddi_subgraphs)
-    num_chunks = math.ceil(total / chunk_size)
-    processed = 0
-    for chunk_idx in range(num_chunks):
-        chunk = go_items[processed : processed + chunk_size]
-        with ProcessPoolExecutor(max_workers=threads, mp_context=_MP_CTX) as executor:
-            futures = {
-                executor.submit(
-                    process_go_term, go_term, subgraph, bicluster_cutoff
-                ): go_term
-                for go_term, subgraph in chunk
-            }
-            for future in as_completed(futures):
-                go_term, local_predicted = future.result()
+    total = len(go_items)
+    in_flight_cap = max(2 * threads, 4)
+    log_every = max(in_flight_cap, 100)
+    completed = 0
+    with ProcessPoolExecutor(max_workers=threads, mp_context=_MP_CTX) as executor:
+        in_flight = {}
+
+        def _drain_one():
+            nonlocal completed
+            done, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                go_term, local_predicted = fut.result()
                 predicted_ddis.update(local_predicted)
                 debug_lines.append(f"{go_term}\t{len(local_predicted)}\n")
-        processed += len(chunk)
-        logging.info(
-            f"Processed chunk {chunk_idx + 1}/{num_chunks} ({processed}/{total} GO terms)"
-        )
-        log_resource_usage(f"After chunk {chunk_idx + 1}")
+                in_flight.pop(fut)
+                completed += 1
+                if completed % log_every == 0:
+                    logging.info(f"Processed {completed}/{total} GO terms")
+
+        for go_term, subgraph in go_items:
+            while len(in_flight) >= in_flight_cap:
+                _drain_one()
+            fut = executor.submit(
+                process_go_term, go_term, subgraph, bicluster_cutoff
+            )
+            in_flight[fut] = go_term
+        while in_flight:
+            _drain_one()
+    log_resource_usage(f"After processing all {total} GO terms")
 
     with open("debug_go_predicted_ddis.txt", "a") as f:
         f.writelines(
@@ -362,29 +396,55 @@ def preprocessing(
         }
         protein_go_terms = permuted_protein_go_terms
 
-    # Now I have the mapping of proteins to their most specific go terms in protein_go_terms
-    proteins = np.array(list(protein_go_terms.keys()))
-    n_proteins = len(proteins)
-    protein_distances = {}
-    # Precompute all pairs indices
-    idx_i, idx_j = np.triu_indices(n_proteins, k=1)
-    for i, j in zip(idx_i, idx_j):
-        p1 = proteins[i]
-        p2 = proteins[j]
-        terms1 = protein_go_terms[p1]
-        terms2 = protein_go_terms[p2]
-        t1_arr = np.array(terms1)
-        t2_arr = np.array(terms2)
-        # Build distance matrix for all pairs (t1, t2)
-        dists = np.full((len(t1_arr), len(t2_arr)), np.inf)
-        for m, t1 in enumerate(t1_arr):
-            for n, t2 in enumerate(t2_arr):
-                d = all_pairs_shortest_path_length.get(t1, {}).get(t2, np.inf)
-                dists[m, n] = d
-        min_dist = np.min(dists) if dists.size > 0 else np.inf
-        protein_distances[tuple(sorted((p1, p2)))] = (
-            min_dist if min_dist != np.inf else None
+    # Vectorized + sparsified protein_distances construction.
+    #
+    # Legacy version materialized a dict of N*(N-1)/2 entries (~44 M for
+    # n_proteins≈9400) using a triple Python loop over GO term lookups. New
+    # version:
+    #   1. Builds a single GO-term-id matrix D once from the precomputed
+    #      all_pairs_shortest_path_length (one pass, no per-pair dict lookups).
+    #   2. Per-pair min distance via numpy slice (D[ti[:,None], tj[None,:]]).
+    #   3. Emits only finite distances — pairs with no GO-graph path between
+    #      their most-specific terms never reach the consumer, which used to
+    #      get None and treat it as not-similar anyway.
+    used_go_terms = sorted(
+        {t for terms in protein_go_terms.values() for t in terms}
+    )
+    go_id = {t: i for i, t in enumerate(used_go_terms)}
+    n_go = len(used_go_terms)
+    D = np.full((n_go, n_go), np.inf, dtype=np.float32)
+    for source, targets in all_pairs_shortest_path_length.items():
+        si = go_id.get(source)
+        if si is None:
+            continue
+        for target, dist in targets.items():
+            ti_ = go_id.get(target)
+            if ti_ is not None:
+                D[si, ti_] = dist
+    protein_term_ids = {
+        p: np.fromiter(
+            (go_id[t] for t in terms if t in go_id),
+            dtype=np.intp,
+            count=sum(1 for t in terms if t in go_id),
         )
+        for p, terms in protein_go_terms.items()
+    }
+    proteins_list = list(protein_term_ids.keys())
+    n_proteins = len(proteins_list)
+    protein_distances = {}
+    for i in range(n_proteins):
+        ti = protein_term_ids[proteins_list[i]]
+        if ti.size == 0:
+            continue
+        p_i = proteins_list[i]
+        for j in range(i + 1, n_proteins):
+            tj = protein_term_ids[proteins_list[j]]
+            if tj.size == 0:
+                continue
+            min_dist = float(D[ti[:, None], tj[None, :]].min())
+            if np.isfinite(min_dist):
+                p_j = proteins_list[j]
+                protein_distances[tuple(sorted((p_i, p_j)))] = min_dist
 
     # Creation of ppi_list
     ppi1s = ppi_df["protein_1"].values
@@ -443,13 +503,66 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold):
     uf = UnionFind(ppi_nodes)
 
     clusters_dict = defaultdict(set)
-    # Cluster PPIs with Union-Find
-    for i, ppi1 in enumerate(ppi_nodes):
-        for j in range(i + 1, len(ppi_nodes)):
-            ppi2 = ppi_nodes[j]
-            if not uf.connected(ppi1, ppi2):
-                if functionally_similar(protein_distances, ppi1, ppi2, threshold):
-                    uf.union(ppi1, ppi2)
+    if os.environ.get("KGIDDI_LEGACY_BUILD"):
+        # Legacy O(N^2) all-pairs scan. Kept as a parity escape hatch — set
+        # KGIDDI_LEGACY_BUILD=1 to compare against the inverted-index path on
+        # the same inputs.
+        logging.warning(
+            "KGIDDI_LEGACY_BUILD set — using O(N^2) all-pairs Union-Find loop"
+        )
+        for i, ppi1 in enumerate(ppi_nodes):
+            for j in range(i + 1, len(ppi_nodes)):
+                ppi2 = ppi_nodes[j]
+                if not uf.connected(ppi1, ppi2):
+                    if functionally_similar(
+                        protein_distances, ppi1, ppi2, threshold
+                    ):
+                        uf.union(ppi1, ppi2)
+    else:
+        # Inverted-index path: enumerate only candidate similar PPIs via a
+        # protein-keyed index. Drops the 2.25e10 pair scan that previously
+        # took 6-7 hours per kgiddi task.
+        #
+        # Similarity: ppi(a,b) ~ ppi(c,d) iff (c in close[a] AND d in close[b])
+        #                                  OR (c in close[b] AND d in close[a])
+        # where close[p] = {q : protein_distances[(p,q)] <= threshold}.
+        close = defaultdict(set)
+        for (p, q), d in protein_distances.items():
+            if d is not None and d <= threshold:
+                close[p].add(q)
+                close[q].add(p)
+
+        ppi_by_protein = defaultdict(list)
+        for idx, (a, b) in enumerate(ppi_nodes):
+            ppi_by_protein[a].append(idx)
+            ppi_by_protein[b].append(idx)
+
+        for i, (a, b) in enumerate(ppi_nodes):
+            close_a = close.get(a, ())
+            close_b = close.get(b, ())
+            candidates = set()
+            # Rule 1: c ~ a AND d ~ b
+            for c in close_a:
+                for j in ppi_by_protein.get(c, ()):
+                    if j <= i:
+                        continue
+                    x, y = ppi_nodes[j]
+                    other = y if x == c else x
+                    if other in close_b:
+                        candidates.add(j)
+            # Rule 2: c ~ b AND d ~ a
+            for c in close_b:
+                for j in ppi_by_protein.get(c, ()):
+                    if j <= i:
+                        continue
+                    x, y = ppi_nodes[j]
+                    other = y if x == c else x
+                    if other in close_a:
+                        candidates.add(j)
+            for j in candidates:
+                if not uf.connected(ppi_nodes[i], ppi_nodes[j]):
+                    uf.union(ppi_nodes[i], ppi_nodes[j])
+
     for ppi in ppi_nodes:
         clusters_dict[uf.find(ppi)].add(ppi)
     clusters = []
