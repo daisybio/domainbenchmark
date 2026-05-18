@@ -9,11 +9,51 @@ import json
 import numpy as np
 import pandas as pd
 import pickle
-from machine_learning import load_embedding_data, clear_load_cache
+from machine_learning import (
+    _tune_threshold_mcc,
+    clear_load_cache,
+    load_embedding_data,
+)
 from pathlib import Path
-from sklearn.metrics import precision_recall_curve
 from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
 from sklearn.utils.class_weight import compute_sample_weight
+
+
+# Three ways to address the heavy positive-class imbalance in the training set.
+# "none"           — train on raw data, no correction.
+# "downsample"     — load_embedding_data(balance_classes=True): equal pos/neg by
+#                    resampling; preserves the original pipeline behaviour.
+# "sample_weight"  — train on the full data and apply class-balanced weights;
+#                    no information loss, cuML RF accepts sample_weight in fit().
+BALANCE_METHODS = ("none", "downsample", "sample_weight")
+
+
+def _load_train_with_balance(
+    args, balance_method: str, samples_per_ddi: int, seed: int
+):
+    """Load training arrays under one of the three balance strategies.
+
+    Returns (x_train, y_train, sample_weight). sample_weight is None except for
+    balance_method == 'sample_weight'.
+    """
+    if balance_method not in BALANCE_METHODS:
+        raise ValueError(f"Unknown balance_method: {balance_method}")
+    downsample = balance_method == "downsample"
+    random.seed(seed)
+    x_train, y_train = load_embedding_data(
+        args.features_path,
+        args.features,
+        args.ddi_path,
+        "train",
+        balance_classes=downsample,
+        samples_per_ddi=samples_per_ddi,
+    )
+    sw = None
+    if balance_method == "sample_weight":
+        sw = compute_sample_weight("balanced", y_train.astype(np.int32)).astype(
+            np.float32
+        )
+    return x_train, y_train, sw
 
 
 def main():
@@ -58,12 +98,9 @@ def main():
 
     with model_json_path.open("r") as model_json_file:
         model_parameters = json.load(model_json_file)
-    balance_opt_set = model_parameters[
-        "balance_positive_and_negative_interactions_train_set"
-    ]
     samples_per_ddi_opt = model_parameters["protein_sample_per_ddi_train_set"]
     threshold = model_parameters.get("threshold", 0.5)
-    predict(args, classifier, balance_opt_set, samples_per_ddi_opt, threshold=threshold)
+    predict(args, classifier, samples_per_ddi_opt, threshold=threshold)
 
 
 def train_model(args):
@@ -85,9 +122,19 @@ def train_model(args):
     ]
     samples_per_ddi_opt = search_parameters["protein_sample_per_ddi_opt_set"]
 
-    outer_loop_runs = len(
-        hyperparameters["balance_positive_and_negative_interactions_train_set"]
-    ) * len(hyperparameters["protein_sample_per_ddi_train_set"])
+    # Backwards-compat shim: prefer new `balance_method` field; fall back to the
+    # old boolean list and translate it. Schema in assets/RandomForest.json is the
+    # source of truth for current runs.
+    balance_methods = hyperparameters.get("balance_method")
+    if balance_methods is None:
+        legacy = hyperparameters.get(
+            "balance_positive_and_negative_interactions_train_set", [False]
+        )
+        balance_methods = ["downsample" if b else "none" for b in legacy]
+
+    outer_loop_runs = len(balance_methods) * len(
+        hyperparameters["protein_sample_per_ddi_train_set"]
+    )
 
     inner_search_runs = math.ceil(
         search_parameters["models_to_evaluate"] / outer_loop_runs
@@ -110,9 +157,7 @@ def train_model(args):
     )
 
     print("Starting grid search for hyperparameter tuning...")
-    for balance_train_set in hyperparameters[
-        "balance_positive_and_negative_interactions_train_set"
-    ]:
+    for balance_method in balance_methods:
         for protein_sample_per_ddi_train_set in hyperparameters[
             "protein_sample_per_ddi_train_set"
         ]:
@@ -121,25 +166,19 @@ def train_model(args):
                 for (k, v) in hyperparameters.items()
                 if k
                 not in [
+                    "balance_method",
                     "balance_positive_and_negative_interactions_train_set",
                     "protein_sample_per_ddi_train_set",
                 ]
             }
 
-            # print("Loading training data...")
-            random.seed(args.seed)
-            x_train, y_train = load_embedding_data(
-                args.features_path,
-                args.features,
-                args.ddi_path,
-                "train",
-                balance_classes=balance_train_set,
-                samples_per_ddi=protein_sample_per_ddi_train_set,
+            print(
+                f"[grid] balance_method={balance_method} "
+                f"samples_per_ddi={protein_sample_per_ddi_train_set}"
             )
-
-            # print(f"Training data shape: {x_train.shape}, Labels shape: {y_train.shape}")
-            # print(
-            #    f"Number of positive samples: {np.sum(y_train == 1)}, Number of negative samples: {np.sum(y_train == 0)}")
+            x_train, y_train, sw_train = _load_train_with_balance(
+                args, balance_method, protein_sample_per_ddi_train_set, args.seed
+            )
 
             x = np.concatenate([x_train, x_opt], axis=0).astype(np.float32)
             y = np.concatenate([y_train, y_opt], axis=0).astype(np.int32)
@@ -148,7 +187,6 @@ def train_model(args):
                 [-1] * len(x_train) + [0] * len(x_opt)
             )  # -1 = always train, 0 = validation fold
 
-            # cuML RF has no class_weight; balanced weighting applied via sample_weight at final refit
             classifier = RandomForestClassifier()
             # n_jobs=1: GPU handles parallelism; parallel CV jobs risk OOM
             grid_search = RandomizedSearchCV(
@@ -161,30 +199,37 @@ def train_model(args):
                 verbose=2,
                 scoring="average_precision",
             )
-            grid_search.fit(x, y)
+            # sample_weight is sliced per fold by sklearn; pass dummy 1.0 weights
+            # for the opt rows so the array length matches x/y.
+            fit_kwargs = {}
+            if sw_train is not None:
+                fit_kwargs["sample_weight"] = np.concatenate(
+                    [sw_train, np.ones(len(x_opt), dtype=np.float32)]
+                )
+            grid_search.fit(x, y, **fit_kwargs)
 
             best_model_parameters_and_performance.append(
                 (
                     grid_search.best_params_,
                     grid_search.best_score_,
-                    balance_train_set,
+                    balance_method,
                     protein_sample_per_ddi_train_set,
                 )
             )
 
             # B3: drop per-iter buffers before next outer iter
-            del x, y, x_train, y_train, classifier, grid_search
+            del x, y, x_train, y_train, sw_train, classifier, grid_search
             gc.collect()
 
     best_model_parameters_and_performance.sort(key=lambda x: x[1], reverse=True)
 
     # Refitting on training data with the best parameters
-    params, score, balance_train_set, protein_sample_per_ddi_train_set = (
+    params, score, balance_method, protein_sample_per_ddi_train_set = (
         best_model_parameters_and_performance[0]
     )
 
     print(f"Best parameters: {params}")
-    print(f"Balance training set: {balance_train_set}")
+    print(f"Balance method: {balance_method}")
     print(f"Protein sample per DDI training set: {protein_sample_per_ddi_train_set}")
 
     # B3: drop x_opt before refit; reload after for thresholding.
@@ -193,14 +238,8 @@ def train_model(args):
     clear_load_cache()
     gc.collect()
 
-    random.seed(args.seed)
-    x_train, y_train = load_embedding_data(
-        args.features_path,
-        args.features,
-        args.ddi_path,
-        "train",
-        balance_classes=balance_train_set,
-        samples_per_ddi=protein_sample_per_ddi_train_set,
+    x_train, y_train, sw_train = _load_train_with_balance(
+        args, balance_method, protein_sample_per_ddi_train_set, args.seed
     )
     classifier = RandomForestClassifier(**params)
     print("Refitting best parameter model on training data...")
@@ -208,11 +247,13 @@ def train_model(args):
     y_train_i32 = y_train.astype(np.int32)
     del x_train, y_train
     gc.collect()
-    #sample_weight = compute_sample_weight("balanced", y_train_i32)
-    classifier.fit(x_train_f32, y_train_i32)#, sample_weight=sample_weight)
+    if sw_train is not None:
+        classifier.fit(x_train_f32, y_train_i32, sample_weight=sw_train)
+    else:
+        classifier.fit(x_train_f32, y_train_i32)
 
     # Free training buffers before allocating x_opt again.
-    del x_train_f32, y_train_i32
+    del x_train_f32, y_train_i32, sw_train
     gc.collect()
 
     random.seed(args.seed)
@@ -226,12 +267,10 @@ def train_model(args):
     )
     assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
 
-    print("Tuning decision threshold on optimization data...")
+    print("Tuning decision threshold on optimization data via MCC...")
     y_opt_proba = classifier.predict_proba(x_opt.astype(np.float32))[:, 1]
-    prec, rec, thr = precision_recall_curve(y_opt, y_opt_proba)
-    f1s = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-12)
-    best_thr = float(thr[np.argmax(f1s)])
-    print(f"Tuned threshold: {best_thr:.3f} (F1={f1s.max():.3f})")
+    best_thr, best_mcc = _tune_threshold_mcc(y_opt, y_opt_proba)
+    print(f"Tuned threshold: {best_thr:.3f} (MCC={best_mcc:.3f})")
 
     y_pred = (y_opt_proba >= best_thr).astype(int)
 
@@ -252,7 +291,7 @@ def train_model(args):
         json.dump(
             {
                 "model_parameters": params,
-                "balance_positive_and_negative_interactions_train_set": balance_train_set,
+                "balance_method": balance_method,
                 "protein_sample_per_ddi_train_set": protein_sample_per_ddi_train_set,
                 "threshold": best_thr,
             },
@@ -263,7 +302,7 @@ def train_model(args):
     return classifier
 
 
-def predict(args, classifier, balance_opt_set, samples_per_ddi_opt, threshold=0.5):
+def predict(args, classifier, samples_per_ddi_opt, threshold=0.5):
     # Predict on test data
     print("Predicting on test data...")
     print(args.features)

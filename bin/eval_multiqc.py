@@ -22,6 +22,7 @@ from eval_multiqc_functions import (
     calc_curves_roc_pr,
     analyse_database,
     aggregate_per_model_metrics,
+    paired_bootstrap_diff,
 )
 import logging
 
@@ -313,13 +314,23 @@ def write_multiqc_json_metrices(
 
     n_models = len(metrics_aucap)
 
-    # --- Block 1: AUC/AP table ---
+    def _fmt_with_ci(point, ci):
+        if ci is None:
+            return f"{float(point):.3f}"
+        lo, hi = ci
+        return f"{float(point):.3f} [{float(lo):.3f}, {float(hi):.3f}]"
+
+    # --- Block 1: AUC/AP table (with Phase 4 bootstrap CIs when available) ---
     table_id = f"{prefix}_metrics_table"
     file_name_suffix = "_metrics_table_mqc.json"
     new_table_data = {
         m: {
-            "ROC AUC": f"{float(metrics_aucap[m]['ROC_AUC']):.3f}",
-            "PR AP": f"{float(metrics_aucap[m]['PR_AP']):.3f}",
+            "ROC AUC": _fmt_with_ci(
+                metrics_aucap[m]["ROC_AUC"], metrics_aucap[m].get("ROC_AUC_CI")
+            ),
+            "PR AP": _fmt_with_ci(
+                metrics_aucap[m]["PR_AP"], metrics_aucap[m].get("PR_AP_CI")
+            ),
         }
         for m in metrics_aucap
     }
@@ -439,6 +450,47 @@ def write_multiqc_json_metrices(
     with open(os.path.join(outdir, "model_eval_metrics_mqc.json"), "w") as f:
         json.dump(metrics_block, f, indent=2)
 
+    # --- Block 5: Pairwise significance (Phase 4) ---
+    # Built only when every model carries bootstrap samples. Uses the unpaired
+    # stochastic-dominance approximation documented on paired_bootstrap_diff.
+    sample_models = [
+        m for m in metrics_aucap if "ROC_AUC_SAMPLES" in metrics_aucap[m]
+    ]
+    if len(sample_models) >= 2:
+        pairwise_id = f"{prefix}_pairwise_significance"
+        pair_data = {}
+        for a in sample_models:
+            row = {}
+            for b in sample_models:
+                if a == b:
+                    row[b] = "—"
+                    continue
+                p = paired_bootstrap_diff(
+                    metrics_aucap[a]["ROC_AUC_SAMPLES"],
+                    metrics_aucap[b]["ROC_AUC_SAMPLES"],
+                )
+                row[b] = f"{p:.3f}"
+            pair_data[a] = row
+        pairwise_block = {
+            "id": pairwise_id,
+            "section_name": "Pairwise significance (ROC AUC)",
+            "plot_type": "table",
+            "pconfig": {
+                "id": pairwise_id,
+                "title": "Pairwise significance — ROC AUC (two-sided p-value)",
+                "col1_header": "Model",
+            },
+            "data": pair_data,
+        }
+        with open(
+            os.path.join(outdir, f"{prefix}_pairwise_significance_mqc.json"), "w"
+        ) as f:
+            json.dump(pairwise_block, f, indent=2)
+        logging.info(
+            "[OK] Wrote pairwise significance block "
+            f"({len(sample_models)} models)"
+        )
+
     logging.info("[OK] Wrote MultiQC JSON (ROC + PR)")
 
 
@@ -517,6 +569,7 @@ def write_multiqc_config(
     roc_blocks = pick(r"_roc$")
     pr_blocks = pick(r"_pr$")
     metric_blocks = pick(r"model_eval_metrics$")
+    pairwise_blocks = pick(r"_pairwise_significance$")
 
     db_blocks = pick(r"database_analysis")
     degree_blocks = pick(r"_degree_distribution")
@@ -527,6 +580,7 @@ def write_multiqc_config(
         white_tbl
         + metric_blocks
         + auc_ap_tbl
+        + pairwise_blocks
         + roc_blocks
         + pr_blocks
         + db_blocks

@@ -11,10 +11,11 @@ import pandas as pd
 import random
 from contextlib import ExitStack
 from pathlib import Path
-from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import matthews_corrcoef, precision_recall_curve
 from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
 from skorch import NeuralNetBinaryClassifier
 from skorch.callbacks import EarlyStopping
+from skorch.dataset import ValidSplit
 from typing import List
 
 import gc
@@ -62,6 +63,35 @@ _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 def clear_load_cache() -> None:
     """Drop every cached embedding array. Call between training phases."""
     _load_cache.clear()
+
+
+def _tune_threshold_mcc(y_true, y_score, n_candidates: int = 200):
+    """Pick the decision threshold that maximises Matthews correlation.
+
+    MCC is class-balance invariant, so the result generalises across test priors
+    that differ from the optimisation set (avoiding the F1-induced positive-bias
+    that previously collapsed predictions to the majority class).
+
+    Returns (threshold, mcc_at_threshold).
+    """
+    y_true = np.asarray(y_true).astype(np.int8)
+    y_score = np.asarray(y_score).astype(np.float64)
+    # Candidate set: quantiles of the score distribution (handles flat scores
+    # and avoids evaluating degenerate thresholds outside [min, max]).
+    qs = np.linspace(0.0, 1.0, n_candidates + 2)[1:-1]
+    candidates = np.unique(np.quantile(y_score, qs))
+    if candidates.size == 0:
+        return 0.5, 0.0
+    best_thr = float(candidates[0])
+    best_mcc = -2.0
+    for thr in candidates:
+        pred = (y_score >= thr).astype(np.int8)
+        # matthews_corrcoef returns 0 when one class is empty in predictions.
+        mcc = matthews_corrcoef(y_true, pred)
+        if mcc > best_mcc:
+            best_mcc = mcc
+            best_thr = float(thr)
+    return best_thr, float(best_mcc)
 
 
 def load_embedding_data(
@@ -419,13 +449,19 @@ def train_model(args):
                 [-1] * len(x_train) + [0] * len(x_opt)
             )  # -1 = always train, 0 = validation fold
 
-            # Train Neural Network Classifier model
+            # Train Neural Network Classifier model.
+            # iterator_train__shuffle=True is critical: load_embedding_data with
+            # balance_classes=True concatenates `pos + neg`, so unshuffled batches
+            # are class-pure and the model collapses to majority prediction.
+            # Stratified valid split keeps positives in the holdout used by EarlyStopping.
             classifier = NeuralNetBinaryClassifier(
                 MLPModule,
                 max_epochs=search_parameters["grid_search_epochs"],
                 device=device,
                 verbose=0,
                 module__input_size=num_features,
+                iterator_train__shuffle=True,
+                train_split=ValidSplit(0.2, stratified=True),
             )
             # grid_search = GridSearchCV(classifier, grid_search_params, n_jobs=args.jobs)
             grid_search = RandomizedSearchCV(
@@ -492,6 +528,8 @@ def train_model(args):
         verbose=1,
         module__input_size=num_features,
         criterion__pos_weight=pos_weight,
+        iterator_train__shuffle=True,
+        train_split=ValidSplit(0.2, stratified=True),
         callbacks=[EarlyStopping(patience=5, monitor="valid_loss")],
     )
     print("Refitting best parameter model on training data...")
@@ -511,12 +549,10 @@ def train_model(args):
     )
     assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
 
-    print("Tuning decision threshold on optimization data...")
+    print("Tuning decision threshold on optimization data via MCC...")
     y_opt_proba = classifier.predict_proba(x_opt)[:, 1]
-    prec, rec, thr = precision_recall_curve(y_opt, y_opt_proba)
-    f1s = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-12)
-    best_thr = float(thr[np.argmax(f1s)])
-    print(f"Tuned threshold: {best_thr:.3f} (F1={f1s.max():.3f})")
+    best_thr, best_mcc = _tune_threshold_mcc(y_opt, y_opt_proba)
+    print(f"Tuned threshold: {best_thr:.3f} (MCC={best_mcc:.3f})")
 
     y_pred = (y_opt_proba >= best_thr).astype(int)
 
