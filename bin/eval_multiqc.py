@@ -314,23 +314,23 @@ def write_multiqc_json_metrices(
 
     n_models = len(metrics_aucap)
 
-    def _fmt_with_ci(point, ci):
+    def _fmt_ci(ci):
         if ci is None:
-            return f"{float(point):.3f}"
+            return ""
         lo, hi = ci
-        return f"{float(point):.3f} [{float(lo):.3f}, {float(hi):.3f}]"
+        return f"[{float(lo):.3f}, {float(hi):.3f}]"
 
-    # --- Block 1: AUC/AP table (with Phase 4 bootstrap CIs when available) ---
+    # --- Block 1: AUC/AP table -----------------------------------------------
+    # Numeric mean kept as float (enables table colour-scale + downstream
+    # heatmap clustering); CI rendered in a sibling string column.
     table_id = f"{prefix}_metrics_table"
     file_name_suffix = "_metrics_table_mqc.json"
     new_table_data = {
         m: {
-            "ROC AUC": _fmt_with_ci(
-                metrics_aucap[m]["ROC_AUC"], metrics_aucap[m].get("ROC_AUC_CI")
-            ),
-            "PR AP": _fmt_with_ci(
-                metrics_aucap[m]["PR_AP"], metrics_aucap[m].get("PR_AP_CI")
-            ),
+            "ROC AUC": float(metrics_aucap[m]["ROC_AUC"]),
+            "ROC AUC CI": _fmt_ci(metrics_aucap[m].get("ROC_AUC_CI")),
+            "PR AP": float(metrics_aucap[m]["PR_AP"]),
+            "PR AP CI": _fmt_ci(metrics_aucap[m].get("PR_AP_CI")),
         }
         for m in metrics_aucap
     }
@@ -351,6 +351,30 @@ def write_multiqc_json_metrices(
             "id": f"{prefix}_metrics_table",
             "title": "Model performance (AUC / AP)",
             "col1_header": "Model",
+        },
+        "headers": {
+            "ROC AUC": {
+                "title": "ROC AUC",
+                "min": 0.0,
+                "max": 1.0,
+                "scale": "RdYlGn",
+                "format": "{:,.3f}",
+            },
+            "ROC AUC CI": {
+                "title": "ROC AUC 95% CI",
+                "scale": False,
+            },
+            "PR AP": {
+                "title": "PR AP",
+                "min": 0.0,
+                "max": 1.0,
+                "scale": "RdYlGn",
+                "format": "{:,.3f}",
+            },
+            "PR AP CI": {
+                "title": "PR AP 95% CI",
+                "scale": False,
+            },
         },
         "data": merged_table_data,
     }
@@ -453,9 +477,9 @@ def write_multiqc_json_metrices(
     # --- Block 5: Pairwise significance (Phase 4) ---
     # Built only when every model carries bootstrap samples. Uses the unpaired
     # stochastic-dominance approximation documented on paired_bootstrap_diff.
-    sample_models = [
+    sample_models = sorted(
         m for m in metrics_aucap if "ROC_AUC_SAMPLES" in metrics_aucap[m]
-    ]
+    )
     if len(sample_models) >= 2:
         pairwise_id = f"{prefix}_pairwise_significance"
         pair_data = {}

@@ -65,6 +65,24 @@ def clear_load_cache() -> None:
     _load_cache.clear()
 
 
+def _aggregate_to_ddi_level(ddi_pairs, y_true, y_score):
+    """Collapse per-protein-pair predictions to one row per DDI pair.
+
+    Aggregation: mean predicted probability over all protein instantiations of
+    each (domain_a, domain_b) pair; true label is constant per pair so 'first'
+    is exact.
+    """
+    df = pd.DataFrame(ddi_pairs, columns=["domain_a", "domain_b"])
+    df["true_interaction"] = np.asarray(y_true).astype(np.int8)
+    df["predicted_probability"] = np.asarray(y_score).astype(np.float32)
+    return (
+        df.groupby(["domain_a", "domain_b"], sort=False)
+        .agg(true_interaction=("true_interaction", "first"),
+             predicted_probability=("predicted_probability", "mean"))
+        .reset_index()
+    )
+
+
 def _tune_threshold_mcc(y_true, y_score, n_candidates: int = 200):
     """Pick the decision threshold that maximises Matthews correlation.
 
@@ -223,13 +241,14 @@ def load_embedding_data(
                     get_domain_protein_combinations(f)
                 )
 
-            # Sample protein combinations
-            if samples_per_ddi is not None:
-                proteins_combinations = random.choices(
-                    sorted(possible_protein_combinations), k=samples_per_ddi
-                )
+            # Sample protein combinations without replacement; cap at min(K, available).
+            sorted_combos = sorted(possible_protein_combinations)
+            if samples_per_ddi is not None and len(sorted_combos) > samples_per_ddi:
+                proteins_combinations = random.sample(sorted_combos, k=samples_per_ddi)
             else:
-                proteins_combinations = sorted(possible_protein_combinations)
+                proteins_combinations = sorted_combos
+            if not proteins_combinations:
+                continue
             proteins_a, proteins_b = zip(*proteins_combinations)
             interactions = [f"{pa}_{pb}" for pa, pb in proteins_combinations]
 
@@ -328,6 +347,12 @@ def main():
     argparser.add_argument("--out_model_dir", type=Path, required=False)
     argparser.add_argument("--model_dir", type=Path, required=False)
     argparser.add_argument("--predict-only", action="store_true")
+    argparser.add_argument(
+        "--max_protein_combinations_per_ddi",
+        type=int,
+        default=None,
+        help="Optional cap on protein-pair instantiations per DDI pair (sampled without replacement). None = use all available combinations.",
+    )
     argparser.add_argument("--seed", type=int, default=42)
     argparser.add_argument(
         "--id", dest="run_id", default=None,
@@ -357,9 +382,8 @@ def main():
     balance_opt_set = model_parameters[
         "balance_positive_and_negative_interactions_train_set"
     ]
-    samples_per_ddi_opt = model_parameters["protein_sample_per_ddi_train_set"]
     threshold = model_parameters.get("threshold", 0.5)
-    predict(args, classifier, balance_opt_set, samples_per_ddi_opt, threshold=threshold)
+    predict(args, classifier, balance_opt_set, threshold=threshold)
 
 
 def train_model(args):
@@ -375,11 +399,11 @@ def train_model(args):
     balance_opt_set = search_parameters[
         "balance_positive_and_negative_interactions_opt_set"
     ]
-    samples_per_ddi_opt = search_parameters["protein_sample_per_ddi_opt_set"]
+    samples_per_ddi = args.max_protein_combinations_per_ddi
 
     outer_loop_runs = len(
         hyperparameters["balance_positive_and_negative_interactions_train_set"]
-    ) * len(hyperparameters["protein_sample_per_ddi_train_set"])
+    )
 
     inner_search_runs = math.ceil(
         search_parameters["models_to_evaluate"] / outer_loop_runs
@@ -401,7 +425,7 @@ def train_model(args):
         args.features,
         args.ddi_path,
         "optimization",
-        samples_per_ddi=samples_per_ddi_opt,
+        samples_per_ddi=samples_per_ddi,
         balance_classes=balance_opt_set,
     )
     num_features = x_opt.shape[1]
@@ -414,91 +438,75 @@ def train_model(args):
     for balance_train_set in hyperparameters[
         "balance_positive_and_negative_interactions_train_set"
     ]:
-        for protein_sample_per_ddi_train_set in hyperparameters[
-            "protein_sample_per_ddi_train_set"
-        ]:
-            hyperparameters_filtered = {
-                k: v
-                for (k, v) in hyperparameters.items()
-                if k
-                not in [
-                    "balance_positive_and_negative_interactions_train_set",
-                    "protein_sample_per_ddi_train_set",
-                ]
-            }
+        hyperparameters_filtered = {
+            k: v
+            for (k, v) in hyperparameters.items()
+            if k != "balance_positive_and_negative_interactions_train_set"
+        }
 
-            # print("Loading training data...")
-            random.seed(args.seed)
-            x_train, y_train = load_embedding_data(
-                args.features_path,
-                args.features,
-                args.ddi_path,
-                "train",
-                balance_classes=balance_train_set,
-                samples_per_ddi=protein_sample_per_ddi_train_set,
+        # print("Loading training data...")
+        random.seed(args.seed)
+        x_train, y_train = load_embedding_data(
+            args.features_path,
+            args.features,
+            args.ddi_path,
+            "train",
+            balance_classes=balance_train_set,
+            samples_per_ddi=samples_per_ddi,
+        )
+
+        x = np.concatenate([x_train, x_opt], axis=0)
+        y = np.concatenate([y_train, y_opt], axis=0)
+
+        split = PredefinedSplit(
+            [-1] * len(x_train) + [0] * len(x_opt)
+        )  # -1 = always train, 0 = validation fold
+
+        # Train Neural Network Classifier model.
+        # iterator_train__shuffle=True is critical: load_embedding_data with
+        # balance_classes=True concatenates `pos + neg`, so unshuffled batches
+        # are class-pure and the model collapses to majority prediction.
+        # Stratified valid split keeps positives in the holdout used by EarlyStopping.
+        classifier = NeuralNetBinaryClassifier(
+            MLPModule,
+            max_epochs=search_parameters["grid_search_epochs"],
+            device=device,
+            verbose=0,
+            module__input_size=num_features,
+            iterator_train__shuffle=True,
+            train_split=ValidSplit(0.2, stratified=True),
+        )
+        grid_search = RandomizedSearchCV(
+            classifier,
+            hyperparameters_filtered,
+            n_iter=inner_search_runs,
+            n_jobs=jobs,
+            cv=split,
+            refit=False,
+            verbose=2,
+            scoring="average_precision",
+        )
+        grid_search.fit(x, y)
+
+        best_model_parameters_and_performance.append(
+            (
+                grid_search.best_params_,
+                grid_search.best_score_,
+                balance_train_set,
             )
+        )
 
-            # print(f"Training data shape: {x_train.shape}, Labels shape: {y_train.shape}")
-            # print(
-            #    f"Number of positive samples: {np.sum(y_train == 1)}, Number of negative samples: {np.sum(y_train == 0)}")
-
-            x = np.concatenate([x_train, x_opt], axis=0)
-            y = np.concatenate([y_train, y_opt], axis=0)
-
-            split = PredefinedSplit(
-                [-1] * len(x_train) + [0] * len(x_opt)
-            )  # -1 = always train, 0 = validation fold
-
-            # Train Neural Network Classifier model.
-            # iterator_train__shuffle=True is critical: load_embedding_data with
-            # balance_classes=True concatenates `pos + neg`, so unshuffled batches
-            # are class-pure and the model collapses to majority prediction.
-            # Stratified valid split keeps positives in the holdout used by EarlyStopping.
-            classifier = NeuralNetBinaryClassifier(
-                MLPModule,
-                max_epochs=search_parameters["grid_search_epochs"],
-                device=device,
-                verbose=0,
-                module__input_size=num_features,
-                iterator_train__shuffle=True,
-                train_split=ValidSplit(0.2, stratified=True),
-            )
-            # grid_search = GridSearchCV(classifier, grid_search_params, n_jobs=args.jobs)
-            grid_search = RandomizedSearchCV(
-                classifier,
-                hyperparameters_filtered,
-                n_iter=inner_search_runs,
-                n_jobs=jobs,
-                cv=split,
-                refit=False,
-                verbose=2,
-                scoring="average_precision",
-            )
-            grid_search.fit(x, y)
-
-            best_model_parameters_and_performance.append(
-                (
-                    grid_search.best_params_,
-                    grid_search.best_score_,
-                    balance_train_set,
-                    protein_sample_per_ddi_train_set,
-                )
-            )
-
-            # B3: free per-iter arrays before next outer-loop fit
-            del x, y, x_train, y_train, classifier, grid_search
-            gc.collect()
+        # B3: free per-iter arrays before next outer-loop fit
+        del x, y, x_train, y_train, classifier, grid_search
+        gc.collect()
 
     best_model_parameters_and_performance.sort(key=lambda x: x[1], reverse=True)
 
     # Refitting on training data with the best parameters
-    params, score, balance_train_set, protein_sample_per_ddi_train_set = (
-        best_model_parameters_and_performance[0]
-    )
+    params, score, balance_train_set = best_model_parameters_and_performance[0]
 
     print(f"Best parameters: {params}")
     print(f"Balance training set: {balance_train_set}")
-    print(f"Protein sample per DDI training set: {protein_sample_per_ddi_train_set}")
 
     # B3: drop x_opt before refit on full train (NN is GPU-bound, no need to
     # keep validation fold materialised in host RAM during retrain). It will
@@ -515,7 +523,7 @@ def train_model(args):
         args.ddi_path,
         "train",
         balance_classes=balance_train_set,
-        samples_per_ddi=protein_sample_per_ddi_train_set,
+        samples_per_ddi=samples_per_ddi,
     )
     n_pos = int(np.sum(y_train == 1))
     n_neg = int(np.sum(y_train == 0))
@@ -539,28 +547,33 @@ def train_model(args):
     del x_train, y_train
     gc.collect()
     random.seed(args.seed)
-    x_opt, y_opt = load_embedding_data(
+    x_opt, y_opt, opt_ddi_pairs = load_embedding_data(
         args.features_path,
         args.features,
         args.ddi_path,
         "optimization",
-        samples_per_ddi=samples_per_ddi_opt,
+        samples_per_ddi=samples_per_ddi,
         balance_classes=balance_opt_set,
+        return_ddi_pairs=True,
     )
     assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
 
-    print("Tuning decision threshold on optimization data via MCC...")
+    print("Tuning decision threshold on DDI-aggregated optimization data via MCC...")
     y_opt_proba = classifier.predict_proba(x_opt)[:, 1]
-    best_thr, best_mcc = _tune_threshold_mcc(y_opt, y_opt_proba)
+    opt_agg = _aggregate_to_ddi_level(opt_ddi_pairs, y_opt, y_opt_proba)
+    best_thr, best_mcc = _tune_threshold_mcc(
+        opt_agg["true_interaction"].values, opt_agg["predicted_probability"].values
+    )
     print(f"Tuned threshold: {best_thr:.3f} (MCC={best_mcc:.3f})")
 
-    y_pred = (y_opt_proba >= best_thr).astype(int)
+    y_pred = (opt_agg["predicted_probability"].values >= best_thr).astype(int)
 
     # create confusion matrix
     confusion_matrix = pd.crosstab(
-        y_opt, y_pred, rownames=["Actual"], colnames=["Predicted"], margins=True
+        opt_agg["true_interaction"].values, y_pred,
+        rownames=["Actual"], colnames=["Predicted"], margins=True,
     )
-    print(f"\nConfusion Matrix:\n\n{confusion_matrix}\n")
+    print(f"\nConfusion Matrix (DDI-level):\n\n{confusion_matrix}\n")
 
     # Save the model
     print("Saving the model...")
@@ -574,7 +587,6 @@ def train_model(args):
             {
                 "model_parameters": params,
                 "balance_positive_and_negative_interactions_train_set": balance_train_set,
-                "protein_sample_per_ddi_train_set": protein_sample_per_ddi_train_set,
                 "threshold": best_thr,
             },
             params_file,
@@ -584,21 +596,20 @@ def train_model(args):
     return classifier
 
 
-def predict(args, classifier, balance_opt_set, samples_per_ddi_opt, threshold=0.5):
+def predict(args, classifier, balance_opt_set, threshold=0.5):
     # Predict on test data
     print("Predicting on test data...")
     print(args.features)
     print(args)
     random.seed(args.seed)
-    x_test, y_test, ddi_pairs, protein_pairs = load_embedding_data(
+    x_test, y_test, ddi_pairs = load_embedding_data(
         args.features_path,
         args.features,
         args.ddi_path,
         "test",
-        samples_per_ddi=samples_per_ddi_opt,
+        samples_per_ddi=args.max_protein_combinations_per_ddi,
         balance_classes=False,
         return_ddi_pairs=True,
-        return_protein_pairs=True,
     )
 
     print(f"Test data shape: {x_test.shape}, Labels shape: {y_test.shape}")
@@ -607,18 +618,18 @@ def predict(args, classifier, balance_opt_set, samples_per_ddi_opt, threshold=0.
     )
 
     y_test_pred_proba = classifier.predict_proba(x_test)[:, 1]
-    y_test_pred = (y_test_pred_proba >= threshold).astype(int)
 
-    # Save predictions. Tight dtypes; parquet by default (5–10× smaller +
-    # faster to read in eval_one); falls back to csv on .csv suffix for
-    # back-compat.
-    predictions_df = pd.DataFrame(ddi_pairs, columns=["domain_a", "domain_b"])
-    predictions_df["protein_a"], predictions_df["protein_b"] = zip(*protein_pairs)
-    predictions_df["true_interaction"] = np.asarray(y_test).astype(np.int8)
-    predictions_df["predicted_interaction"] = np.asarray(y_test_pred).astype(np.int8)
-    predictions_df["predicted_probability"] = np.asarray(y_test_pred_proba).astype(
-        np.float32
-    )
+    # DDI-level aggregation: mean probability over all protein-pair instances
+    # of each (domain_a, domain_b). Yields N = #DDI test pairs, identical
+    # across models for a given DB+feature.
+    predictions_df = _aggregate_to_ddi_level(ddi_pairs, y_test, y_test_pred_proba)
+    predictions_df["predicted_interaction"] = (
+        predictions_df["predicted_probability"].values >= threshold
+    ).astype(np.int8)
+    predictions_df["true_interaction"] = predictions_df["true_interaction"].astype(np.int8)
+    predictions_df = predictions_df[
+        ["domain_a", "domain_b", "true_interaction", "predicted_interaction", "predicted_probability"]
+    ]
     out_path = str(args.out_predictions)
     if out_path.endswith(".csv"):
         predictions_df.to_csv(out_path, index=False)

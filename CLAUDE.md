@@ -34,10 +34,10 @@ Python deps managed via conda — `environments/general.yml` (extraction/RF/grap
 ### Top-level layout
 - `main.nf` — entry. Defines `DOMAINBENCHMARK` workflow (MultiQC + versions/methods boilerplate) and `DAISYBIO_DOMAINBENCHMARK` (the science workflow).
 - `workflows/domainbenchmark.nf` — wires sample channel → `PER_DB_BENCHMARK` (scattered per DB) → `AGGREGATE_EVAL`.
-- `subworkflows/local/per_db_benchmark/main.nf` — scatter: `DDI_EXTRACTION` → `FEATURE_EXTRACTION` (fan-out feature × split) → `MACHINE_LEARNING` + `RANDOM_FOREST` (powerset capped at `params.max_machine_learning_features`) + `GRAPH_MODEL` → `EVAL_ONE` (per-prediction) → `EVALUATION` (per-DB MultiQC reduce).
+- `subworkflows/local/per_db_benchmark/main.nf` — scatter: `DDI_EXTRACTION` → `FEATURE_EXTRACTION` (fan-out feature × split) → `MACHINE_LEARNING` + `RANDOM_FOREST` (per-feature singletons + one all-feature concat run, gated by `params.machine_learning_models`) + `GRAPH_MODEL` → `EVAL_ONE` (per-prediction) → `EVALUATION` (per-DB MultiQC reduce).
 - `subworkflows/local/aggregate_eval/main.nf` — runs `COMBINE_EVAL` across per-DB reports to produce `results/evaluation/ddi_report.html`.
 - `subworkflows/local/utils_nfcore_domainbenchmark_pipeline/main.nf` — nf-core boilerplate (initialise, completion, citations).
-- `nextflow.config` — single source of truth for `db_list` (legacy), `graph_models`, `machine_learning_features`, `large_features`, `max_machine_learning_features`, `skip`, `out_dir`, profiles.
+- `nextflow.config` — single source of truth for `db_list` (legacy), `graph_models`, `machine_learning_models`, `machine_learning_features`, `large_features`, `max_protein_combinations_per_ddi`, `skip`, `out_dir`, profiles.
 - `conf/{base,slurm,test,test_full,modules}.config` — layered config. `conf/base.config` carries retry strategy and per-label resources.
 - `assets/<ModelName>.json` — per-model hyperparameter grid + search config. Filename must match `model_name` and the Python script in `bin/`.
 - `modules/local/<stage>/main.nf` — Nextflow process defs (`ddi_extraction`, `feature_extraction`, `machine_learning`, `random_forest`, `graph_model`, `evaluation`).

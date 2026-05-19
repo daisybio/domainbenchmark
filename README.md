@@ -30,8 +30,8 @@ The pipeline runs the following stages:
 2. **Feature extraction** for every requested encoding (`aacomp`,
    `aaencode`, ProtT5 / ESM-3 / ESM-C protein and domain embeddings) —
    parallelized per `(feature × split)`.
-3. **ML classifiers** trained on every feature combination up to
-   `--max_machine_learning_features`:
+3. **ML classifiers** trained on each feature individually plus one
+   all-feature concatenation run (gated by `--machine_learning_models`):
    - `MACHINE_LEARNING` — neural network (PyTorch + skorch).
    - `RANDOM_FOREST` — RAPIDS cuML random forest on GPU.
 4. **Graph models** (`GRAPH_MODEL`): KGIDDI, DDI parsimony, KGIDDI-random.
@@ -129,7 +129,8 @@ CI and by `nf-test`.
 | `--graph_models` | `kgiddi,ddiparsimony,kgiddi_random` | Graph models to run. |
 | `--machine_learning_features` | `aacomp,aaencode,prott5_*,esm3_*,esmc_*` | Feature encodings to compute. |
 | `--large_features` | `prott5_*,esm3_*,esmc_*` | Features routed to `process_gpu_large`. |
-| `--max_machine_learning_features` | `2` | Max features combined per ML run. |
+| `--machine_learning_models` | `neural_network,random_forest` | ML models to run. |
+| `--max_protein_combinations_per_ddi` | `null` | Cap on protein-pair instantiations per DDI pair (sampled without replacement). Null = use all. |
 | `--seed` | `42` | Global RNG seed. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
 
