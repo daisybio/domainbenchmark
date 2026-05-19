@@ -28,6 +28,54 @@ from tqdm import tqdm
 # each worker's RSS bounded to the size of the subgraph it processes.
 _MP_CTX = mp.get_context("spawn")
 
+
+def _reset_resource_tracker():
+    """Force-recreate the multiprocessing resource_tracker daemon.
+
+    Under spawn, multiprocessing maintains a singleton resource_tracker
+    subprocess to clean up shared semaphores. On long-running parents
+    (kgiddi runs 4-7h under SLURM), that daemon can be reaped by the
+    container/cgroup or have its pipe closed silently. The next
+    ``ProcessPoolExecutor`` then crashes inside ``Queue.__init__`` with
+    ``BrokenPipeError`` from ``resource_tracker._send`` because the
+    cached fd points at a dead reader. Clearing ``_fd``/``_pid`` lets
+    the next ``ensure_running()`` call respawn a fresh daemon.
+    """
+    try:
+        from multiprocessing import resource_tracker as _rt
+        rt = _rt._resource_tracker
+        with rt._lock:
+            if rt._fd is not None:
+                try:
+                    os.close(rt._fd)
+                except OSError:
+                    pass
+            rt._fd = None
+            rt._pid = None
+    except Exception:
+        pass
+
+
+def _new_pool(threads):
+    """Construct ``ProcessPoolExecutor`` with resource_tracker recovery.
+
+    Wraps construction so that a stale resource_tracker daemon (see
+    :func:`_reset_resource_tracker`) is detected by catching
+    ``BrokenPipeError``/``OSError`` from ``Queue``/``Lock`` init, then
+    we clear the tracker state and retry once. A second failure is
+    surfaced as before.
+    """
+    try:
+        return ProcessPoolExecutor(max_workers=threads, mp_context=_MP_CTX)
+    except (BrokenPipeError, OSError) as err:
+        logging.warning(
+            "ProcessPoolExecutor init failed (%s); resetting "
+            "resource_tracker daemon and retrying once.",
+            err,
+        )
+        _reset_resource_tracker()
+        return ProcessPoolExecutor(max_workers=threads, mp_context=_MP_CTX)
+
 from kgiddi_functions import (
     approx_bimax,
     select_best_ddis_per_group,
@@ -254,7 +302,7 @@ def network_expansion(
     in_flight_cap = max(2 * threads, 4)
     log_every = max(in_flight_cap, 100)
     completed = 0
-    with ProcessPoolExecutor(max_workers=threads, mp_context=_MP_CTX) as executor:
+    with _new_pool(threads) as executor:
         in_flight = {}
 
         def _drain_one():
