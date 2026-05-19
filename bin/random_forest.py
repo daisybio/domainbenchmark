@@ -16,26 +16,48 @@ from machine_learning import (
 )
 from pathlib import Path
 from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
-from sklearn.utils.class_weight import compute_sample_weight
 
 
 # Three ways to address the heavy positive-class imbalance in the training set.
-# "none"           — train on raw data, no correction.
-# "downsample"     — load_embedding_data(balance_classes=True): equal pos/neg by
-#                    resampling; preserves the original pipeline behaviour.
-# "sample_weight"  — train on the full data and apply class-balanced weights;
-#                    no information loss, cuML RF accepts sample_weight in fit().
-BALANCE_METHODS = ("none", "downsample", "sample_weight")
+# "none"        — train on raw data, no correction.
+# "downsample"  — load_embedding_data(balance_classes=True): equal pos/neg by
+#                 resampling; preserves the original pipeline behaviour.
+# "oversample"  — replicate minority-class rows to match majority size; keeps
+#                 all original data and is equivalent to balanced integer
+#                 sample weights. cuML RandomForestClassifier.fit() does not
+#                 accept a sample_weight kwarg, so we materialise the weights
+#                 as duplicated rows instead.
+BALANCE_METHODS = ("none", "downsample", "oversample")
+
+
+def _oversample_minority(x, y, seed):
+    """Replicate minority-class rows so class counts match. Returns (x, y)."""
+    rng = np.random.default_rng(seed)
+    y_arr = np.asarray(y).astype(np.int32)
+    classes, counts = np.unique(y_arr, return_counts=True)
+    if len(classes) < 2:
+        return x, y_arr
+    majority_count = counts.max()
+    parts_x = [x]
+    parts_y = [y_arr]
+    for cls, cnt in zip(classes, counts):
+        if cnt >= majority_count:
+            continue
+        idx = np.where(y_arr == cls)[0]
+        need = majority_count - cnt
+        pick = rng.choice(idx, size=need, replace=True)
+        parts_x.append(x[pick])
+        parts_y.append(y_arr[pick])
+    x_out = np.concatenate(parts_x, axis=0)
+    y_out = np.concatenate(parts_y, axis=0)
+    perm = rng.permutation(len(y_out))
+    return x_out[perm], y_out[perm]
 
 
 def _load_train_with_balance(
     args, balance_method: str, samples_per_ddi: int, seed: int
 ):
-    """Load training arrays under one of the three balance strategies.
-
-    Returns (x_train, y_train, sample_weight). sample_weight is None except for
-    balance_method == 'sample_weight'.
-    """
+    """Load training arrays under one of the three balance strategies."""
     if balance_method not in BALANCE_METHODS:
         raise ValueError(f"Unknown balance_method: {balance_method}")
     downsample = balance_method == "downsample"
@@ -48,12 +70,9 @@ def _load_train_with_balance(
         balance_classes=downsample,
         samples_per_ddi=samples_per_ddi,
     )
-    sw = None
-    if balance_method == "sample_weight":
-        sw = compute_sample_weight("balanced", y_train.astype(np.int32)).astype(
-            np.float32
-        )
-    return x_train, y_train, sw
+    if balance_method == "oversample":
+        x_train, y_train = _oversample_minority(x_train, y_train, seed)
+    return x_train, y_train
 
 
 def main():
@@ -176,7 +195,7 @@ def train_model(args):
                 f"[grid] balance_method={balance_method} "
                 f"samples_per_ddi={protein_sample_per_ddi_train_set}"
             )
-            x_train, y_train, sw_train = _load_train_with_balance(
+            x_train, y_train = _load_train_with_balance(
                 args, balance_method, protein_sample_per_ddi_train_set, args.seed
             )
 
@@ -199,14 +218,7 @@ def train_model(args):
                 verbose=2,
                 scoring="average_precision",
             )
-            # sample_weight is sliced per fold by sklearn; pass dummy 1.0 weights
-            # for the opt rows so the array length matches x/y.
-            fit_kwargs = {}
-            if sw_train is not None:
-                fit_kwargs["sample_weight"] = np.concatenate(
-                    [sw_train, np.ones(len(x_opt), dtype=np.float32)]
-                )
-            grid_search.fit(x, y, **fit_kwargs)
+            grid_search.fit(x, y)
 
             best_model_parameters_and_performance.append(
                 (
@@ -218,7 +230,7 @@ def train_model(args):
             )
 
             # B3: drop per-iter buffers before next outer iter
-            del x, y, x_train, y_train, sw_train, classifier, grid_search
+            del x, y, x_train, y_train, classifier, grid_search
             gc.collect()
 
     best_model_parameters_and_performance.sort(key=lambda x: x[1], reverse=True)
@@ -238,7 +250,7 @@ def train_model(args):
     clear_load_cache()
     gc.collect()
 
-    x_train, y_train, sw_train = _load_train_with_balance(
+    x_train, y_train = _load_train_with_balance(
         args, balance_method, protein_sample_per_ddi_train_set, args.seed
     )
     classifier = RandomForestClassifier(**params)
@@ -247,13 +259,10 @@ def train_model(args):
     y_train_i32 = y_train.astype(np.int32)
     del x_train, y_train
     gc.collect()
-    if sw_train is not None:
-        classifier.fit(x_train_f32, y_train_i32, sample_weight=sw_train)
-    else:
-        classifier.fit(x_train_f32, y_train_i32)
+    classifier.fit(x_train_f32, y_train_i32)
 
     # Free training buffers before allocating x_opt again.
-    del x_train_f32, y_train_i32, sw_train
+    del x_train_f32, y_train_i32
     gc.collect()
 
     random.seed(args.seed)
