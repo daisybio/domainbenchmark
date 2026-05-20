@@ -3,6 +3,7 @@
 import gc
 import math
 import random
+import sys
 
 import argparse
 import json
@@ -17,6 +18,33 @@ from machine_learning import (
 )
 from pathlib import Path
 from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
+
+
+# Exit code 140 sits in conf/base.config's retry list (errorStrategy retries on
+# [137, 139, 140, 143, 247]). We use it to flag transient CUDA failures so
+# Nextflow reschedules onto a different GPU node instead of giving up.
+_CUDA_RETRY_EXIT_CODE = 140
+
+
+def _probe_cuda_or_retry():
+    """Run a 1-element GPU op to surface broken CUDA init before grid search.
+
+    Without this, a node-local CUDA glitch (cudaErrorOperatingSystem from
+    stale --nv bind / cgroup race) makes all GridSearchCV fits fail identically
+    and sklearn swallows the exception behind "All N fits failed". We catch it
+    here and exit 140 so the SLURM retry policy moves us to another node.
+    """
+    try:
+        import cupy as cp
+        _ = cp.asarray([1.0], dtype=cp.float32) + 1.0
+        cp.cuda.runtime.deviceSynchronize()
+    except Exception as exc:  # noqa: BLE001 — any CUDA-init failure is fatal here
+        print(
+            f"[random_forest] CUDA smoke test failed ({type(exc).__name__}: {exc}). "
+            "Exiting with retry code so Nextflow reschedules on a different GPU node.",
+            file=sys.stderr,
+        )
+        sys.exit(_CUDA_RETRY_EXIT_CODE)
 
 
 # Three ways to address the heavy positive-class imbalance in the training set.
@@ -131,6 +159,7 @@ def main():
 def train_model(args):
     # cuML is only needed for training; importing it lazily lets --predict-only
     # and --help work on machines without a GPU / without cuML installed.
+    _probe_cuda_or_retry()
     from cuml.ensemble import RandomForestClassifier
 
     # Load the configuration file
@@ -214,6 +243,9 @@ def train_model(args):
             refit=False,
             verbose=2,
             scoring="average_precision",
+            # Surface the real exception on the first failed fit instead of
+            # letting sklearn mask all N folds behind "All N fits failed".
+            error_score="raise",
         )
         grid_search.fit(x, y)
 
