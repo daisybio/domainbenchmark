@@ -183,11 +183,27 @@ A full description of each output is in [`docs/output.md`](docs/output.md).
 
 ## Adding new components
 
-- **New ML model:** add `assets/<Name>.json` (with `model_name`, `data`,
-  `search_parameters`, `model_parameters`) and the matching script in
-  `bin/`. The pipeline picks up the JSON automatically.
-- **New feature encoding:** add `bin/features/<name>.py` and append
-  `<name>` to `params.machine_learning_features` in `nextflow.config`.
+### New feature encoding
+
+Copy the template and implement your feature computation:
+
+1. Copy `bin/features/new_feature.py` to `bin/features/<your_feature>.py`
+2. Implement `extract_features(conn, out_file)` — read from SQLite, write feature vectors to HDF5
+3. Append `<your_feature>` to `params.machine_learning_features` in `nextflow.config`
+4. If it needs GPU or large memory, also add it to `params.large_features`
+
+See `bin/features/new_feature.py` for the full contract and examples.
+
+### New ML model
+
+Copy the template and implement your training/prediction logic:
+
+1. Copy `bin/new_model.py` to `bin/<your_model>.py`
+2. Subclass `DDIModelTrainer` and implement the required methods
+3. Create `assets/<YourModel>.json` with hyperparameter grid (must include `model_name`, `data`, `search_parameters`, `model_parameters`)
+4. Add a Nextflow process in `modules/local/<your_model>/main.nf` and wire it into `subworkflows/local/per_db_benchmark/main.nf`
+
+See `bin/new_model.py` for the full API and optional overrides.
 
 ## Credits
 
