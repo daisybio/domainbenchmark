@@ -32,7 +32,7 @@ The pipeline runs the following stages:
    parallelized per `(feature × split)`.
 3. **ML classifiers** trained on each feature individually plus one
    all-feature concatenation run (gated by `--machine_learning_models`):
-   - `MACHINE_LEARNING` — neural network (PyTorch + skorch).
+   - `NEURAL_NETWORK` — neural network (PyTorch + skorch).
    - `RANDOM_FOREST` — RAPIDS cuML random forest on GPU.
 4. **Graph models** (`GRAPH_MODEL`): KGIDDI, DDI parsimony, KGIDDI-random.
 5. **Per-prediction evaluation** (`EVAL_ONE`) → tiny per-model JSONs.
@@ -44,17 +44,17 @@ flowchart LR
     subgraph "per database"
         ddi[DDI_EXTRACTION]
         feat[FEATURE_EXTRACTION]
-        ml[MACHINE_LEARNING]
+        nn[NEURAL_NETWORK]
         rf[RANDOM_FOREST]
         gm[GRAPH_MODEL]
         eo[EVAL_ONE]
         ev[EVALUATION]
     end
     db[(db_list)] --> ddi
-    db --> feat --> ml & rf
+    db --> feat --> nn & rf
     db --> gm
-    ddi --> ml & rf
-    ml & rf & gm --> eo --> ev
+    ddi --> nn & rf
+    nn & rf & gm --> eo --> ev
     ev --> agg[COMBINE_EVAL] --> report[ddi_report.html]
 ```
 
@@ -148,8 +148,8 @@ For each database split processed, a subdirectory under `--outdir/<db_name>/`:
 │       ├── train.h5
 │       ├── test.h5
 │       └── optimization.h5
-├── ml_output/
-│   └── <feature_combo>/
+├── nn_output/
+│   └── neural_network_<feature_combo>/
 │       ├── predictions.parquet
 │       └── model/
 ├── rf_output/

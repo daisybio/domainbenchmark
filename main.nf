@@ -62,10 +62,7 @@ workflow {
         params.input,
         params.help,
         params.help_full,
-        params.show_hidden,
-        // pipeline-specific input
-        params.db_list,
-        params.db
+        params.show_hidden
     )
 
     //

@@ -12,7 +12,7 @@
         "balance_positive_and_negative_interactions_opt_set": true
     },
     "model_parameters": {
-        "balance_positive_and_negative_interactions_train_set": [true],
+        "balance_method": ["downsample"],
         "module__hidden_layer_sizes": [
             [32, 32, 32],
             [128, 64, 32],

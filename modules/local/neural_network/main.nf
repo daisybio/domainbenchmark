@@ -1,4 +1,4 @@
-process MACHINE_LEARNING {
+process NEURAL_NETWORK {
     tag "${meta.id}"
     label 'process_gpu'
 
@@ -21,7 +21,7 @@ process MACHINE_LEARNING {
         """
         mkdir -p ${output_model_dir}
 
-        machine_learning.py \\
+        neural_network.py \\
             --features ${meta.features.join(' ')} \\
             --features_path features/ \\
             --ddi_path DDI/ \\
@@ -40,7 +40,7 @@ process MACHINE_LEARNING {
         """
 }
 
-process MACHINE_LEARNING_EVALUATION {
+process NEURAL_NETWORK_EVALUATION {
     tag "${meta.id}"
     label 'process_high_memory'
     label 'process_long'
@@ -59,12 +59,12 @@ process MACHINE_LEARNING_EVALUATION {
 
     script:
         def output_base    = "neural_network_${meta.combo_id}"
-        def model_dir      = "${prev_results}/ml_output/${output_base}/model"
+        def model_dir      = "${prev_results}/nn_output/${output_base}/model"
         def max_combos_arg = params.max_protein_combinations_per_ddi ? "--max_protein_combinations_per_ddi ${params.max_protein_combinations_per_ddi}" : ''
         """
         mkdir -p ${output_base}
 
-        machine_learning.py \\
+        neural_network.py \\
             --features ${meta.features.join(' ')} \\
             --features_path features/ \\
             --ddi_path DDI/ \\

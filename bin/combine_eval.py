@@ -56,12 +56,6 @@ def parse_arguments():
     return p.parse_args()
 
 
-def create_section_header(section_id, section_name, outdir):
-    block = {"id": section_id, "section_name": section_name}
-    with open(os.path.join(outdir, f"{section_id}_mqc.json"), "w") as f:
-        json.dump(block, f, indent=2)
-
-
 def write_multiqc_config(outdir) -> str:
     # Write MultiQC config file to specify module order
     # @outdir: output directory where MultiQC JSON files are located
@@ -402,50 +396,6 @@ def combined_pr_curves(pr_data, outdir):
     }
     with open(os.path.join(outdir, "combined_pr_curves_mqc.json"), "w") as f:
         json.dump(pr_block, f, indent=2)
-
-
-def combined_metrics_heatmap(metrics_data, outdir):
-
-    # Heatmap: rows: models/databases, columns: metrics (precision, recall, f1), values: metric scorFoes
-    # Ordered by model name on y-axis, metric name on x-axis
-    # Create data structure for heatmap: {model_name: {metric_name: value}}
-    # Ids are: combined_metrics_table_{db_name}
-
-    # Split the metrics in two parts, for the samples, tp, tn, fp, fn, and for the metrics (Accuracy, Recall, Specificity, Precision, Balanced Accuracy, F1 Score)
-    # Calculate the percentages for the sample sizes
-
-    # For the metrics, create a
-
-    data = {}
-    for block_id, block in metrics_data.items():
-        db_name = block_id.replace("combined_metrics_table_", "")
-        metrics = block.get("data", {})
-        # Each model has a list of metrices
-        for model in metrics.keys():
-            model_name = f"{model} ({db_name})"
-            data[model_name] = metrics[model]
-
-    # force ordering by model_name
-    ordered_model_names = sorted(data.keys())
-    data = {model_name: data[model_name] for model_name in ordered_model_names}
-
-    # Order data by model_name
-    data = {model_name: data[model_name] for model_name in sorted(data.keys())}
-
-    metrics_heatmap_block = {
-        "id": "combined_metrics_heatmap",
-        "section_name": "Combined Metrics Heatmap",
-        "plot_type": "heatmap",
-        "pconfig": {
-            "id": "combined_metrics_heatmap",
-            "title": "Combined Metrics Heatmap",
-            "xlab": "Model",
-            "ylab": "Metric",
-        },
-        "data": data,
-    }
-    with open(os.path.join(outdir, "combined_metrics_heatmap_mqc.json"), "w") as f:
-        json.dump(metrics_heatmap_block, f, indent=2)
 
 
 def model_performance_heatmap(combined_metrics, outdir):

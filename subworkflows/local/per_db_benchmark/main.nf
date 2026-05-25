@@ -7,7 +7,7 @@
             ↓
         FEATURE_EXTRACTION  (scatter (db × feature × split))
             ↓
-        MACHINE_LEARNING + RANDOM_FOREST + GRAPH_MODEL  (per db × combo / model)
+        NEURAL_NETWORK + RANDOM_FOREST + GRAPH_MODEL  (per db × combo / model)
             ↓
         EVAL_ONE  (scatter — one tiny JSON per prediction)
             ↓
@@ -18,7 +18,7 @@
 
 include { DDI_EXTRACTION                                } from '../../../modules/local/ddi_extraction/main.nf'
 include { FEATURE_EXTRACTION                            } from '../../../modules/local/feature_extraction/main.nf'
-include { MACHINE_LEARNING                              } from '../../../modules/local/machine_learning/main.nf'
+include { NEURAL_NETWORK                                } from '../../../modules/local/neural_network/main.nf'
 include { RANDOM_FOREST                                 } from '../../../modules/local/random_forest/main.nf'
 include { GRAPH_MODEL                                   } from '../../../modules/local/graph_model/main.nf'
 include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
@@ -80,10 +80,10 @@ workflow PER_DB_BENCHMARK {
         ddi_keyed = ddi_ch.map { meta, ddi_dir -> tuple(meta.id, meta, ddi_dir) }
 
         // ---------------------------------------------------------------
-        // ML / RF (per-feature singletons + one all-concat run, gated by
+        // NN / RF (per-feature singletons + one all-concat run, gated by
         // params.machine_learning_models and --skip)
         // ---------------------------------------------------------------
-        ml_input_ch = nn_enabled ? ddi_keyed
+        nn_input_ch = nn_enabled ? ddi_keyed
             .join(feature_dirs_per_db)
             .combine(Channel.fromList(feature_combos.collect { [it] }))
             .combine(Channel.value(ml_config))
@@ -98,7 +98,7 @@ workflow PER_DB_BENCHMARK {
                 ]
                 tuple(m, ddi_dir, feature_dirs, cfg)
             } : Channel.empty()
-        MACHINE_LEARNING(ml_input_ch)
+        NEURAL_NETWORK(nn_input_ch)
 
         rf_input_ch = rf_enabled ? ddi_keyed
             .join(feature_dirs_per_db)
@@ -136,7 +136,7 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         // Per-prediction evaluation (scatter)
         // ---------------------------------------------------------------
-        all_predictions_ch = MACHINE_LEARNING.out.predictions
+        all_predictions_ch = NEURAL_NETWORK.out.predictions
             .mix(RANDOM_FOREST.out.predictions)
             .mix(GRAPH_MODEL.out.predictions)
             .map { meta, pred ->
@@ -177,7 +177,7 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         ch_versions = DDI_EXTRACTION.out.versions
             .mix(FEATURE_EXTRACTION.out.versions)
-            .mix(MACHINE_LEARNING.out.versions)
+            .mix(NEURAL_NETWORK.out.versions)
             .mix(RANDOM_FOREST.out.versions)
             .mix(GRAPH_MODEL.out.versions)
             .mix(EVAL_ONE.out.versions)

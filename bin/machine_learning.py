@@ -1,48 +1,27 @@
 #!/usr/bin/env python3
-import itertools
+"""Shared infrastructure for DDI ML models.
 
-import math
+Provides data loading, caching, evaluation utilities, and the DDIModelTrainer
+base class that neural_network.py and random_forest.py extend.
+"""
 
 import argparse
-import h5py
+import collections
+import gc
+import itertools
 import json
+import math
+import random
+
+import h5py
 import numpy as np
 import pandas as pd
-import random
+from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from pathlib import Path
-from sklearn.metrics import matthews_corrcoef, precision_recall_curve
+from sklearn.metrics import matthews_corrcoef
 from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
-from skorch import NeuralNetBinaryClassifier
-from skorch.callbacks import EarlyStopping
-from skorch.dataset import ValidSplit
 from typing import List
-
-import gc
-
-import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-
-class MLPModule(torch.nn.Module):
-    def __init__(
-        self, input_size: int, hidden_layer_sizes: List[int] = [], dropout_rate=0.5
-    ):
-        layer_sizes = (
-            [input_size] + hidden_layer_sizes + [1]
-        )  # Ensure input and output sizes are correct
-        super(MLPModule, self).__init__()
-        layers = []
-        for i in range(len(layer_sizes) - 1):
-            layers.append(torch.nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
-            if i < len(layer_sizes) - 2:
-                layers.append(torch.nn.ReLU())
-                layers.append(torch.nn.Dropout(dropout_rate))
-        self.layers = torch.nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)
 
 
 interaction_encodings = ["protdcal"]
@@ -54,8 +33,6 @@ interaction_encodings = ["protdcal"]
 # Now: keep at most one entry. Outer-loop callers either reload (cheap with
 # h5py memmap) or get a hit when the SAME key repeats inside one inner loop
 # (e.g. final refit immediately after the same grid iter).
-import collections
-
 _LOAD_CACHE_MAX = 1
 _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 
@@ -328,315 +305,234 @@ def load_embedding_data(
             return x, y
 
 
-def main():
-    argparser = argparse.ArgumentParser()
+class DDIModelTrainer(ABC):
+    """Base class for DDI prediction models.
 
-    argparser.add_argument(
-        "--features",
-        nargs="+",
-        required=True,
-    )
-    argparser.add_argument(
-        "--features_path",
-        type=Path,
-        required=True,
-    )
-    argparser.add_argument("--ddi_path", type=Path, required=True)
-    argparser.add_argument("--config", type=Path, required=True)
-    argparser.add_argument("--out_predictions", type=Path, required=True)
-    argparser.add_argument("--out_model_dir", type=Path, required=False)
-    argparser.add_argument("--model_dir", type=Path, required=False)
-    argparser.add_argument("--predict-only", action="store_true")
-    argparser.add_argument(
-        "--max_protein_combinations_per_ddi",
-        type=int,
-        default=None,
-        help="Optional cap on protein-pair instantiations per DDI pair (sampled without replacement). None = use all available combinations.",
-    )
-    argparser.add_argument("--seed", type=int, default=42)
-    argparser.add_argument(
-        "--id", dest="run_id", default=None,
-        help="Optional run ID (logged only).",
-    )
+    Subclasses implement model-specific training, saving, and loading while
+    inheriting the shared training loop, prediction, and evaluation logic.
+    """
 
-    args = argparser.parse_args()
-    if args.run_id:
-        print(f"[machine_learning] run_id={args.run_id}")
+    MODEL_NAME: str
+    MODEL_FILE: str
 
-    if not args.predict_only:
-        classifier = train_model(args)
-        model_json_path = args.out_model_dir / "model_parameters.json"
-    else:
-        module_path = args.model_dir / "NeuralNetwork.pkl"
-        model_json_path = args.model_dir / "model_parameters.json"
-        if not module_path.exists():
-            raise FileNotFoundError(f"Model file {module_path} does not exist.")
-        with module_path.open("rb") as model_file:
-            module = torch.load(model_file, weights_only=False)
-            print(module)
-            classifier = NeuralNetBinaryClassifier(module)
-            classifier.initialize()
+    @abstractmethod
+    def _get_balance_methods(self, hyperparameters: dict) -> list:
+        """Return list of balance method strings from the config."""
 
-    with model_json_path.open("r") as model_json_file:
-        model_parameters = json.load(model_json_file)
-    balance_opt_set = model_parameters[
-        "balance_positive_and_negative_interactions_train_set"
-    ]
-    threshold = model_parameters.get("threshold", 0.5)
-    predict(args, classifier, balance_opt_set, threshold=threshold)
+    @abstractmethod
+    def _balance_keys(self) -> list:
+        """Config keys to exclude from the hyperparameter grid."""
 
+    @abstractmethod
+    def _load_train_data(self, args, balance_method: str, samples_per_ddi, seed: int):
+        """Load training data with the given balance strategy. Returns (x, y)."""
 
-def train_model(args):
-    # Load the configuration file
-    with Path(args.config).open("r") as config_file:
-        config = json.load(config_file)
+    @abstractmethod
+    def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
+        """Create and fit a RandomizedSearchCV. Returns the fitted object."""
 
-    # Load hyperparameters and search parameters from the configuration
-    hyperparameters = config["model_parameters"]
-    search_parameters = config["search_parameters"]
-    best_model_parameters_and_performance = []
+    @abstractmethod
+    def _refit(self, best_params, best_balance, args, config, num_features, samples_per_ddi):
+        """Refit on full training data with best params. Returns the classifier."""
 
-    balance_opt_set = search_parameters[
-        "balance_positive_and_negative_interactions_opt_set"
-    ]
-    samples_per_ddi = args.max_protein_combinations_per_ddi
+    @abstractmethod
+    def _save_model(self, classifier, model_path: Path):
+        """Serialize the trained model to disk."""
 
-    outer_loop_runs = len(
-        hyperparameters["balance_positive_and_negative_interactions_train_set"]
-    )
+    @abstractmethod
+    def _load_model(self, model_path: Path):
+        """Deserialize a trained model from disk."""
 
-    inner_search_runs = math.ceil(
-        search_parameters["models_to_evaluate"] / outer_loop_runs
-    )
-    device = config["device"]
-    if device in ("auto", "cuda") and not torch.cuda.is_available():
-        print("CUDA requested but not available — falling back to CPU.")
-        device = "cpu"
-    elif device == "auto":
-        device = "cuda"
-    print(f"Training device: {device}")
-    jobs = config["jobs"]
+    def _pre_train_hook(self):
+        """Called before training starts. Override for e.g. CUDA probe."""
+        pass
 
-    # Load optimization data
-    print("Loading optimization data...")
-    random.seed(args.seed)
-    x_opt, y_opt = load_embedding_data(
-        args.features_path,
-        args.features,
-        args.ddi_path,
-        "optimization",
-        samples_per_ddi=samples_per_ddi,
-        balance_classes=balance_opt_set,
-    )
-    num_features = x_opt.shape[1]
-    print(f"Optimization data shape: {x_opt.shape}, Labels shape: {y_opt.shape}")
-    print(
-        f"Number of positive samples: {np.sum(y_opt == 1)}, Number of negative samples: {np.sum(y_opt == 0)}"
-    )
+    def _predict_proba(self, classifier, x):
+        """Get predicted probabilities. Override if dtype casting needed."""
+        return classifier.predict_proba(x)[:, 1]
 
-    print("Starting grid search for hyperparameter tuning...")
-    for balance_train_set in hyperparameters[
-        "balance_positive_and_negative_interactions_train_set"
-    ]:
-        hyperparameters_filtered = {
-            k: v
-            for (k, v) in hyperparameters.items()
-            if k != "balance_positive_and_negative_interactions_train_set"
+    @classmethod
+    def build_argparser(cls):
+        argparser = argparse.ArgumentParser()
+        argparser.add_argument("--features", nargs="+", required=True)
+        argparser.add_argument("--features_path", type=Path, required=True)
+        argparser.add_argument("--ddi_path", type=Path, required=True)
+        argparser.add_argument("--config", type=Path, required=True)
+        argparser.add_argument("--out_predictions", type=Path, required=True)
+        argparser.add_argument("--out_model_dir", type=Path, required=False)
+        argparser.add_argument("--model_dir", type=Path, required=False)
+        argparser.add_argument("--predict-only", action="store_true")
+        argparser.add_argument(
+            "--max_protein_combinations_per_ddi", type=int, default=None,
+            help="Optional cap on protein-pair instantiations per DDI pair (sampled without replacement). None = use all available combinations.",
+        )
+        argparser.add_argument("--seed", type=int, default=42)
+        argparser.add_argument(
+            "--id", dest="run_id", default=None,
+            help="Optional run ID (logged only).",
+        )
+        return argparser
+
+    def run(self):
+        args = self.build_argparser().parse_args()
+        if args.run_id:
+            print(f"[{self.MODEL_NAME}] run_id={args.run_id}")
+
+        if not args.predict_only:
+            classifier = self.train(args)
+            model_json_path = args.out_model_dir / "model_parameters.json"
+        else:
+            model_path = args.model_dir / self.MODEL_FILE
+            if not model_path.exists():
+                raise FileNotFoundError(f"Model file {model_path} does not exist.")
+            classifier = self._load_model(model_path)
+            model_json_path = args.model_dir / "model_parameters.json"
+
+        with model_json_path.open("r") as f:
+            model_parameters = json.load(f)
+        threshold = model_parameters.get("threshold", 0.5)
+        self.predict(args, classifier, threshold)
+
+    def predict(self, args, classifier, threshold=0.5):
+        print("Predicting on test data...")
+        print(args.features)
+        print(args)
+        random.seed(args.seed)
+        x_test, y_test, ddi_pairs = load_embedding_data(
+            args.features_path, args.features, args.ddi_path, "test",
+            samples_per_ddi=args.max_protein_combinations_per_ddi,
+            balance_classes=False, return_ddi_pairs=True,
+        )
+
+        print(f"Test data shape: {x_test.shape}, Labels shape: {y_test.shape}")
+        print(
+            f"Number of positive samples: {np.sum(y_test == 1)}, Number of negative samples: {np.sum(y_test == 0)}"
+        )
+
+        y_test_pred_proba = self._predict_proba(classifier, x_test)
+
+        predictions_df = _aggregate_to_ddi_level(ddi_pairs, y_test, y_test_pred_proba)
+        predictions_df["predicted_interaction"] = (
+            predictions_df["predicted_probability"].values >= threshold
+        ).astype(np.int8)
+        predictions_df["true_interaction"] = predictions_df["true_interaction"].astype(np.int8)
+        predictions_df = predictions_df[
+            ["domain_a", "domain_b", "true_interaction", "predicted_interaction", "predicted_probability"]
+        ]
+        out_path = str(args.out_predictions)
+        if out_path.endswith(".csv"):
+            predictions_df.to_csv(out_path, index=False)
+        else:
+            predictions_df.to_parquet(out_path, index=False, compression="zstd")
+        print(f"Predictions saved to {out_path}")
+
+    def train(self, args):
+        self._pre_train_hook()
+
+        with Path(args.config).open("r") as config_file:
+            config = json.load(config_file)
+
+        hyperparameters = config["model_parameters"]
+        search_parameters = config["search_parameters"]
+        balance_methods = self._get_balance_methods(hyperparameters)
+        samples_per_ddi = args.max_protein_combinations_per_ddi
+        balance_opt_set = search_parameters[
+            "balance_positive_and_negative_interactions_opt_set"
+        ]
+
+        n_iter = math.ceil(
+            search_parameters["models_to_evaluate"] / len(balance_methods)
+        )
+
+        print("Loading optimization data...")
+        random.seed(args.seed)
+        x_opt, y_opt = load_embedding_data(
+            args.features_path, args.features, args.ddi_path, "optimization",
+            samples_per_ddi=samples_per_ddi, balance_classes=balance_opt_set,
+        )
+        num_features = x_opt.shape[1]
+        print(f"Optimization data shape: {x_opt.shape}, Labels shape: {y_opt.shape}")
+        print(
+            f"Number of positive samples: {np.sum(y_opt == 1)}, Number of negative samples: {np.sum(y_opt == 0)}"
+        )
+
+        print("Starting grid search for hyperparameter tuning...")
+        results = []
+        hparams_filtered = {
+            k: v for k, v in hyperparameters.items()
+            if k not in self._balance_keys()
         }
 
-        # print("Loading training data...")
-        random.seed(args.seed)
-        x_train, y_train = load_embedding_data(
-            args.features_path,
-            args.features,
-            args.ddi_path,
-            "train",
-            balance_classes=balance_train_set,
-            samples_per_ddi=samples_per_ddi,
-        )
-
-        x = np.concatenate([x_train, x_opt], axis=0)
-        y = np.concatenate([y_train, y_opt], axis=0)
-
-        split = PredefinedSplit(
-            [-1] * len(x_train) + [0] * len(x_opt)
-        )  # -1 = always train, 0 = validation fold
-
-        # Train Neural Network Classifier model.
-        # iterator_train__shuffle=True is critical: load_embedding_data with
-        # balance_classes=True concatenates `pos + neg`, so unshuffled batches
-        # are class-pure and the model collapses to majority prediction.
-        # Stratified valid split keeps positives in the holdout used by EarlyStopping.
-        classifier = NeuralNetBinaryClassifier(
-            MLPModule,
-            max_epochs=search_parameters["grid_search_epochs"],
-            device=device,
-            verbose=0,
-            module__input_size=num_features,
-            iterator_train__shuffle=True,
-            train_split=ValidSplit(0.2, stratified=True),
-        )
-        grid_search = RandomizedSearchCV(
-            classifier,
-            hyperparameters_filtered,
-            n_iter=inner_search_runs,
-            n_jobs=jobs,
-            cv=split,
-            refit=False,
-            verbose=2,
-            scoring="average_precision",
-        )
-        grid_search.fit(x, y)
-
-        best_model_parameters_and_performance.append(
-            (
-                grid_search.best_params_,
-                grid_search.best_score_,
-                balance_train_set,
+        for balance_method in balance_methods:
+            print(f"[grid] balance_method={balance_method}")
+            x_train, y_train = self._load_train_data(
+                args, balance_method, samples_per_ddi, args.seed
             )
-        )
 
-        # B3: free per-iter arrays before next outer-loop fit
-        del x, y, x_train, y_train, classifier, grid_search
+            x = np.concatenate([x_train, x_opt], axis=0)
+            y = np.concatenate([y_train, y_opt], axis=0)
+            split = PredefinedSplit([-1] * len(x_train) + [0] * len(x_opt))
+
+            gs = self._create_grid_search(
+                hparams_filtered, n_iter, split, x, y, config, num_features
+            )
+            results.append((gs.best_params_, gs.best_score_, balance_method))
+
+            del x, y, x_train, y_train, gs
+            gc.collect()
+
+        results.sort(key=lambda r: r[1], reverse=True)
+        best_params, _, best_balance = results[0]
+
+        print(f"Best parameters: {best_params}")
+        print(f"Balance method: {best_balance}")
+
+        x_opt_shape = x_opt.shape
+        del x_opt, y_opt
+        clear_load_cache()
         gc.collect()
 
-    best_model_parameters_and_performance.sort(key=lambda x: x[1], reverse=True)
-
-    # Refitting on training data with the best parameters
-    params, score, balance_train_set = best_model_parameters_and_performance[0]
-
-    print(f"Best parameters: {params}")
-    print(f"Balance training set: {balance_train_set}")
-
-    # B3: drop x_opt before refit on full train (NN is GPU-bound, no need to
-    # keep validation fold materialised in host RAM during retrain). It will
-    # be reloaded for threshold tuning right after.
-    x_opt_shape = x_opt.shape
-    del x_opt, y_opt
-    clear_load_cache()
-    gc.collect()
-
-    random.seed(args.seed)
-    x_train, y_train = load_embedding_data(
-        args.features_path,
-        args.features,
-        args.ddi_path,
-        "train",
-        balance_classes=balance_train_set,
-        samples_per_ddi=samples_per_ddi,
-    )
-    n_pos = int(np.sum(y_train == 1))
-    n_neg = int(np.sum(y_train == 0))
-    pos_weight = torch.tensor([n_neg / max(n_pos, 1)])
-    classifier = NeuralNetBinaryClassifier(
-        MLPModule,
-        max_epochs=search_parameters["retrain_epochs"],
-        device=device,
-        **params,
-        verbose=1,
-        module__input_size=num_features,
-        criterion__pos_weight=pos_weight,
-        iterator_train__shuffle=True,
-        train_split=ValidSplit(0.2, stratified=True),
-        callbacks=[EarlyStopping(patience=5, monitor="valid_loss")],
-    )
-    print("Refitting best parameter model on training data...")
-    classifier.fit(x_train, y_train)
-
-    # B3: x_train no longer needed once refit done; reload x_opt for thresholding.
-    del x_train, y_train
-    gc.collect()
-    random.seed(args.seed)
-    x_opt, y_opt, opt_ddi_pairs = load_embedding_data(
-        args.features_path,
-        args.features,
-        args.ddi_path,
-        "optimization",
-        samples_per_ddi=samples_per_ddi,
-        balance_classes=balance_opt_set,
-        return_ddi_pairs=True,
-    )
-    assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
-
-    print("Tuning decision threshold on DDI-aggregated optimization data via MCC...")
-    y_opt_proba = classifier.predict_proba(x_opt)[:, 1]
-    opt_agg = _aggregate_to_ddi_level(opt_ddi_pairs, y_opt, y_opt_proba)
-    best_thr, best_mcc = _tune_threshold_mcc(
-        opt_agg["true_interaction"].values, opt_agg["predicted_probability"].values
-    )
-    print(f"Tuned threshold: {best_thr:.3f} (MCC={best_mcc:.3f})")
-
-    y_pred = (opt_agg["predicted_probability"].values >= best_thr).astype(int)
-
-    # create confusion matrix
-    confusion_matrix = pd.crosstab(
-        opt_agg["true_interaction"].values, y_pred,
-        rownames=["Actual"], colnames=["Predicted"], margins=True,
-    )
-    print(f"\nConfusion Matrix (DDI-level):\n\n{confusion_matrix}\n")
-
-    # Save the model
-    print("Saving the model...")
-    args.out_model_dir.mkdir(parents=True, exist_ok=True)
-    model_path = args.out_model_dir / "NeuralNetwork.pkl"
-    with model_path.open("wb") as model_file:
-        torch.save(classifier.module_, model_file)
-    params_path = args.out_model_dir / "model_parameters.json"
-    with params_path.open("w") as params_file:
-        json.dump(
-            {
-                "model_parameters": params,
-                "balance_positive_and_negative_interactions_train_set": balance_train_set,
-                "threshold": best_thr,
-            },
-            params_file,
-            indent=4,
+        classifier = self._refit(
+            best_params, best_balance, args, config, num_features, samples_per_ddi
         )
 
-    return classifier
+        random.seed(args.seed)
+        x_opt, y_opt, opt_ddi_pairs = load_embedding_data(
+            args.features_path, args.features, args.ddi_path, "optimization",
+            samples_per_ddi=samples_per_ddi, balance_classes=balance_opt_set,
+            return_ddi_pairs=True,
+        )
+        assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
 
+        print("Tuning decision threshold on DDI-aggregated optimization data via MCC...")
+        y_opt_proba = self._predict_proba(classifier, x_opt)
+        opt_agg = _aggregate_to_ddi_level(opt_ddi_pairs, y_opt, y_opt_proba)
+        best_thr, best_mcc = _tune_threshold_mcc(
+            opt_agg["true_interaction"].values,
+            opt_agg["predicted_probability"].values,
+        )
+        print(f"Tuned threshold: {best_thr:.3f} (MCC={best_mcc:.3f})")
 
-def predict(args, classifier, balance_opt_set, threshold=0.5):
-    # Predict on test data
-    print("Predicting on test data...")
-    print(args.features)
-    print(args)
-    random.seed(args.seed)
-    x_test, y_test, ddi_pairs = load_embedding_data(
-        args.features_path,
-        args.features,
-        args.ddi_path,
-        "test",
-        samples_per_ddi=args.max_protein_combinations_per_ddi,
-        balance_classes=False,
-        return_ddi_pairs=True,
-    )
+        y_pred = (opt_agg["predicted_probability"].values >= best_thr).astype(int)
+        confusion_matrix = pd.crosstab(
+            opt_agg["true_interaction"].values, y_pred,
+            rownames=["Actual"], colnames=["Predicted"], margins=True,
+        )
+        print(f"\nConfusion Matrix (DDI-level):\n\n{confusion_matrix}\n")
 
-    print(f"Test data shape: {x_test.shape}, Labels shape: {y_test.shape}")
-    print(
-        f"Number of positive samples: {np.sum(y_test == 1)}, Number of negative samples: {np.sum(y_test == 0)}"
-    )
+        print("Saving the model...")
+        args.out_model_dir.mkdir(parents=True, exist_ok=True)
+        self._save_model(classifier, args.out_model_dir / self.MODEL_FILE)
+        params_path = args.out_model_dir / "model_parameters.json"
+        with params_path.open("w") as f:
+            json.dump(
+                {
+                    "model_parameters": best_params,
+                    "balance_method": best_balance,
+                    "threshold": best_thr,
+                },
+                f,
+                indent=4,
+            )
 
-    y_test_pred_proba = classifier.predict_proba(x_test)[:, 1]
-
-    # DDI-level aggregation: mean probability over all protein-pair instances
-    # of each (domain_a, domain_b). Yields N = #DDI test pairs, identical
-    # across models for a given DB+feature.
-    predictions_df = _aggregate_to_ddi_level(ddi_pairs, y_test, y_test_pred_proba)
-    predictions_df["predicted_interaction"] = (
-        predictions_df["predicted_probability"].values >= threshold
-    ).astype(np.int8)
-    predictions_df["true_interaction"] = predictions_df["true_interaction"].astype(np.int8)
-    predictions_df = predictions_df[
-        ["domain_a", "domain_b", "true_interaction", "predicted_interaction", "predicted_probability"]
-    ]
-    out_path = str(args.out_predictions)
-    if out_path.endswith(".csv"):
-        predictions_df.to_csv(out_path, index=False)
-    else:
-        predictions_df.to_parquet(out_path, index=False, compression="zstd")
-    print(f"Predictions saved to {out_path}")
-
-
-if __name__ == "__main__":
-    main()
+        return classifier

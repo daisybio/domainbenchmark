@@ -20,20 +20,8 @@
                     "mimetype": "text/csv",
                     "pattern": "^\\S+\\.csv$",
                     "description": "Path to comma-separated samplesheet listing database splits to run.",
-                    "help_text": "Optional. CSV with one row per database split (columns: id, db_path). Use this OR --db / --db_list, not both.",
+                    "help_text": "CSV with one row per database split (columns: id, db_path). Relative db_path values are resolved against the project directory.",
                     "fa_icon": "fas fa-file-csv"
-                },
-                "db": {
-                    "type": "string",
-                    "format": "directory-path",
-                    "description": "Path to a single database split directory containing train.sqlite3, test.sqlite3, optimization.sqlite3.",
-                    "fa_icon": "fas fa-folder"
-                },
-                "db_list": {
-                    "type": "string",
-                    "description": "Comma-separated list of database split directories to run as a scatter.",
-                    "help_text": "Mutually exclusive with --db. Each entry must contain train.sqlite3 / test.sqlite3 / optimization.sqlite3.",
-                    "fa_icon": "fas fa-folder-tree"
                 },
                 "outdir": {
                     "type": "string",

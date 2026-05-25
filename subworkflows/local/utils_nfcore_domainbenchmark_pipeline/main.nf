@@ -33,9 +33,6 @@ workflow PIPELINE_INITIALISATION {
     help              // boolean: Display help message and exit
     help_full         // boolean: Show the full help message
     show_hidden       // boolean: Show hidden parameters in the help message
-    // pipeline-specific input
-    db_list           //  string: Comma-separated list of databases to benchmark
-    db                //  string: Single database to benchmark (alternative to --db_list or --input samplesheet)
 
     main:
 
@@ -90,28 +87,14 @@ workflow PIPELINE_INITIALISATION {
             .fromPath(params.input, checkIfExists: true)
             .splitCsv(header: true)
             .map { row ->
-                def db_path = file(row.db_path, checkIfExists: true)
+                def db_path = row.db_path.startsWith('/')
+                    ? file(row.db_path, checkIfExists: true)
+                    : file("${workflow.projectDir}/${row.db_path}", checkIfExists: true)
                 def id      = row.id ?: db_path.getName()
                 tuple([ id: id, db: id ], db_path)
             }
-    } else if (params.db_list) {
-        def items = params.db_list instanceof List
-            ? params.db_list
-            : params.db_list.tokenize(',')*.trim().findAll { it }
-        db_ch = Channel
-            .fromList(items)
-            .map { p ->
-                def db_path = file(p, checkIfExists: true)
-                tuple([ id: db_path.getName(), db: db_path.getName() ], db_path)
-            }
-    } else if (params.db) {
-        def db_path = file(params.db, checkIfExists: true)
-        db_ch = Channel.value(tuple(
-            [ id: db_path.getName(), db: db_path.getName() ],
-            db_path
-        ))
     } else {
-        error "No input provided: set --input <samplesheet.csv>, --db_list <csv>, or --db <path>"
+        error "No input provided: set --input <samplesheet.csv>"
     }
 
     emit:

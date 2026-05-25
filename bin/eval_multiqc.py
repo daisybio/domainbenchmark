@@ -89,13 +89,6 @@ def add_db_name_to_block(block, db_name):
     return block
 
 
-def load_old_multiqc_data(old_report_dir):
-    # @old_report_dir: directory containing old MultiQC report
-    # Returns loaded MultiQC object with parsed logs
-    search_path = f"{old_report_dir}/{REPORT_NAME}_data/"
-    multiqc.parse_logs(search_path, preserve_module_raw_data=True)
-    return multiqc
-
 
 def copy_old_report_blocks(old_report_dir, out_dir):
     # @old_report_dir: directory containing old MultiQC report
@@ -129,6 +122,29 @@ def merge_data(old, new):
         if sample in new:
             merged[sample].update(new[sample])
     return merged
+
+
+def _write_distribution_block(data, metric, label, interaction_type, db_name, outdir):
+    block_id = f"{DB_PREFIX}{interaction_type}_{metric}_distribution"
+    block = {
+        "id": block_id,
+        "section_name": f"{interaction_type.upper()} {label} Distribution",
+        "plot_type": "box",
+        "pconfig": {
+            "id": block_id,
+            "title": f"{interaction_type.upper()} {label} Distribution",
+            "xlab": "Database",
+            "ylab": label,
+        },
+        "data": data,
+        "raw_data": data,
+    }
+    block = add_db_name_to_block(block, db_name)
+    with open(
+        os.path.join(outdir, f"{interaction_type}_{metric}_distribution_{db_name}_db_mqc.json"),
+        "w",
+    ) as f:
+        json.dump(block, f, indent=2)
 
 
 def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
@@ -199,79 +215,19 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
                 f"{network_type}_network_data"
             ]["clustering_coefficient"]
 
-    # Write MultiQC JSON blocks for box plots, each model_type/interaction_type combination gets its own block
-    # for db_type in degree_distributions:
     for interaction_type in ["ppi", "ddi"]:
-        # Degree Distribution Block
-        degree_block = {
-            "id": f"{DB_PREFIX}{interaction_type}_degree_distribution",
-            "section_name": f"{interaction_type.upper()} Degree Distribution",
-            "plot_type": "box",
-            "pconfig": {
-                "id": f"{DB_PREFIX}{interaction_type}_degree_distribution",
-                "title": f"{interaction_type.upper()} Degree Distribution",
-                "xlab": "Database",
-                "ylab": "Degree",
-            },
-            "data": degree_distributions[interaction_type],
-            "raw_data": degree_distributions[interaction_type],
-        }
-        degree_block = add_db_name_to_block(degree_block, db_name)
-        with open(
-            os.path.join(
-                outdir, f"{interaction_type}_degree_distribution_{db_name}_db_mqc.json"
-            ),
-            "w",
-        ) as f:
-            json.dump(degree_block, f, indent=2)
-
-        # Betweenness Centrality Block
-        betweenness_block = {
-            "id": f"{DB_PREFIX}{interaction_type}_betweenness_distribution",
-            "section_name": f"{interaction_type.upper()} Betweenness Centrality Distribution",
-            "plot_type": "box",
-            "pconfig": {
-                "id": f"{DB_PREFIX}{interaction_type}_betweenness_distribution",
-                "title": f"{interaction_type.upper()} Betweenness Centrality Distribution",
-                "xlab": "Database",
-                "ylab": "Betweenness Centrality",
-            },
-            "data": betweenness_distributions[interaction_type],
-            "raw_data": betweenness_distributions[interaction_type],
-        }
-        betweenness_block = add_db_name_to_block(betweenness_block, db_name)
-        with open(
-            os.path.join(
-                outdir,
-                f"{interaction_type}_betweenness_distribution_{db_name}_db_mqc.json",
-            ),
-            "w",
-        ) as f:
-            json.dump(betweenness_block, f, indent=2)
-
-        # Clustering Coefficient Block
-        clustering_block = {
-            "id": f"{DB_PREFIX}{interaction_type}_clustering_distribution",
-            "section_name": f"{interaction_type.upper()} Clustering Coefficient Distribution",
-            "plot_type": "box",
-            "pconfig": {
-                "id": f"{DB_PREFIX}{interaction_type}_clustering_distribution",
-                "title": f"{interaction_type.upper()} Clustering Coefficient Distribution",
-                "xlab": "Database",
-                "ylab": "Clustering Coefficient",
-            },
-            "data": clustering_distributions[interaction_type],
-            "raw_data": clustering_distributions[interaction_type],
-        }
-        clustering_block = add_db_name_to_block(clustering_block, db_name)
-        with open(
-            os.path.join(
-                outdir,
-                f"{interaction_type}_clustering_distribution_{db_name}_db_mqc.json",
-            ),
-            "w",
-        ) as f:
-            json.dump(clustering_block, f, indent=2)
+        _write_distribution_block(
+            degree_distributions[interaction_type], "degree", "Degree",
+            interaction_type, db_name, outdir,
+        )
+        _write_distribution_block(
+            betweenness_distributions[interaction_type], "betweenness", "Betweenness Centrality",
+            interaction_type, db_name, outdir,
+        )
+        _write_distribution_block(
+            clustering_distributions[interaction_type], "clustering", "Clustering Coefficient",
+            interaction_type, db_name, outdir,
+        )
 
 
 def load_old_json_block(old_report_dir, file_name_suffix, block_id):
@@ -295,7 +251,7 @@ def load_old_json_block(old_report_dir, file_name_suffix, block_id):
     return None
 
 
-def write_multiqc_json_metrices(
+def write_multiqc_json_metrics(
     metrics_aucap,
     roc_curves,
     pr_curves,
@@ -802,7 +758,7 @@ def main():
     print(f"[INFO] Database analysis completed for: {db_name}")
 
     # Part4: MultiQC JSON
-    write_multiqc_json_metrices(
+    write_multiqc_json_metrics(
         metrics_auc_pr,
         roc_curves,
         pr_curves,

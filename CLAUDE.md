@@ -34,13 +34,13 @@ Python deps managed via conda — `environments/general.yml` (extraction/RF/grap
 ### Top-level layout
 - `main.nf` — entry. Defines `DOMAINBENCHMARK` workflow (MultiQC + versions/methods boilerplate) and `DAISYBIO_DOMAINBENCHMARK` (the science workflow).
 - `workflows/domainbenchmark.nf` — wires sample channel → `PER_DB_BENCHMARK` (scattered per DB) → `AGGREGATE_EVAL`.
-- `subworkflows/local/per_db_benchmark/main.nf` — scatter: `DDI_EXTRACTION` → `FEATURE_EXTRACTION` (fan-out feature × split) → `MACHINE_LEARNING` + `RANDOM_FOREST` (per-feature singletons + one all-feature concat run, gated by `params.machine_learning_models`) + `GRAPH_MODEL` → `EVAL_ONE` (per-prediction) → `EVALUATION` (per-DB MultiQC reduce).
+- `subworkflows/local/per_db_benchmark/main.nf` — scatter: `DDI_EXTRACTION` → `FEATURE_EXTRACTION` (fan-out feature × split) → `NEURAL_NETWORK` + `RANDOM_FOREST` (per-feature singletons + one all-feature concat run, gated by `params.machine_learning_models`) + `GRAPH_MODEL` → `EVAL_ONE` (per-prediction) → `EVALUATION` (per-DB MultiQC reduce).
 - `subworkflows/local/aggregate_eval/main.nf` — runs `COMBINE_EVAL` across per-DB reports to produce `results/evaluation/ddi_report.html`.
 - `subworkflows/local/utils_nfcore_domainbenchmark_pipeline/main.nf` — nf-core boilerplate (initialise, completion, citations).
 - `nextflow.config` — single source of truth for `db_list` (legacy), `graph_models`, `machine_learning_models`, `machine_learning_features`, `large_features`, `max_protein_combinations_per_ddi`, `skip`, `out_dir`, profiles.
 - `conf/{base,slurm,test,test_full,modules}.config` — layered config. `conf/base.config` carries retry strategy and per-label resources.
 - `assets/<ModelName>.json` — per-model hyperparameter grid + search config. Filename must match `model_name` and the Python script in `bin/`.
-- `modules/local/<stage>/main.nf` — Nextflow process defs (`ddi_extraction`, `feature_extraction`, `machine_learning`, `random_forest`, `graph_model`, `evaluation`).
+- `modules/local/<stage>/main.nf` — Nextflow process defs (`ddi_extraction`, `feature_extraction`, `neural_network`, `random_forest`, `graph_model`, `evaluation`).
 - `bin/` — Python entrypoints invoked by modules (`run_models.py`, `random_forest.py`, `run_graph_models.py`, `kgiddi.py`, `ddiparsimony.py`, `extract_features.py`, `eval_one.py`, `eval_multiqc.py`, `combine_eval.py`, `load_data_gm.py`). Auto on `PATH` from Nextflow.
 - `bin/features/` — feature encoders (`aacomp`, `aaencode`, `dummy`, `embeddings`, `protdcal`, `esm3_*`, `esmc_*`, `prott5_*`). New feature = new file here + entry in `params.machine_learning_features`. Heavy ones go in `params.large_features` → routed to `process_gpu_large`.
 - `docker/`, `containers_{docker,singularity,conda_lock}_{amd64,arm64}.config` — container/lock matrices.
@@ -49,7 +49,7 @@ Python deps managed via conda — `environments/general.yml` (extraction/RF/grap
 1. Input: samplesheet of `{id, db_path}`. Each `db_path` contains `train/test/optimization.sqlite3` (tables: DDI, DGO, PD, DomSeq, PPI, PGO, Embeddings).
 2. `DDI_EXTRACTION` → SQL → CSV per split.
 3. `FEATURE_EXTRACTION` (fan-out per feature × split) → per-feature `train/test/optimization.h5` under `results/<db>/data/<feature>/`.
-4. `MACHINE_LEARNING` / `RANDOM_FOREST` consume `.h5`, grid-search via model JSON, predictions to `results/<db>/ml_output/`.
+4. `NEURAL_NETWORK` / `RANDOM_FOREST` consume `.h5`, grid-search via model JSON, predictions to `results/<db>/nn_output/` and `results/<db>/rf_output/`.
 5. `GRAPH_MODEL` (KGIDDI, DDIParsimony, KGIDDI_RANDOM) runs independently against sqlite splits → `results/<db>/graph_models/<model>/`.
 6. `EVAL_ONE` per-prediction → `EVALUATION` per-DB MultiQC → `results/<db>/evaluation/evaluation.html`.
 7. `AGGREGATE_EVAL` / `COMBINE_EVAL` → `results/evaluation/ddi_report.html`.
