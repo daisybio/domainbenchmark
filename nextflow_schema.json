@@ -81,9 +81,9 @@
                 },
                 "max_protein_combinations_per_ddi": {
                     "type": ["integer", "null"],
-                    "default": 15,
+                    "default": null,
                     "minimum": 1,
-                    "description": "Cap on protein-pair instantiations per DDI domain pair for ML / RF training and prediction. Sampled without replacement; if fewer combinations exist than the cap, all are used. Leave null / unset to use every available combination.",
+                    "description": "Cap on protein-pair instantiations per DDI domain pair for ML / RF training and prediction. Sampled without replacement; if fewer combinations exist than the cap, all are used. Leave null / unset to use every available combination. Default: 15.",
                     "fa_icon": "fas fa-random"
                 },
                 "modeljson": {
