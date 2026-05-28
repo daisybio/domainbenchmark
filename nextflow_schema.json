@@ -20,20 +20,8 @@
                     "mimetype": "text/csv",
                     "pattern": "^\\S+\\.csv$",
                     "description": "Path to comma-separated samplesheet listing database splits to run.",
-                    "help_text": "Optional. CSV with one row per database split (columns: id, db_path). Use this OR --db / --db_list, not both.",
+                    "help_text": "CSV with one row per database split (columns: id, db_path). Relative db_path values are resolved against the project directory.",
                     "fa_icon": "fas fa-file-csv"
-                },
-                "db": {
-                    "type": "string",
-                    "format": "directory-path",
-                    "description": "Path to a single database split directory containing train.sqlite3, test.sqlite3, optimization.sqlite3.",
-                    "fa_icon": "fas fa-folder"
-                },
-                "db_list": {
-                    "type": "string",
-                    "description": "Comma-separated list of database split directories to run as a scatter.",
-                    "help_text": "Mutually exclusive with --db. Each entry must contain train.sqlite3 / test.sqlite3 / optimization.sqlite3.",
-                    "fa_icon": "fas fa-folder-tree"
                 },
                 "outdir": {
                     "type": "string",
@@ -66,13 +54,20 @@
                 "graph_models": {
                     "type": "string",
                     "default": "kgiddi,ddiparsimony,kgiddi_random",
-                    "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
-                    "description": "Comma-separated list of graph-based DDI models to run.",
+                    "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
+                    "description": "Comma-separated list of graph-based DDI models to run. Pass 'none' (or an empty string) to disable.",
                     "fa_icon": "fas fa-project-diagram"
+                },
+                "machine_learning_models": {
+                    "type": "string",
+                    "default": "neural_network,random_forest",
+                    "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
+                    "description": "Comma-separated list of machine-learning models to run (subset of: neural_network, random_forest). Pass 'none' to disable all ML models.",
+                    "fa_icon": "fas fa-brain"
                 },
                 "machine_learning_features": {
                     "type": "string",
-                    "default": "aacomp,aaencode,prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
+                    "default": "dummy,aacomp,aaencode,prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of feature encodings to compute and feed into the ML / RF classifiers.",
                     "fa_icon": "fas fa-vector-square"
@@ -84,12 +79,12 @@
                     "description": "Comma-separated list of features whose embedding dim makes ML / RF tasks need the heavy GPU label (process_gpu_large).",
                     "fa_icon": "fas fa-weight-hanging"
                 },
-                "max_machine_learning_features": {
-                    "type": "integer",
-                    "default": 2,
+                "max_protein_combinations_per_ddi": {
+                    "type": ["integer", "null"],
+                    "default": null,
                     "minimum": 1,
-                    "description": "Maximum number of feature encodings combined per ML run (powerset cap).",
-                    "fa_icon": "fas fa-layer-group"
+                    "description": "Cap on protein-pair instantiations per DDI domain pair for ML / RF training and prediction. Sampled without replacement; if fewer combinations exist than the cap, all are used. Leave null / unset to use every available combination. Default: 15.",
+                    "fa_icon": "fas fa-random"
                 },
                 "modeljson": {
                     "type": "string",

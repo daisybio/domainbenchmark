@@ -77,19 +77,37 @@ process COMBINE_EVAL {
     container "docker://konstantinpelz/cobinet-general:1.0.0"
 
     input:
-        tuple val(meta), path(eval_reports, stageAs: 'reports/*')
+        // Every per-DB EVALUATION emits a dir literally named `evaluation/`, so
+        // staging them with a shared target collides ("multiple input files for
+        // each of the following file names: reports/evaluation"). `stageAs:
+        // 'src/?/*'` gives each input its own numbered parent dir while
+        // preserving the original `evaluation` name. `ids` runs in parallel with
+        // `eval_reports` (same order), letting us symlink each staged dir into
+        // `reports/<db_id>/evaluation` -- required by combine_eval.py, which
+        // derives db_name from the report dir's parent.
+        tuple val(meta), path(eval_reports, stageAs: 'src/?/*'), val(ids)
 
     output:
         tuple val(meta), path('evaluation/'), emit: combined_report
         path "versions.yml",                  emit: versions
 
     script:
-        def reports_list = eval_reports instanceof java.util.List ? eval_reports.join(' ') : eval_reports
+        def ids_list = ids instanceof java.util.List ? ids : [ids]
+        def ids_bash = ids_list.collect { "'${it}'" }.join(' ')
         """
+        mkdir -p reports
+        ids=(${ids_bash})
+        n=\${#ids[@]}
+        for (( i=1; i<=n; i++ )); do
+            db_id="\${ids[\$((i-1))]}"
+            mkdir -p "reports/\${db_id}"
+            ln -s "../../src/\${i}/evaluation" "reports/\${db_id}/evaluation"
+        done
+
         mkdir -p evaluation
 
         combine_eval.py \\
-            --reports ${reports_list} \\
+            --reports reports/*/evaluation \\
             --out_dir evaluation
 
         cat <<-END_VERSIONS > versions.yml

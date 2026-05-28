@@ -4,13 +4,11 @@
     "data": [],
     "jobs": 5,
     "search_parameters": {
-        "models_to_evaluate": 100,
-        "protein_sample_per_ddi_opt_set": 1,
+        "models_to_evaluate": 200,
         "balance_positive_and_negative_interactions_opt_set": true
     },
     "model_parameters": {
-        "balance_positive_and_negative_interactions_train_set": [true, false],
-        "protein_sample_per_ddi_train_set": [1,2,5,10],
+        "balance_method": ["none", "downsample", "oversample"],
         "n_estimators": [100, 200, 500],
         "max_depth": [10, 20, 50],
         "min_samples_split": [2, 5, 10],

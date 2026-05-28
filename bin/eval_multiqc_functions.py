@@ -20,6 +20,75 @@ import sqlite3
 import networkx as nx
 import logging
 
+
+### Bootstrap helpers ###
+
+
+def bootstrap_metric(
+    y_true,
+    y_score,
+    metric_fn,
+    n_resamples: int = 1000,
+    ci: float = 0.95,
+    seed: int = 42,
+):
+    """Bootstrap a binary-classification ranking metric.
+
+    Returns (point, lo, hi, samples). `samples` is the array of per-resample
+    metric values, kept so downstream code can run pairwise comparisons without
+    re-running the bootstrap. Identical `seed` across models means the resample
+    *strategy* is identical even though the indices differ in length when
+    models cover different test rows.
+    """
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    n = len(y_true)
+    rng = np.random.default_rng(seed)
+    samples = np.empty(n_resamples, dtype=np.float64)
+    for i in range(n_resamples):
+        idx = rng.integers(0, n, size=n)
+        yt = y_true[idx]
+        ys = y_score[idx]
+        # Degenerate resamples (single class) make ranking metrics undefined.
+        if yt.min() == yt.max():
+            samples[i] = np.nan
+            continue
+        samples[i] = float(metric_fn(yt, ys))
+    valid = samples[~np.isnan(samples)]
+    if valid.size == 0:
+        point = float(metric_fn(y_true, y_score))
+        return point, point, point, samples
+    alpha = (1.0 - ci) / 2.0
+    lo = float(np.quantile(valid, alpha))
+    hi = float(np.quantile(valid, 1.0 - alpha))
+    point = float(metric_fn(y_true, y_score))
+    return point, lo, hi, samples
+
+
+def paired_bootstrap_diff(samples_a, samples_b) -> float:
+    """Two-sided p-value that metric_a differs from metric_b.
+
+    Operates on the per-resample arrays returned by `bootstrap_metric`. When the
+    arrays come from independent draws (the scatter-evaluation case here, where
+    each per-model JSON is built without cross-model index alignment), this is
+    an unpaired stochastic-dominance approximation rather than the textbook
+    paired-bootstrap test. It is still informative for ordering models; treat
+    p-values as indicative rather than calibrated.
+    """
+    a = np.asarray(samples_a, dtype=np.float64)
+    b = np.asarray(samples_b, dtype=np.float64)
+    a = a[~np.isnan(a)]
+    b = b[~np.isnan(b)]
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    n = min(a.size, b.size)
+    diff = a[:n] - b[:n]
+    # Two-sided: smaller tail mass × 2.
+    p_pos = float((diff <= 0).mean())
+    p_neg = float((diff >= 0).mean())
+    return float(min(1.0, 2.0 * min(p_pos, p_neg)))
+
+
 ### Functions to load data from the database ###
 
 
@@ -320,7 +389,8 @@ def aggregate_per_model_metrics(per_model_files):
     rows in the reducer task.
 
     Each JSON file: {model_name, samples, metrics_summary, roc:[[fp,tp]...],
-                     pr:[[recall,precision]...], roc_auc, pr_ap}
+                     pr:[[recall,precision]...], roc_auc, pr_ap,
+                     roc_auc_ci, pr_ap_ci, roc_auc_samples, pr_ap_samples}
     """
     metrics_rows = []
     metrics_aucap = {}
@@ -332,10 +402,21 @@ def aggregate_per_model_metrics(per_model_files):
             obj = json.load(fh)
         name = obj["model_name"]
         metrics_rows.append(obj["metrics_summary"])
-        metrics_aucap[name] = {
+        entry = {
             "ROC_AUC": obj["roc_auc"],
             "PR_AP": obj["pr_ap"],
         }
+        # Optional Phase 4 fields — missing on legacy JSONs from before the
+        # bootstrap rollout, so guard with .get().
+        if "roc_auc_ci" in obj:
+            entry["ROC_AUC_CI"] = obj["roc_auc_ci"]
+        if "pr_ap_ci" in obj:
+            entry["PR_AP_CI"] = obj["pr_ap_ci"]
+        if "roc_auc_samples" in obj:
+            entry["ROC_AUC_SAMPLES"] = obj["roc_auc_samples"]
+        if "pr_ap_samples" in obj:
+            entry["PR_AP_SAMPLES"] = obj["pr_ap_samples"]
+        metrics_aucap[name] = entry
         roc_pairs = obj["roc"]
         pr_pairs = obj["pr"]
         roc_curves[name] = (

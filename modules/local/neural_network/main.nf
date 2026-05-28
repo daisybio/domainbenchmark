@@ -1,4 +1,4 @@
-process MACHINE_LEARNING {
+process NEURAL_NETWORK {
     tag "${meta.id}"
     label 'process_gpu'
 
@@ -9,24 +9,26 @@ process MACHINE_LEARNING {
         tuple val(meta), path('DDI'), path('features/*'), path('config.json')
 
     output:
-        tuple val(meta), path("machine_learning_${meta.features.join('_')}/predictions.parquet"), emit: predictions
-        tuple val(meta), path("machine_learning_${meta.features.join('_')}/model/"),               emit: model
-        path "versions.yml",                                                                        emit: versions
+        tuple val(meta), path("neural_network_${meta.combo_id}/predictions.parquet"), emit: predictions
+        tuple val(meta), path("neural_network_${meta.combo_id}/model/"),               emit: model
+        path "versions.yml",                                                            emit: versions
 
     script:
-        def output_base        = "machine_learning_${meta.features.join('_')}"
+        def output_base        = "neural_network_${meta.combo_id}"
         def output_predictions = "${output_base}/predictions.parquet"
         def output_model_dir   = "${output_base}/model"
+        def max_combos_arg     = params.max_protein_combinations_per_ddi ? "--max_protein_combinations_per_ddi ${params.max_protein_combinations_per_ddi}" : ''
         """
         mkdir -p ${output_model_dir}
 
-        machine_learning.py \\
+        neural_network.py \\
             --features ${meta.features.join(' ')} \\
             --features_path features/ \\
             --ddi_path DDI/ \\
             --config config.json \\
             --out_predictions ${output_predictions} \\
             --out_model_dir ${output_model_dir} \\
+            ${max_combos_arg} \\
             --seed ${params.seed}
 
         cat <<-END_VERSIONS > versions.yml
@@ -38,7 +40,7 @@ process MACHINE_LEARNING {
         """
 }
 
-process MACHINE_LEARNING_EVALUATION {
+process NEURAL_NETWORK_EVALUATION {
     tag "${meta.id}"
     label 'process_high_memory'
     label 'process_long'
@@ -52,22 +54,24 @@ process MACHINE_LEARNING_EVALUATION {
         tuple val(meta), path('DDI'), path('features/*'), path('config.json'), path(prev_results)
 
     output:
-        tuple val(meta), path("machine_learning_${meta.features.join('_')}/predictions.parquet"), emit: predictions
-        path "versions.yml",                                                                      emit: versions
+        tuple val(meta), path("neural_network_${meta.combo_id}/predictions.parquet"), emit: predictions
+        path "versions.yml",                                                          emit: versions
 
     script:
-        def output_base = "machine_learning_${meta.features.join('_')}"
-        def model_dir   = "${prev_results}/ml_output/${output_base}/model"
+        def output_base    = "neural_network_${meta.combo_id}"
+        def model_dir      = "${prev_results}/nn_output/${output_base}/model"
+        def max_combos_arg = params.max_protein_combinations_per_ddi ? "--max_protein_combinations_per_ddi ${params.max_protein_combinations_per_ddi}" : ''
         """
         mkdir -p ${output_base}
 
-        machine_learning.py \\
+        neural_network.py \\
             --features ${meta.features.join(' ')} \\
             --features_path features/ \\
             --ddi_path DDI/ \\
             --config config.json \\
             --out_predictions ${output_base}/predictions.parquet \\
             --model_dir ${model_dir} \\
+            ${max_combos_arg} \\
             --predict-only
 
         cat <<-END_VERSIONS > versions.yml

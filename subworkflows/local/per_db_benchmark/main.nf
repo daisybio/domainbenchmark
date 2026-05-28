@@ -7,7 +7,7 @@
             ↓
         FEATURE_EXTRACTION  (scatter (db × feature × split))
             ↓
-        MACHINE_LEARNING + RANDOM_FOREST + GRAPH_MODEL  (per db × combo / model)
+        NEURAL_NETWORK + RANDOM_FOREST + GRAPH_MODEL  (per db × combo / model)
             ↓
         EVAL_ONE  (scatter — one tiny JSON per prediction)
             ↓
@@ -18,18 +18,18 @@
 
 include { DDI_EXTRACTION                                } from '../../../modules/local/ddi_extraction/main.nf'
 include { FEATURE_EXTRACTION                            } from '../../../modules/local/feature_extraction/main.nf'
-include { MACHINE_LEARNING                              } from '../../../modules/local/machine_learning/main.nf'
+include { NEURAL_NETWORK                                } from '../../../modules/local/neural_network/main.nf'
 include { RANDOM_FOREST                                 } from '../../../modules/local/random_forest/main.nf'
 include { GRAPH_MODEL                                   } from '../../../modules/local/graph_model/main.nf'
 include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 
 
 def csvToList(s) {
-    s instanceof List ? s.findAll { it } : (s ? s.tokenize(',')*.trim().findAll { it } : [])
-}
-
-def powerSet(List lst) {
-    lst.inject([[]] as List) { acc, e -> acc + acc.collect { it + e } }
+    // Accept either a List or a comma-separated String. Filter out blanks
+    // and the sentinel 'none' so callers can disable a list cleanly with
+    // `--graph_models none` (or `--graph_models ''` once nf-schema allows it).
+    def items = s instanceof List ? s : (s ? s.tokenize(',') : [])
+    items*.trim().findAll { it && it.toLowerCase() != 'none' }
 }
 
 workflow PER_DB_BENCHMARK {
@@ -39,7 +39,7 @@ workflow PER_DB_BENCHMARK {
 
     main:
         // ---------------------------------------------------------------
-        // Feature filtering (constant per pipeline run)
+        // Feature / model filtering (constant per pipeline run)
         // ---------------------------------------------------------------
 
         def skip_features        = csvToList(params.skip)
@@ -49,8 +49,15 @@ workflow PER_DB_BENCHMARK {
         def all_graph_models     = csvToList(params.graph_models)
         def graph_model_names    = all_graph_models.findAll { !skip_features.contains(it) }
 
-        def feature_combos = powerSet(ml_features)
-            .findAll { it && it.size() <= params.max_machine_learning_features }
+        def all_ml_models        = csvToList(params.machine_learning_models)
+        def ml_model_names       = all_ml_models.findAll { !skip_features.contains(it) }
+        def nn_enabled           = ml_model_names.contains('neural_network')
+        def rf_enabled           = ml_model_names.contains('random_forest')
+
+        // One run per feature (singleton) plus one all-feature concatenation
+        // run when more than one feature is available.
+        def feature_combos = ml_features.collect { [it] }
+        if (ml_features.size() >= 2) feature_combos << ml_features
 
         def ml_config = file(params.modeljson) / 'NeuralNetwork.json'
         def rf_config = file(params.modeljson) / 'RandomForest.json'
@@ -73,36 +80,41 @@ workflow PER_DB_BENCHMARK {
         ddi_keyed = ddi_ch.map { meta, ddi_dir -> tuple(meta.id, meta, ddi_dir) }
 
         // ---------------------------------------------------------------
-        // ML / RF (powerset of features capped per params)
+        // NN / RF (per-feature singletons + one all-concat run, gated by
+        // params.machine_learning_models and --skip)
         // ---------------------------------------------------------------
-        ml_input_ch = ddi_keyed
+        nn_input_ch = nn_enabled ? ddi_keyed
             .join(feature_dirs_per_db)
             .combine(Channel.fromList(feature_combos.collect { [it] }))
             .combine(Channel.value(ml_config))
             .map { _db_id, meta, ddi_dir, feature_dirs, combo, cfg ->
+                def combo_id = combo.size() == 1 ? combo[0] : 'all'
                 def m = [
-                    id      : "${meta.id}_machine_learning_${combo.join('_')}",
+                    id      : "${meta.id}_neural_network_${combo_id}",
                     db      : meta.db,
-                    model   : 'machine_learning',
-                    features: combo
+                    model   : 'neural_network',
+                    features: combo,
+                    combo_id: combo_id
                 ]
                 tuple(m, ddi_dir, feature_dirs, cfg)
-            }
-        MACHINE_LEARNING(ml_input_ch)
+            } : Channel.empty()
+        NEURAL_NETWORK(nn_input_ch)
 
-        rf_input_ch = ddi_keyed
+        rf_input_ch = rf_enabled ? ddi_keyed
             .join(feature_dirs_per_db)
             .combine(Channel.fromList(feature_combos.collect { [it] }))
             .combine(Channel.value(rf_config))
             .map { _db_id, meta, ddi_dir, feature_dirs, combo, cfg ->
+                def combo_id = combo.size() == 1 ? combo[0] : 'all'
                 def m = [
-                    id      : "${meta.id}_random_forest_${combo.join('_')}",
+                    id      : "${meta.id}_random_forest_${combo_id}",
                     db      : meta.db,
                     model   : 'random_forest',
-                    features: combo
+                    features: combo,
+                    combo_id: combo_id
                 ]
                 tuple(m, ddi_dir, feature_dirs, cfg)
-            }
+            } : Channel.empty()
         RANDOM_FOREST(rf_input_ch)
 
         // ---------------------------------------------------------------
@@ -124,7 +136,7 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         // Per-prediction evaluation (scatter)
         // ---------------------------------------------------------------
-        all_predictions_ch = MACHINE_LEARNING.out.predictions
+        all_predictions_ch = NEURAL_NETWORK.out.predictions
             .mix(RANDOM_FOREST.out.predictions)
             .mix(GRAPH_MODEL.out.predictions)
             .map { meta, pred ->
@@ -165,7 +177,7 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         ch_versions = DDI_EXTRACTION.out.versions
             .mix(FEATURE_EXTRACTION.out.versions)
-            .mix(MACHINE_LEARNING.out.versions)
+            .mix(NEURAL_NETWORK.out.versions)
             .mix(RANDOM_FOREST.out.versions)
             .mix(GRAPH_MODEL.out.versions)
             .mix(EVAL_ONE.out.versions)

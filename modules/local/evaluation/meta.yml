@@ -1,0 +1,63 @@
+name: evaluation
+description: |
+  Two-stage evaluation. `EVAL_ONE` scatters: one subtask per prediction
+  parquet emits a small JSON of metrics plus downsampled ROC/PR curves.
+  `EVALUATION` reduces: collects per-model JSONs for a database and builds
+  the per-DB MultiQC report. `COMBINE_EVAL` merges the per-DB reports into
+  the cross-database `ddi_report.html`.
+keywords:
+  - evaluation
+  - multiqc
+  - metrics
+  - roc
+  - pr curve
+  - benchmark
+tools:
+  - multiqc:
+      description: HTML aggregation of per-model metric JSONs.
+      homepage: https://multiqc.info
+      documentation: https://multiqc.info/docs/
+      licence:
+        - "GPL-3.0-or-later"
+  - scikit-learn:
+      description: Metric computation (AUROC, AUPRC, F1, MCC).
+      homepage: https://scikit-learn.org
+      documentation: https://scikit-learn.org/stable/
+      licence:
+        - "BSD-3-Clause"
+input:
+  - - meta:
+        type: map
+        description: |
+          Groovy Map with database and model information.
+    - predictions:
+        type: file
+        description: Predictions parquet file (one model × DB × feature combo).
+        pattern: "*.parquet"
+output:
+  metrics:
+    - - meta:
+          type: map
+          description: Groovy Map with database and model info.
+      - "per_model/${meta.model}.json":
+          type: file
+          description: Per-model metric JSON (metrics + downsampled curves).
+          pattern: "*.json"
+  report:
+    - - meta:
+          type: map
+          description: Groovy Map with database info.
+      - "evaluation/":
+          type: directory
+          description: Per-database MultiQC report directory.
+  versions:
+    - - ${task.process}:
+          type: string
+          description: The process the versions were collected from
+      - python:
+          type: string
+          description: Python interpreter version
+authors:
+  - "@konstantinpelz"
+maintainers:
+  - "@konstantinpelz"

@@ -1,0 +1,71 @@
+name: neural_network
+description: |
+  Train a neural-network DDI classifier (PyTorch + skorch) on a feature
+  combination, run hyperparameter search per the model JSON config, and
+  emit predictions for downstream evaluation.
+keywords:
+  - machine learning
+  - neural network
+  - pytorch
+  - skorch
+  - ddi
+  - classifier
+tools:
+  - pytorch:
+      description: Deep learning framework used to train the neural-network classifier.
+      homepage: https://pytorch.org
+      documentation: https://pytorch.org/docs/
+      licence:
+        - "BSD-3-Clause"
+  - skorch:
+      description: scikit-learn-compatible wrapper around PyTorch models.
+      homepage: https://github.com/skorch-dev/skorch
+      documentation: https://skorch.readthedocs.io
+      licence:
+        - "BSD-3-Clause"
+input:
+  - - meta:
+        type: map
+        description: |
+          Groovy Map with database and feature-combo information,
+          e.g. [ id:'random_denoise', features:['aacomp','aaencode'] ]
+    - ddi_dir:
+        type: directory
+        description: DDI tables from `DDI_EXTRACTION` (staged as `DDI/`).
+        pattern: "DDI"
+    - features_dir:
+        type: directory
+        description: |
+          Per-feature `.h5` files staged as `features/<feature>/<split>.h5`.
+        pattern: "features/*"
+    - config_json:
+        type: file
+        description: Model hyperparameter JSON from `assets/<ModelName>.json`.
+        pattern: "*.json"
+output:
+  predictions:
+    - - meta:
+          type: map
+          description: Groovy Map with database and feature-combo info.
+      - "neural_network_*/predictions.parquet":
+          type: file
+          description: Per-prediction parquet table.
+          pattern: "*.parquet"
+  model:
+    - - meta:
+          type: map
+          description: Groovy Map with database and feature-combo info.
+      - "neural_network_*/model/":
+          type: directory
+          description: Trained model artefacts.
+  versions:
+    - - ${task.process}:
+          type: string
+          description: The process the versions were collected from
+      - python:
+          type: string
+          description: Python interpreter version
+authors:
+  - "@konstantinpelz"
+maintainers:
+  - "@konstantinpelz"

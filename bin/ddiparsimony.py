@@ -138,7 +138,7 @@ def evaluate_reliability_test(
 
 
 def preprocessing(
-    db_path: Path, output_dir: Path
+    db_path: Path, output_dir: Path, threads: int = 1
 ) -> Tuple[
     List[Tuple[str, str]],
     np.ndarray,
@@ -246,7 +246,7 @@ def preprocessing(
             proteins,
             ddi_score,
             num_iterations=1000,
-            max_workers=os.cpu_count() or 4,
+            max_workers=threads,
         )
         np.save(rxm_path, random_x_matrix)
 
@@ -262,7 +262,7 @@ def preprocessing(
 
 
 def run_ddiparsimony(
-    database: str, params_file: str, out_dir: str, out_predictions: str
+    database: str, params_file: str, out_dir: str, out_predictions: str, threads: int = 1
 ):
     db_train = Path(os.path.join(database, "train.sqlite3"))
     db_test = Path(os.path.join(database, "test.sqlite3"))
@@ -306,7 +306,7 @@ def run_ddiparsimony(
             protein_domains,
             ppi_list,
             ddi_score,
-        ) = preprocessing(db_train, Path(out_dir))
+        ) = preprocessing(db_train, Path(out_dir), threads)
         import gc
 
         domain_pair_to_idx = {pair: idx for idx, pair in enumerate(domain_pairs)}
@@ -327,7 +327,7 @@ def run_ddiparsimony(
         ]
 
         train_logs = []
-        with ProcessPoolExecutor() as executor:
+        with ProcessPoolExecutor(max_workers=threads) as executor:
             results = list(
                 tqdm(
                     executor.map(evaluate_reliability_train, param_grid),
@@ -409,7 +409,7 @@ def run_ddiparsimony(
     )
     # Preprocessing on test data
     domain_pairs, random_x_matrix, ddi_dict, protein_domains, ppi_list, ddi_score = (
-        preprocessing(db_test, Path(out_dir))
+        preprocessing(db_test, Path(out_dir), threads)
     )
     import gc
 

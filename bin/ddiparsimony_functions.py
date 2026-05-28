@@ -225,7 +225,7 @@ def compute_random_x_matrix_parallel(
     proteins,
     ddi_score,
     num_iterations=1000,
-    max_workers=8,
+    max_workers=1,
 ):
     random_x_matrix = np.zeros((num_iterations, len(domain_pairs)))
     with ProcessPoolExecutor(max_workers=max_workers) as executor:

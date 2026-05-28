@@ -1,6 +1,6 @@
 process GRAPH_MODEL {
     tag "${meta.id}"
-    label 'process_medium'
+    label 'process_high'
 
     conda "${projectDir}/environments/general.yml"
     container "docker://konstantinpelz/cobinet-general:1.0.0"
@@ -24,7 +24,8 @@ process GRAPH_MODEL {
             --model ${meta.model} \\
             --params ${model_json} \\
             --out_dir ${output_model_dir} \\
-            --out_predictions ${output_predictions}
+            --out_predictions ${output_predictions} \\
+            --threads ${task.cpus}
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":

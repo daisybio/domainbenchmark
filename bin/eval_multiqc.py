@@ -22,6 +22,7 @@ from eval_multiqc_functions import (
     calc_curves_roc_pr,
     analyse_database,
     aggregate_per_model_metrics,
+    paired_bootstrap_diff,
 )
 import logging
 
@@ -88,13 +89,6 @@ def add_db_name_to_block(block, db_name):
     return block
 
 
-def load_old_multiqc_data(old_report_dir):
-    # @old_report_dir: directory containing old MultiQC report
-    # Returns loaded MultiQC object with parsed logs
-    search_path = f"{old_report_dir}/{REPORT_NAME}_data/"
-    multiqc.parse_logs(search_path, preserve_module_raw_data=True)
-    return multiqc
-
 
 def copy_old_report_blocks(old_report_dir, out_dir):
     # @old_report_dir: directory containing old MultiQC report
@@ -128,6 +122,29 @@ def merge_data(old, new):
         if sample in new:
             merged[sample].update(new[sample])
     return merged
+
+
+def _write_distribution_block(data, metric, label, interaction_type, db_name, outdir):
+    block_id = f"{DB_PREFIX}{interaction_type}_{metric}_distribution"
+    block = {
+        "id": block_id,
+        "section_name": f"{interaction_type.upper()} {label} Distribution",
+        "plot_type": "box",
+        "pconfig": {
+            "id": block_id,
+            "title": f"{interaction_type.upper()} {label} Distribution",
+            "xlab": "Database",
+            "ylab": label,
+        },
+        "data": data,
+        "raw_data": data,
+    }
+    block = add_db_name_to_block(block, db_name)
+    with open(
+        os.path.join(outdir, f"{interaction_type}_{metric}_distribution_{db_name}_db_mqc.json"),
+        "w",
+    ) as f:
+        json.dump(block, f, indent=2)
 
 
 def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
@@ -198,79 +215,19 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
                 f"{network_type}_network_data"
             ]["clustering_coefficient"]
 
-    # Write MultiQC JSON blocks for box plots, each model_type/interaction_type combination gets its own block
-    # for db_type in degree_distributions:
     for interaction_type in ["ppi", "ddi"]:
-        # Degree Distribution Block
-        degree_block = {
-            "id": f"{DB_PREFIX}{interaction_type}_degree_distribution",
-            "section_name": f"{interaction_type.upper()} Degree Distribution",
-            "plot_type": "box",
-            "pconfig": {
-                "id": f"{DB_PREFIX}{interaction_type}_degree_distribution",
-                "title": f"{interaction_type.upper()} Degree Distribution",
-                "xlab": "Database",
-                "ylab": "Degree",
-            },
-            "data": degree_distributions[interaction_type],
-            "raw_data": degree_distributions[interaction_type],
-        }
-        degree_block = add_db_name_to_block(degree_block, db_name)
-        with open(
-            os.path.join(
-                outdir, f"{interaction_type}_degree_distribution_{db_name}_db_mqc.json"
-            ),
-            "w",
-        ) as f:
-            json.dump(degree_block, f, indent=2)
-
-        # Betweenness Centrality Block
-        betweenness_block = {
-            "id": f"{DB_PREFIX}{interaction_type}_betweenness_distribution",
-            "section_name": f"{interaction_type.upper()} Betweenness Centrality Distribution",
-            "plot_type": "box",
-            "pconfig": {
-                "id": f"{DB_PREFIX}{interaction_type}_betweenness_distribution",
-                "title": f"{interaction_type.upper()} Betweenness Centrality Distribution",
-                "xlab": "Database",
-                "ylab": "Betweenness Centrality",
-            },
-            "data": betweenness_distributions[interaction_type],
-            "raw_data": betweenness_distributions[interaction_type],
-        }
-        betweenness_block = add_db_name_to_block(betweenness_block, db_name)
-        with open(
-            os.path.join(
-                outdir,
-                f"{interaction_type}_betweenness_distribution_{db_name}_db_mqc.json",
-            ),
-            "w",
-        ) as f:
-            json.dump(betweenness_block, f, indent=2)
-
-        # Clustering Coefficient Block
-        clustering_block = {
-            "id": f"{DB_PREFIX}{interaction_type}_clustering_distribution",
-            "section_name": f"{interaction_type.upper()} Clustering Coefficient Distribution",
-            "plot_type": "box",
-            "pconfig": {
-                "id": f"{DB_PREFIX}{interaction_type}_clustering_distribution",
-                "title": f"{interaction_type.upper()} Clustering Coefficient Distribution",
-                "xlab": "Database",
-                "ylab": "Clustering Coefficient",
-            },
-            "data": clustering_distributions[interaction_type],
-            "raw_data": clustering_distributions[interaction_type],
-        }
-        clustering_block = add_db_name_to_block(clustering_block, db_name)
-        with open(
-            os.path.join(
-                outdir,
-                f"{interaction_type}_clustering_distribution_{db_name}_db_mqc.json",
-            ),
-            "w",
-        ) as f:
-            json.dump(clustering_block, f, indent=2)
+        _write_distribution_block(
+            degree_distributions[interaction_type], "degree", "Degree",
+            interaction_type, db_name, outdir,
+        )
+        _write_distribution_block(
+            betweenness_distributions[interaction_type], "betweenness", "Betweenness Centrality",
+            interaction_type, db_name, outdir,
+        )
+        _write_distribution_block(
+            clustering_distributions[interaction_type], "clustering", "Clustering Coefficient",
+            interaction_type, db_name, outdir,
+        )
 
 
 def load_old_json_block(old_report_dir, file_name_suffix, block_id):
@@ -294,7 +251,7 @@ def load_old_json_block(old_report_dir, file_name_suffix, block_id):
     return None
 
 
-def write_multiqc_json_metrices(
+def write_multiqc_json_metrics(
     metrics_aucap,
     roc_curves,
     pr_curves,
@@ -313,13 +270,23 @@ def write_multiqc_json_metrices(
 
     n_models = len(metrics_aucap)
 
-    # --- Block 1: AUC/AP table ---
+    def _fmt_ci(ci):
+        if ci is None:
+            return ""
+        lo, hi = ci
+        return f"[{float(lo):.3f}, {float(hi):.3f}]"
+
+    # --- Block 1: AUC/AP table -----------------------------------------------
+    # Numeric mean kept as float (enables table colour-scale + downstream
+    # heatmap clustering); CI rendered in a sibling string column.
     table_id = f"{prefix}_metrics_table"
     file_name_suffix = "_metrics_table_mqc.json"
     new_table_data = {
         m: {
-            "ROC AUC": f"{float(metrics_aucap[m]['ROC_AUC']):.3f}",
-            "PR AP": f"{float(metrics_aucap[m]['PR_AP']):.3f}",
+            "ROC AUC": float(metrics_aucap[m]["ROC_AUC"]),
+            "ROC AUC CI": _fmt_ci(metrics_aucap[m].get("ROC_AUC_CI")),
+            "PR AP": float(metrics_aucap[m]["PR_AP"]),
+            "PR AP CI": _fmt_ci(metrics_aucap[m].get("PR_AP_CI")),
         }
         for m in metrics_aucap
     }
@@ -340,6 +307,30 @@ def write_multiqc_json_metrices(
             "id": f"{prefix}_metrics_table",
             "title": "Model performance (AUC / AP)",
             "col1_header": "Model",
+        },
+        "headers": {
+            "ROC AUC": {
+                "title": "ROC AUC",
+                "min": 0.0,
+                "max": 1.0,
+                "scale": "RdYlGn",
+                "format": "{:,.3f}",
+            },
+            "ROC AUC CI": {
+                "title": "ROC AUC 95% CI",
+                "scale": False,
+            },
+            "PR AP": {
+                "title": "PR AP",
+                "min": 0.0,
+                "max": 1.0,
+                "scale": "RdYlGn",
+                "format": "{:,.3f}",
+            },
+            "PR AP CI": {
+                "title": "PR AP 95% CI",
+                "scale": False,
+            },
         },
         "data": merged_table_data,
     }
@@ -439,6 +430,47 @@ def write_multiqc_json_metrices(
     with open(os.path.join(outdir, "model_eval_metrics_mqc.json"), "w") as f:
         json.dump(metrics_block, f, indent=2)
 
+    # --- Block 5: Pairwise significance (Phase 4) ---
+    # Built only when every model carries bootstrap samples. Uses the unpaired
+    # stochastic-dominance approximation documented on paired_bootstrap_diff.
+    sample_models = sorted(
+        m for m in metrics_aucap if "ROC_AUC_SAMPLES" in metrics_aucap[m]
+    )
+    if len(sample_models) >= 2:
+        pairwise_id = f"{prefix}_pairwise_significance"
+        pair_data = {}
+        for a in sample_models:
+            row = {}
+            for b in sample_models:
+                if a == b:
+                    row[b] = "—"
+                    continue
+                p = paired_bootstrap_diff(
+                    metrics_aucap[a]["ROC_AUC_SAMPLES"],
+                    metrics_aucap[b]["ROC_AUC_SAMPLES"],
+                )
+                row[b] = f"{p:.3f}"
+            pair_data[a] = row
+        pairwise_block = {
+            "id": pairwise_id,
+            "section_name": "Pairwise significance (ROC AUC)",
+            "plot_type": "table",
+            "pconfig": {
+                "id": pairwise_id,
+                "title": "Pairwise significance — ROC AUC (two-sided p-value)",
+                "col1_header": "Model",
+            },
+            "data": pair_data,
+        }
+        with open(
+            os.path.join(outdir, f"{prefix}_pairwise_significance_mqc.json"), "w"
+        ) as f:
+            json.dump(pairwise_block, f, indent=2)
+        logging.info(
+            "[OK] Wrote pairwise significance block "
+            f"({len(sample_models)} models)"
+        )
+
     logging.info("[OK] Wrote MultiQC JSON (ROC + PR)")
 
 
@@ -517,6 +549,7 @@ def write_multiqc_config(
     roc_blocks = pick(r"_roc$")
     pr_blocks = pick(r"_pr$")
     metric_blocks = pick(r"model_eval_metrics$")
+    pairwise_blocks = pick(r"_pairwise_significance$")
 
     db_blocks = pick(r"database_analysis")
     degree_blocks = pick(r"_degree_distribution")
@@ -527,6 +560,7 @@ def write_multiqc_config(
         white_tbl
         + metric_blocks
         + auc_ap_tbl
+        + pairwise_blocks
         + roc_blocks
         + pr_blocks
         + db_blocks
@@ -724,7 +758,7 @@ def main():
     print(f"[INFO] Database analysis completed for: {db_name}")
 
     # Part4: MultiQC JSON
-    write_multiqc_json_metrices(
+    write_multiqc_json_metrics(
         metrics_auc_pr,
         roc_curves,
         pr_curves,

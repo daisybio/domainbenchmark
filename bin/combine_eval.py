@@ -56,12 +56,6 @@ def parse_arguments():
     return p.parse_args()
 
 
-def create_section_header(section_id, section_name, outdir):
-    block = {"id": section_id, "section_name": section_name}
-    with open(os.path.join(outdir, f"{section_id}_mqc.json"), "w") as f:
-        json.dump(block, f, indent=2)
-
-
 def write_multiqc_config(outdir) -> str:
     # Write MultiQC config file to specify module order
     # @outdir: output directory where MultiQC JSON files are located
@@ -101,7 +95,9 @@ def write_multiqc_config(outdir) -> str:
     roc_curves_block = pick(r"combined_roc_curves")
     pr_curves_block = pick(r"combined_pr_curves")
     roc_heatmap_block = pick(r"model_performance_heatmap_roc$")
+    roc_heatmap_ci = pick(r"model_performance_heatmap_roc_ci$")
     pr_heatmep_block = pick(r"model_performance_heatmap_pr$")
+    pr_heatmap_ci = pick(r"model_performance_heatmap_pr_ci$")
 
     db_blocks = pick(r"database_analysis")
     degree_blocks = pick(r"_degree_distribution")
@@ -119,7 +115,9 @@ def write_multiqc_config(outdir) -> str:
         + clustering_blocks
         + metric_blocks
         + roc_heatmap_block
+        + roc_heatmap_ci
         + pr_heatmep_block
+        + pr_heatmap_ci
         + roc_curves_block
         + pr_curves_block
     )
@@ -400,103 +398,121 @@ def combined_pr_curves(pr_data, outdir):
         json.dump(pr_block, f, indent=2)
 
 
-def combined_metrics_heatmap(metrics_data, outdir):
-
-    # Heatmap: rows: models/databases, columns: metrics (precision, recall, f1), values: metric scorFoes
-    # Ordered by model name on y-axis, metric name on x-axis
-    # Create data structure for heatmap: {model_name: {metric_name: value}}
-    # Ids are: combined_metrics_table_{db_name}
-
-    # Split the metrics in two parts, for the samples, tp, tn, fp, fn, and for the metrics (Accuracy, Recall, Specificity, Precision, Balanced Accuracy, F1 Score)
-    # Calculate the percentages for the sample sizes
-
-    # For the metrics, create a
-
-    data = {}
-    for block_id, block in metrics_data.items():
-        db_name = block_id.replace("combined_metrics_table_", "")
-        metrics = block.get("data", {})
-        # Each model has a list of metrices
-        for model in metrics.keys():
-            model_name = f"{model} ({db_name})"
-            data[model_name] = metrics[model]
-
-    # force ordering by model_name
-    ordered_model_names = sorted(data.keys())
-    data = {model_name: data[model_name] for model_name in ordered_model_names}
-
-    # Order data by model_name
-    data = {model_name: data[model_name] for model_name in sorted(data.keys())}
-
-    metrics_heatmap_block = {
-        "id": "combined_metrics_heatmap",
-        "section_name": "Combined Metrics Heatmap",
-        "plot_type": "heatmap",
-        "pconfig": {
-            "id": "combined_metrics_heatmap",
-            "title": "Combined Metrics Heatmap",
-            "xlab": "Model",
-            "ylab": "Metric",
-        },
-        "data": data,
-    }
-    with open(os.path.join(outdir, "combined_metrics_heatmap_mqc.json"), "w") as f:
-        json.dump(metrics_heatmap_block, f, indent=2)
-
-
 def model_performance_heatmap(combined_metrics, outdir):
+    # Heatmap colour + clustering use the numeric mean (float). The
+    # bootstrap CI lives in a sibling "<...> CI" string column emitted by
+    # eval_multiqc.py and is rendered as a companion label-table next to the
+    # heatmap so the CI string is visible alongside the colour cell.
 
-    roc_data = {}
-    pr_data = {}
+    def _to_float(v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            # backwards-compat: "0.948 [0.938, 0.956]" or "0.948"
+            try:
+                return float(v.split()[0].strip("[],"))
+            except Exception:
+                return None
+        return None
+
+    roc_mean, roc_ci = {}, {}
+    pr_mean, pr_ci = {}, {}
     for block_id, block in combined_metrics.items():
         db_name = block_id.replace("combined_metrics_table_", "")
         metrics = block.get("data", {})
-        # Each model has a list of metrices
-        for model in metrics.keys():
-            for metric_name, metric_value in metrics[model].items():
-                model_name = f"{model}"
-                if "roc" in metric_name.lower():
-                    roc_data.setdefault(model_name, {})[db_name] = metric_value
-                if "pr" in metric_name.lower():
-                    pr_data.setdefault(model_name, {})[db_name] = metric_value
+        for model, row in metrics.items():
+            rv = _to_float(row.get("ROC AUC"))
+            pv = _to_float(row.get("PR AP"))
+            if rv is not None:
+                roc_mean.setdefault(model, {})[db_name] = rv
+            if pv is not None:
+                pr_mean.setdefault(model, {})[db_name] = pv
+            rc = row.get("ROC AUC CI") or ""
+            pc = row.get("PR AP CI") or ""
+            roc_ci.setdefault(model, {})[db_name] = (
+                f"{rv:.3f} {rc}".strip() if rv is not None else (rc or "")
+            )
+            pr_ci.setdefault(model, {})[db_name] = (
+                f"{pv:.3f} {pc}".strip() if pv is not None else (pc or "")
+            )
 
-    # Order data by model_name
-    pr_data = {model_name: pr_data[model_name] for model_name in sorted(pr_data.keys())}
-    roc_data = {
-        model_name: roc_data[model_name] for model_name in sorted(roc_data.keys())
-    }
+    # Sort rows
+    roc_mean = {m: roc_mean[m] for m in sorted(roc_mean)}
+    pr_mean = {m: pr_mean[m] for m in sorted(pr_mean)}
+    roc_ci = {m: roc_ci[m] for m in sorted(roc_ci)}
+    pr_ci = {m: pr_ci[m] for m in sorted(pr_ci)}
 
-    model_eval_block = {
-        "id": "model_performance_heatmap_roc",
-        "section_name": "AUC Heatmap",
-        "plot_type": "heatmap",
-        "pconfig": {
-            "id": "model_performance_heatmap_roc",
-            "title": "AUC Heatmap",
-            "xlab": "Database",
-            "ylab": "Model",
-            "colstops": colstops,
-        },
-        "data": roc_data,
-    }
-    with open(os.path.join(outdir, "model_performance_heatmap_roc_mqc.json"), "w") as f:
-        json.dump(model_eval_block, f, indent=2)
+    def _write_heatmap(block_id, title, data, fname):
+        block = {
+            "id": block_id,
+            "section_name": title,
+            "plot_type": "heatmap",
+            "pconfig": {
+                "id": block_id,
+                "title": title,
+                "xlab": "Database",
+                "ylab": "Model",
+                "colstops": colstops,
+                "min": 0.0,
+                "max": 1.0,
+                "decimalPlaces": 3,
+                "display_values": True,
+            },
+            "data": data,
+        }
+        with open(os.path.join(outdir, fname), "w") as f:
+            json.dump(block, f, indent=2)
 
-    model_eval_block = {
-        "id": "model_performance_heatmap_pr",
-        "section_name": "Average Precision Heatmap",
-        "plot_type": "heatmap",
-        "pconfig": {
-            "id": "model_performance_heatmap_pr",
-            "title": "Average Precision Heatmap",
-            "xlab": "Database",
-            "ylab": "Model",
-            "colstops": colstops,
-        },
-        "data": pr_data,
-    }
-    with open(os.path.join(outdir, "model_performance_heatmap_pr_mqc.json"), "w") as f:
-        json.dump(model_eval_block, f, indent=2)
+    def _write_ci_table(block_id, title, data, fname):
+        # Table sharing the same model/db grid; cells = "mean [lo, hi]" strings.
+        # Acts as the CI label panel rendered directly below the heatmap.
+        db_cols = sorted({db for row in data.values() for db in row})
+        headers = {
+            db: {"title": db, "scale": False, "description": f"{title} ({db})"}
+            for db in db_cols
+        }
+        block = {
+            "id": block_id,
+            "section_name": f"{title} — 95% CI labels",
+            "plot_type": "table",
+            "pconfig": {
+                "id": block_id,
+                "title": f"{title} (95% CI)",
+                "col1_header": "Model",
+                "no_violin": True,
+                "sortRows": False,
+            },
+            "headers": headers,
+            "data": data,
+        }
+        with open(os.path.join(outdir, fname), "w") as f:
+            json.dump(block, f, indent=2)
+
+    _write_heatmap(
+        "model_performance_heatmap_roc",
+        "AUC Heatmap",
+        roc_mean,
+        "model_performance_heatmap_roc_mqc.json",
+    )
+    _write_ci_table(
+        "model_performance_heatmap_roc_ci",
+        "AUC Heatmap",
+        roc_ci,
+        "model_performance_heatmap_roc_ci_mqc.json",
+    )
+
+    _write_heatmap(
+        "model_performance_heatmap_pr",
+        "Average Precision Heatmap",
+        pr_mean,
+        "model_performance_heatmap_pr_mqc.json",
+    )
+    _write_ci_table(
+        "model_performance_heatmap_pr_ci",
+        "Average Precision Heatmap",
+        pr_ci,
+        "model_performance_heatmap_pr_ci_mqc.json",
+    )
 
 
 def combine_db_analysis(db_blocks, outdir):

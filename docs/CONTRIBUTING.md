@@ -148,6 +148,15 @@ These labels define resource defaults for single-core processes, modules that re
 
 Values assigned within these labels can be dynamically passed to a tool using the the `${task.cpus}` and `${task.memory}` Nextflow variables in the `script:` block of a module (see an example in the [modules repository](https://github.com/nf-core/modules/blob/bd1b6a40f55933d94b8c9ca94ec8c1ea0eaf4b82/modules/nf-core/samtools/bam2fq/main.nf#L30)).
 
+#### Adding new features or models
+
+The pipeline provides copy-and-customize templates for the two most common extension points:
+
+- **Feature encodings:** `bin/features/new_feature.py` — implements the `extract_features(conn, out_file)` contract. Copy it, implement your computation, and add the feature name to `params.machine_learning_features` in `nextflow.config`. Add to `params.large_features` if it needs GPU/large memory.
+- **ML models:** `bin/new_model.py` — subclasses `DDIModelTrainer` with hooks for grid search, refit, save/load. Copy it, implement the methods, create the matching `assets/<Model>.json`, and add a Nextflow process + subworkflow wiring.
+
+Both templates include step-by-step instructions in their docstrings.
+
 #### Nextflow version bumping
 
 If you use a new feature from core Nextflow, bump the minimum required Nextflow version in the pipeline with:

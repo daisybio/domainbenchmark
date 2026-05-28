@@ -16,14 +16,18 @@ workflow AGGREGATE_EVAL {
         per_db_reports   // channel: tuple(meta, evaluation_dir) — emitted by PER_DB_BENCHMARK
 
     main:
-        def reports_collected = per_db_reports
-            .map { _meta, dir -> dir }
-            .collect()
-
-        def combine_input_ch = reports_collected.map { dirs ->
-            def m = [ id: 'combined' ]
-            tuple(m, dirs)
-        }
+        // Collect (db_id, dir) pairs as a single list so COMBINE_EVAL can stage
+        // each per-DB report under a parent dir named by db_id. Flat collect
+        // would lose the pairing; flat:false preserves the per-entry tuples.
+        def combine_input_ch = per_db_reports
+            .map { meta, dir -> [ meta.id, dir ] }
+            .collect(flat: false)
+            .map { entries ->
+                def m    = [ id: 'combined' ]
+                def ids  = entries.collect { it[0] }
+                def dirs = entries.collect { it[1] }
+                tuple(m, dirs, ids)
+            }
 
         COMBINE_EVAL(combine_input_ch)
 
