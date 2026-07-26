@@ -56,8 +56,7 @@ process DDI_EXTRACTION {
                         ddi_df = pd.read_sql('''
                                 SELECT domain_id_a AS domain_1, domain_id_b AS domain_2,
                                         NOT negative AS interaction
-                                FROM domain_domain_interaction
-                                WHERE is_evaluation_relevant;
+                                FROM domain_domain_interaction;
                         ''', conn)
                     ddi_df.to_csv(f"${meta.id}/DDI/{dbtype}.csv", index=False)
             PYEOF

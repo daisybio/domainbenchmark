@@ -1,0 +1,68 @@
+name: svm
+description: |
+  Train a Support Vector Machine DDI classifier (scikit-learn) on a
+  feature combination, run `RandomizedSearchCV` per the model JSON config,
+  and emit predictions for downstream evaluation.
+keywords:
+  - support vector machine
+  - scikit-learn
+  - ddi
+  - classifier
+tools:
+  - scikit-learn:
+      description: Support vector machine classifier and hyperparameter search.
+      homepage: https://scikit-learn.org
+      documentation: https://scikit-learn.org/stable/
+      licence:
+        - "BSD-3-Clause"
+  # - cuml:
+  #     description: GPU-accelerated random-forest implementation.
+  #     homepage: https://rapids.ai/cuml
+  #     documentation: https://docs.rapids.ai/api/cuml/stable/
+  #     licence:
+  #       - "Apache-2.0"
+input:
+  - - meta:
+        type: map
+        description: |
+          Groovy Map with database and feature-combo information,
+          e.g. [ id:'random_denoise', features:['aacomp'] ]
+    - ddi_dir:
+        type: directory
+        description: DDI tables from `DDI_EXTRACTION`.
+        pattern: "DDI"
+    - features_dir:
+        type: directory
+        description: Per-feature `.h5` files.
+        pattern: "features/*"
+    - config_json:
+        type: file
+        description: Model hyperparameter JSON from `assets/SVM.json`.
+        pattern: "*.json"
+output:
+  predictions:
+    - - meta:
+          type: map
+          description: Groovy Map with database and feature-combo info.
+      - "svm_*/predictions.parquet":
+          type: file
+          description: Per-prediction parquet table.
+          pattern: "*.parquet"
+  model:
+    - - meta:
+          type: map
+          description: Groovy Map with database and feature-combo info.
+      - "svm_*/model/":
+          type: directory
+          description: Trained model artefacts.
+  versions:
+    - - ${task.process}:
+          type: string
+          description: The process the versions were collected from
+      - python:
+          type: string
+          description: Python interpreter version
+authors:
+  - "@konstantinpelz"
+maintainers:
+  - "@konstantinpelz"

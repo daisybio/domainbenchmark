@@ -21,7 +21,10 @@ DUMMY_DIM = 512
 _RNG = np.random.default_rng()
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, dim: int = 512):
+
+    print(f"Calling feature extraction with parameters: dim={dim}")
+    
     domain_protein_df = pd.read_sql(
         """
         SELECT domain_id, protein_id
@@ -39,9 +42,9 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
         else:
             pfam_group = out_file[domain_id]
 
-        pfam_group[protein_id] = _RNG.standard_normal(DUMMY_DIM, dtype=np.float32)
+        pfam_group[protein_id] = _RNG.standard_normal(dim, dtype=np.float32)  # type: ignore
 
     print(
         f"dummy: wrote {len(domain_protein_df)} (domain, protein) entries x "
-        f"{DUMMY_DIM}-dim random vectors"
+        f"{dim}-dim random vectors"
     )

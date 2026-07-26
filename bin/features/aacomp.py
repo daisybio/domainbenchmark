@@ -38,6 +38,6 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
         else:
             pfam_group = out_file[domain_id]
 
-        pfam_group[uniprot_id] = aacomp
+        pfam_group[uniprot_id] = aacomp # pyright: ignore[reportIndexIssue]
 
     print(domain_sequence_df.head())

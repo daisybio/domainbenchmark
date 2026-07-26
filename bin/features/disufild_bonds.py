@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Template for adding a new feature encoding to the benchmark pipeline.
+
+Steps to add a new feature:
+1. Copy this file to bin/features/<your_feature>.py
+2. Implement extract_features() below
+3. Add '<your_feature>' to params.machine_learning_features in nextflow.config
+4. If your feature needs GPU or large memory, also add it to params.large_features
+
+The pipeline auto-discovers features by name: extract_features.py calls
+importlib.import_module(f"features.{feature_name}").extract_features(conn, out_file).
+
+Database schema (domain_protein_map table):
+    domain_id       TEXT    -- Pfam domain ID (e.g. PF00001)
+    protein_id      TEXT    -- UniProt protein ID (e.g. P12345)
+    domain_sequence TEXT    -- amino acid sequence of the domain
+    start_pos       INT    -- domain start position in protein sequence
+    end_pos         INT    -- domain end position in protein sequence
+    pdb_af_gz        BLOB    -- gzipped PDB file of the domain structure (from AlphaFold3)
+    pdb_rf_gz        BLOB    -- gzipped PDB file of the domain structure (from RoseTTAFold2)
+    (+ embedding columns like esm3_per_domain, esmc_per_residue, etc.)
+
+    CREATE TABLE IF NOT EXISTS domain_structure (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT, 
+        ddi_id INTEGER NOT NULL REFERENCES domain_domain_interaction(id),
+        protein1 INTEGER NOT NULL REFERENCES protein(id),
+        protein2 INTEGER NOT NULL REFERENCES protein(id),
+        source     TEXT    NOT NULL,
+        pdb_gz     BLOB    NOT NULL,
+        z_score    REAL,
+        UNIQUE (ddi_id, protein1, protein2, source)
+    );
+
+HDF5 output structure (required by downstream ML models):
+    /<domain_id>/<protein_id> = numpy array of shape (feature_dim,)
+
+
+"""
+
+import h5py
+import numpy as np
+import pandas as pd
+import sqlite3
+
+from structure_utils import bytes_to_pdb_structure
+
+
+DISULPHIDE_CUTOFFSQ = 5.0625
+
+def identify_ss_bonds(domain):
+    # Identify disulfide bonds in the domain structure
+    # If the distance between the SG atoms of two cysteine residues is less than 2.25 Å, we consider it a disulfide bond.
+    ss_bonds = []
+    cysteines = [residue for residue in domain.get_residues() if residue.get_resname() == 'CYS']
+    for i, res1 in enumerate(cysteines):
+        for j, res2 in enumerate(cysteines):
+            if i < j:  # Avoid double counting
+                sg1 = res1['SG']
+                sg2 = res2['SG']
+                distance_sq = (sg1 - sg2) ** 2
+                if distance_sq < DISULPHIDE_CUTOFFSQ:
+                    ss_bonds.append((res1.get_id(), res2.get_id()))
+    return ss_bonds
+
+
+def count_disulfide_bonds(domain):
+    ss_bonds = identify_ss_bonds(domain)
+    return len(ss_bonds)
+
+
+
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+    """Extract features from the database and write them to the HDF5 file.
+
+    Args:
+        conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
+              optimization.sqlite3. Read-only — do not write.
+        out_file: Writable HDF5 file. Write one dataset per (domain, protein)
+                  pair, grouped by domain_id.
+    """
+    domain_protein_df = pd.read_sql(
+        """
+        SELECT domain_id, protein_id, pdb_af_gz, pdb_rf_gz
+        FROM domain_protein_map;
+        """,
+        conn,
+    )
+
+
+    domain_protein_df["domain_id"] = domain_protein_df["domain_id"].astype(str)
+    domain_protein_df["protein_id"] = domain_protein_df["protein_id"].astype(str)
+
+
+    for domain_id, protein_id, pdb_af_gz, pdb_rf_gz in domain_protein_df.itertuples(index=False):
+        # Initialize feature vector with shape 1,
+        feature_vector = np.zeros(1, dtype=np.float32)
+        
+        pdb_files = (pdb_af_gz, pdb_rf_gz)
+        vector_list = []
+
+        for pdb_gz in pdb_files:
+            if pdb_gz is None:
+                print(f"Warning: Missing PDB file for domain {domain_id}, protein {protein_id}. Skipping.")
+                continue
+        
+            structure = bytes_to_pdb_structure(pdb_gz)
+
+            ssbond_count = count_disulfide_bonds(structure)
+            vector_list.append(ssbond_count)
+
+        # Average the feature vectors from AF and RF if both are available
+        if vector_list:
+            feature_vector = np.mean(vector_list, axis=0)
+
+        if domain_id not in out_file:
+            pfam_group = out_file.create_group(domain_id)
+        else:
+            pfam_group = out_file[domain_id]
+
+        pfam_group[protein_id] = feature_vector # pyright: ignore[reportIndexIssue]
+
+    print(f"disulfide_bonds: wrote {len(domain_protein_df)} entries")

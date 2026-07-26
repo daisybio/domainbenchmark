@@ -24,6 +24,8 @@ process FEATURE_EXTRACTION_ONE {
     script:
         def out = "${meta.dataset}.h5"
         def feature_name = meta.feature
+        def module_name = meta.module
+        def feature_params = meta.params ?: [:]
         def dataset      = meta.dataset
 
         def script_body
@@ -35,6 +37,8 @@ process FEATURE_EXTRACTION_ONE {
                 script_body = """extract_features.py \\
                     --db ${database_dir} \\
                     --feature ${feature_name} \\
+                    --module ${module_name} \\
+                    --params '${groovy.json.JsonOutput.toJson(feature_params)}' \\
                     --out ${out}"""
             }
         } else {
@@ -42,6 +46,8 @@ process FEATURE_EXTRACTION_ONE {
                 extract_features.py \\
                     --db ${database_dir}/${dataset}.sqlite3 \\
                     --feature ${feature_name} \\
+                    --module ${module_name} \\
+                    --params '${groovy.json.JsonOutput.toJson(feature_params)}' \\
                     --out ${out}
             else
                 # Split missing in this database — emit zero-byte placeholder
@@ -109,9 +115,11 @@ workflow FEATURE_EXTRACTION {
             .combine(ds_ch)
             .map { db_meta, db_path, feat, ds ->
                 def m = [
-                    id     : "${db_meta.id}_${feat}_${ds}",
+                    id     : "${db_meta.id}_${feat.name}_${ds}",
                     db     : db_meta.id,
-                    feature: feat,
+                    feature: feat.name,
+                    module : feat.module,
+                    params : groovy.json.JsonOutput.toJson(feat.params ?: [:]),
                     dataset: ds
                 ]
                 tuple(m, db_path)
