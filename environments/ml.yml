@@ -1,4 +1,4 @@
-name: cobinet-ml
+name: domainbenchmark-gpu
 channels:
   - rapidsai
   - conda-forge

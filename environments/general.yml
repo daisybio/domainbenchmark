@@ -1,4 +1,4 @@
-name: cobinet-general
+name: domainbenchmark-general
 channels:
   - conda-forge
   - bioconda

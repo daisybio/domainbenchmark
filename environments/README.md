@@ -4,8 +4,8 @@ Two environments are the single source of truth for runtime dependencies.
 
 | File          | Purpose                          | Container tag                       |
 |---------------|----------------------------------|-------------------------------------|
-| `general.yml`    | CPU env (eval, graph models, IO) | `konstantinpelz/cobinet-general:1.0.0` |
-| `ml.yml`      | GPU env (ML, RF, cuML, torch)    | `konstantinpelz/cobinet-ml:1.0.0`   |
+| `general.yml`    | CPU env (eval, graph models, IO) | `konstantinpelz/domainbenchmark-general:1.0.0` |
+| `ml.yml`      | GPU env (ML, RF, cuML, torch)    | `konstantinpelz/domainbenchmark-gpu:1.0.0`   |
 
 The `docker/Dockerfile.base` and `docker/Dockerfile.ml` images mirror these
 files. When pinning a package version here, update the corresponding line in
