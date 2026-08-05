@@ -42,9 +42,10 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
+import Bio
 
 from .sasa_structure import calculate_sasa_structure_level
-from structure_utils import bytes_to_pdb_structure, calculate_sasa_residue_level
+from .structure_utils import bytes_to_pdb_structure, calculate_sasa_residue_level
 
 
 def calculate_interface_area(struct, structA, structB):

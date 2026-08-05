@@ -1,8 +1,8 @@
 import numpy as np
-from Bio.PDB.PDBParser import PDBParser
 from collections import defaultdict
 import gzip
 
+from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.SASA import ShrakeRupley
 
 
@@ -230,8 +230,7 @@ if torch.cuda.is_available():
 else:
     device = torch.device('cpu')
 
-# DIM = 20
-# LAYER_GNN = 2
+
 
 
 # class _SingleProteinEncoder(nn.Module):
@@ -343,6 +342,8 @@ class ProteinProteinInteractionPrediction(nn.Module):
 # repeated calls in a loop don't reinitialize random weights each time.
 _encoder_cache = {}
 
+DIM = 20
+LAYER_GNN = 2
 
 def embed_fingerprints_single(fingerprint, adjacency, n_fingerprint, dim=DIM, layer_gnn=LAYER_GNN):
     """

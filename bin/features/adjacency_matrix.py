@@ -43,8 +43,10 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
+import Bio
 
-from structure_utils import bytes_to_pdb_structure, calculate_rsa_residue_level, embed_fingerprints_single, normalize_weighted_adjacency
+
+from .structure_utils import bytes_to_pdb_structure, calculate_rsa_residue_level, embed_fingerprints_single, normalize_weighted_adjacency
 
 
 FINGERPRINT_DICT = defaultdict(lambda: len(FINGERPRINT_DICT))
@@ -191,8 +193,8 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
         
         structure = bytes_to_pdb_structure(pdb_gz)
 
-        structA = structure[0]["A"]
-        structB = structure[0]["B"]
+        structA = structure[0]["A"]  # type: ignore[reportGeneralTypeIssues]
+        structB = structure[0]["B"]  # type: ignore[reportGeneralTypeIssues]
 
 
         shell_matrix_A = build_shell_adjacency_graph(define_shell(structA))

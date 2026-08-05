@@ -1,2 +1,3 @@
 id,db_path
-minimal_leakage_domain_deletion,/nfs/home/students/c.thomas/domainsplit/results/teschting_smoke/databases/minimal_leakage_domain_deletion
+random_ddi_random_addition,/nfs/data/CoBiNet_Masterpraktikum/domainsplit/results/teschting_smoke_af/databases_scored/random_ddi_random_addition/
+random_ddi_deletion,/nfs/data/CoBiNet_Masterpraktikum/domainsplit/results/teschting_smoke_af/databases_scored/random_ddi_deletion/

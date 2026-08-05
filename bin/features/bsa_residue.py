@@ -42,8 +42,10 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
+import Bio
 
-from structure_utils import bytes_to_pdb_structure, calculate_sasa_residue_level, pad_vector
+
+from .structure_utils import bytes_to_pdb_structure, calculate_sasa_residue_level, pad_vector
 
 
 

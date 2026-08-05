@@ -42,8 +42,10 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
+import Bio
 
-from structure_utils import bytes_to_pdb_structure
+from .structure_utils import bytes_to_pdb_structure
+
 
 
 def build_interchain_distance_matrix(structA, structB):
@@ -71,7 +73,7 @@ def get_mean_distances(distance_matrix, k):
     
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, res_num: int = 5):
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
@@ -79,6 +81,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
               optimization.sqlite3. Read-only — do not write.
         out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
                   pair, grouped by ddi_id.
+        res_num: Number of closest residues to consider for distance calculation.
     """
     domain_structure = pd.read_sql(
         """
@@ -101,11 +104,11 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
 
         structure = bytes_to_pdb_structure(pdb_gz)
 
-        structA = structure[0]["A"]
-        structB = structure[0]["B"]
+        structA = structure[0]["A"]  # type: ignore[reportGeneralTypeIssues]
+        structB = structure[0]["B"]  # type: ignore[reportGeneralTypeIssues]
 
         distance_matrix = build_interchain_distance_matrix(structA, structB)
-        mean_distances = get_mean_distances(distance_matrix, k=5)  # Example: get mean of 5 closest distances
+        mean_distances = get_mean_distances(distance_matrix, k=res_num)  # Example: get mean of res_num closest distances
         feature_vector = np.array([mean_distances], dtype=np.float32)
 
         def write_to_h5(domain_key, protein_key):

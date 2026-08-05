@@ -11,20 +11,19 @@ The pipeline auto-discovers features by name: extract_features.py calls
 importlib.import_module(f"features.{feature_name}").extract_features(conn, out_file).
 
 CREATE TABLE IF NOT EXISTS domain_structure (
-    id         INTEGER PRIMARY KEY,
-    ddi_id     REFERENCES domain_domain_interaction ON DELETE CASCADE,
-    domain1    REFERENCES domain ON DELETE CASCADE,
-    domain2    REFERENCES domain ON DELETE CASCADE,
-    protein1   REFERENCES protein ON DELETE CASCADE,
-    protein2   REFERENCES protein ON DELETE CASCADE,
-    source     TEXT    NOT NULL,
-    pdb_gz     BLOB    NOT NULL,
-    z_score    REAL,
-    UNIQUE (ddi_id, protein1, protein2, source)
-);
+        id         INTEGER PRIMARY KEY AUTOINCREMENT, 
+        ddi_id INTEGER NOT NULL REFERENCES domain_domain_interaction(id),
+        domain_id_a TEXT NOT NULL REFERENCES domain(id),
+        domain_id_b TEXT NOT NULL REFERENCES domain(id),
+        protein1 INTEGER NOT NULL REFERENCES protein(id),
+        protein2 INTEGER NOT NULL REFERENCES protein(id),
+        source     TEXT    NOT NULL,
+        pdb_gz     BLOB    NOT NULL,
+        UNIQUE (ddi_id, protein1, protein2, source)
+    );
 
 HDF5 output structure (required by downstream ML models):
-    /<domain_id>/<protein_id> = numpy array of shape (feature_dim,)
+    /<domain_id_a _ domain_id_b>/<protein_id_a protein_id_b> = numpy array of shape (feature_dim,)
 
 
 """
@@ -33,9 +32,9 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
+import Bio
 
-from structure_utils import bytes_to_pdb_structure
-
+from .structure_utils import bytes_to_pdb_structure
 from Bio.PDB.SASA import ShrakeRupley
 
 def calculate_sasa_structure_level(domain):
@@ -54,45 +53,50 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
         out_file: Writable HDF5 file. Write one dataset per (domain, protein)
                   pair, grouped by domain_id.
     """
-    domain_protein_df = pd.read_sql(
-        """
-        SELECT domain_id, protein_id, pdb_af_gz, pdb_rf_gz
-        FROM domain_protein_map;
-        """,
-        conn,
-    )
+    domain_structure = pd.read_sql(
+            """
+            SELECT domain_id_a, domain_id_b, protein_id_a, protein_id_b, source, pdb_gz
+            FROM domain_structure;
+            """,
+            conn,
+        )
+    
+
+    domain_structure["domain_id_a"] = domain_structure["domain_id_a"].astype(str)
+    domain_structure["domain_id_b"] = domain_structure["domain_id_b"].astype(str)
+    domain_structure["protein_id_a"] = domain_structure["protein_id_a"].astype(str)
+    domain_structure["protein_id_b"] = domain_structure["protein_id_b"].astype(str)
 
 
-    domain_protein_df["domain_id"] = domain_protein_df["domain_id"].astype(str)
-    domain_protein_df["protein_id"] = domain_protein_df["protein_id"].astype(str)
-
-
-    for domain_id, protein_id, pdb_af_gz, pdb_rf_gz in domain_protein_df.itertuples(index=False):
+    for domain_id_a, domain_id_b, protein_id_a, protein_id_b, source, pdb_gz in domain_structure.itertuples(index=False):
         # Initialize feature vector with shape 1,
         feature_vector = np.zeros(1, dtype=np.float32)
         
-        pdb_files = (pdb_af_gz, pdb_rf_gz)
-        vector_list = []
 
-        for pdb_gz in pdb_files:
-            if pdb_gz is None:
-                print(f"Warning: Missing PDB file for domain {domain_id}, protein {protein_id}. Skipping.")
-                continue
+        if pdb_gz is None:
+            print(f"Warning: Missing PDB file for ddi {domain_id_a}_{domain_id_b} in ppi {protein_id_a}_{protein_id_b}. Skipping.")
+            continue
         
-            structure = bytes_to_pdb_structure(pdb_gz)
+        structure = bytes_to_pdb_structure(pdb_gz)
 
-            sasa_structure = calculate_sasa_structure_level(structure)
-            vector_list.append(sasa_structure)
+        sasa_structure = calculate_sasa_structure_level(structure)
 
-        # Average the feature vectors from AF and RF if both are available
-        if vector_list:
-            feature_vector = np.mean(vector_list, axis=0)
+        feature_vector = np.array([sasa_structure], dtype=np.float32)
 
-        if domain_id not in out_file:
-            pfam_group = out_file.create_group(domain_id)
-        else:
-            pfam_group = out_file[domain_id]
+        def write_to_h5(domain_key, protein_key):
+            # create a group for each pfam_id and put uniprot_id as a subgroup
+            if domain_key not in out_file:
+                pfam_group = out_file.create_group(domain_key)
+            else:
+                pfam_group = out_file[domain_key]
 
-        pfam_group[protein_id] = feature_vector # pyright: ignore[reportIndexIssue]
+            if protein_key in pfam_group:
+                print(f"Warning: Duplicate entry for {protein_key} in {domain_key}.")
+            else:
+                pfam_group[protein_key] = feature_vector  # pyright: ignore[reportIndexIssue]
 
-    print(f"sasa_structure: wrote {len(domain_protein_df)} entries")
+        # write both directions
+        write_to_h5(f"{domain_id_a}_{domain_id_b}", f"{protein_id_a}_{protein_id_b}")
+        write_to_h5(f"{domain_id_b}_{domain_id_a}", f"{protein_id_b}_{protein_id_a}")
+        
+    print(f"sasa_structure: wrote {len(domain_structure)} entries")
