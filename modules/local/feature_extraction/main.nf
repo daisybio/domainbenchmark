@@ -12,7 +12,7 @@ process FEATURE_EXTRACTION_ONE {
     label 'feature_extraction'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker://konstantinpelz/cobinet-general:1.0.0"
+    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
         tuple val(meta), path(database_dir)
@@ -66,7 +66,7 @@ process STAGE_FEATURE_DIR {
     label 'feature_stage'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker://konstantinpelz/cobinet-general:1.0.0"
+    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
         tuple val(meta), path(h5_files)
