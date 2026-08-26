@@ -11,19 +11,25 @@ process EVAL_ONE {
     container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
-        tuple val(meta), path(predictions)
+        tuple val(meta), path(predictions), path(ddi_dir)
 
     output:
         tuple val(meta), path("per_model/${meta.model}.json"), emit: metrics
         path "versions.yml",                                    emit: versions
 
     script:
+        // `<split>_sources.csv` carries each test DDI's comma-joined provenance
+        // list, which is what turns the predictions into per-source accuracy.
+        // Passed as a path, not a flag: a database whose splitter predates the
+        // `source` column simply has no such file and the block is skipped.
+        def sources_arg = meta.split ? "--sources ${ddi_dir}/${meta.split}_sources.csv" : ''
         """
         mkdir -p per_model
 
         eval_one.py \\
             --predictions ${predictions} \\
             --model_name ${meta.model} \\
+            ${sources_arg} \\
             --out per_model/${meta.model}.json
 
         cat <<-END_VERSIONS > versions.yml

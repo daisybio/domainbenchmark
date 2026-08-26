@@ -172,13 +172,26 @@ workflow PER_DB_BENCHMARK {
                         id       : "${run_label}_${model_name}",
                         db       : meta.db,
                         variant  : variant,
+                        // Split name behind the variant (`balanced` ->
+                        // `test_balanced`), which is how EVAL_ONE finds the
+                        // right `<split>_sources.csv`.
+                        split    : (meta.tests ? meta.tests[variant] : null),
                         run_label: run_label,
                         model    : model_name
                     ]
                     tuple(m_eval, pf)
                 }
             }
-        EVAL_ONE(all_predictions_ch)
+
+        // Per-source accuracy needs each test DDI's provenance list, so the
+        // scatter task gets its database's DDI directory alongside the
+        // predictions. `combine(by: 0)` rather than `join`: one DDI dir fans out
+        // to every (model x variant) prediction of that database.
+        eval_one_input_ch = all_predictions_ch
+            .map { m, pf -> tuple(m.db, m, pf) }
+            .combine(ddi_keyed.map { id, _meta, ddi_dir -> tuple(id, ddi_dir) }, by: 0)
+            .map { _db_id, m, pf, ddi_dir -> tuple(m, pf, ddi_dir) }
+        EVAL_ONE(eval_one_input_ch)
 
         // ---------------------------------------------------------------
         // Per-(DB, variant) MultiQC reduce. Group EVAL_ONE outputs by

@@ -686,6 +686,79 @@ def fix_trailing_punctuation_in_report(html_path: str) -> None:
         logging.info("[INFO] No stray trailing dots found to fix.")
 
 
+#: Per-source accuracy sidecar. Deliberately NOT a `*_mqc.json` block: the
+#: per-source view is a cross-dataset comparison, so only `combine_eval.py`
+#: renders it (as one tabbed bar graph over every (database, variant)). MultiQC
+#: ignores the file here, but it travels with the published `evaluation/` dir.
+SOURCE_ACCURACY_SIDECAR = "source_accuracy.json"
+
+
+def write_source_accuracy_sidecar(per_model_paths, outdir, db_name, test_split) -> None:
+    """Collect `per_source` from every model's eval_one sidecar into one file.
+
+    @per_model_paths: eval_one.py JSON sidecars for this (database, variant)
+    @outdir: evaluation output directory
+    @db_name: run label, i.e. the dataset this file describes
+    @test_split: the split the numbers were measured on
+
+    Counts (`n`, `n_pos`, `n_neg`) describe the test split itself and are
+    therefore model-independent -- taken from whichever model reports them, with
+    disagreements logged rather than silently reconciled. `n_scored` / `correct`
+    stay per model so `combine_eval.py` can both flag partial coverage and add up
+    an exact cross-dataset total.
+    """
+    models = {}
+    totals = {}
+    for path in per_model_paths or []:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+        except Exception as e:
+            logging.info(f"[WARN] Could not read per-model sidecar {path}: {e}")
+            continue
+        per_source = obj.get("per_source") or {}
+        if not per_source:
+            continue
+        model = obj.get("model_name") or os.path.splitext(os.path.basename(path))[0]
+        models[model] = {
+            source: {
+                "n_scored": int(stats.get("n_scored", 0)),
+                "correct": int(stats.get("correct", 0)),
+                "accuracy": stats.get("accuracy"),
+            }
+            for source, stats in per_source.items()
+        }
+        for source, stats in per_source.items():
+            counts = {
+                "n": int(stats.get("n", 0)),
+                "n_pos": int(stats.get("n_pos", 0)),
+                "n_neg": int(stats.get("n_neg", 0)),
+            }
+            if source in totals and totals[source] != counts:
+                logging.info(
+                    f"[WARN] Model '{model}' disagrees on the size of source "
+                    f"'{source}' ({counts} vs {totals[source]}); keeping the first."
+                )
+                continue
+            totals.setdefault(source, counts)
+
+    if not models:
+        print("[INFO] No per-source metrics in the per-model sidecars; skipping "
+              f"{SOURCE_ACCURACY_SIDECAR}")
+        return
+
+    payload = {
+        "db_name": db_name,
+        "test_split": test_split,
+        "totals": totals,
+        "models": models,
+    }
+    out_path = os.path.join(outdir, SOURCE_ACCURACY_SIDECAR)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"[INFO] Wrote {out_path} ({len(models)} models, {len(totals)} sources)")
+
+
 def main():
     args = parse_arguments()
     # print arguments for logging
@@ -781,6 +854,12 @@ def main():
         old_report_dir=old_report_dir,
     )
     print("[INFO] MultiQC JSON blocks written for model evaluation metrics and curves.")
+
+    # Per-source accuracy travels as a plain sidecar for combine_eval.py.
+    if args.per_model_metrics:
+        write_source_accuracy_sidecar(
+            args.per_model_metrics, args.out_dir, db_name, args.test_split
+        )
 
     # Part5: Config + run MultiQC
     cfg_path = write_multiqc_config(args.out_dir, args.report, db_name, same_db=same_db)

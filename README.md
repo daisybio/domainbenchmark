@@ -171,9 +171,10 @@ For each database split processed, a subdirectory under `--outdir/<db_name>/`:
 ```
 <outdir>/<db_name>/
 ├── ddi/
-│   └── <db_name>/DDI/
+│   └── DDI/
 │       ├── <split>.csv            # domain pairs + label
-│       └── <split>_instances.csv  # the split's domain-instance pairs
+│       ├── <split>_instances.csv  # the split's domain-instance pairs
+│       └── <split>_sources.csv    # domain pairs + provenance list
 ├── data/
 │   └── <db_name>/<feature>/
 │       ├── train.h5
@@ -193,13 +194,24 @@ For each database split processed, a subdirectory under `--outdir/<db_name>/`:
 │       └── model/
 └── evaluation/
     └── <variant>/                          # one report per test split
-        └── ddi_report.html
+        ├── ddi_report.html
+        └── source_accuracy.json            # per-source accuracy, for COMBINE_EVAL
 ```
 
 Shared work (DDI CSVs, features, fitted models) sits directly under the
 database directory; only `evaluation/` fans out per test variant. A top-level
 cross-database report is always written to `<outdir>/evaluation/ddi_report.html`
 and lists every (database, test variant) pair as a separate dataset.
+
+That combined report also carries an **Accuracy by DDI source** section: one bar
+group per source (`3did`, `sampled_negative`, `single_domain_ppi`, `PPIDM*`,
+`negatome`, …), one bar per model plus an `Average` bar, and a tab per
+(database, variant) with a final `Combined` tab pooling them all. A DDI whose
+`source` lists several sources counts under each of them, so the groups overlap
+and do not sum to the `ALL` group. Sources are usually single-class -- `3did` is
+all positives, `sampled_negative` all negatives -- so accuracy is the only
+metric reported; the DDI counts per source sit in the section description,
+together with a note for any model that scored less than the full source.
 
 A full description of each output is in [`docs/output.md`](docs/output.md).
 

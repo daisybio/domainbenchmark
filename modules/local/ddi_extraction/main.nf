@@ -9,8 +9,13 @@ process DDI_EXTRACTION {
         tuple val(meta), path(database_dir)
 
     output:
-        tuple val(meta), path("${meta.id}/DDI"), emit: ddi
-        path "versions.yml",                     emit: versions
+        // NOT `${meta.id}/DDI`: the input database directory is staged under its
+        // own basename, which for a directory input *is* `${meta.id}`, so writing
+        // there followed the stage symlink and dumped the CSVs straight into the
+        // caller's domainsplit output (and into the test fixture, whose stale
+        // copies are still tracked). `ddi_out/` cannot collide with a staged input.
+        tuple val(meta), path("ddi_out/DDI"), emit: ddi
+        path "versions.yml",                  emit: versions
 
     script:
         // Every DDI row in a split database *is* that split: domainsplit's
@@ -40,9 +45,15 @@ process DDI_EXTRACTION {
                                 NOT negative AS interaction
                         FROM domain_domain_interaction;
                 ''', conn)
+                source_df = pd.read_sql('''
+                        SELECT domain_id_a AS domain_1, domain_id_b AS domain_2,
+                                NOT negative AS interaction, source
+                        FROM domain_domain_interaction;
+                ''', conn)
 
-            os.makedirs(f"${meta.id}/DDI/", exist_ok=True)
-            ddi_df.to_csv(f"${meta.id}/DDI/test.csv", index=False)
+            os.makedirs("ddi_out/DDI/", exist_ok=True)
+            ddi_df.to_csv("ddi_out/DDI/test.csv", index=False)
+            source_df.to_csv("ddi_out/DDI/test_sources.csv", index=False)
             PYEOF
 
             cat <<-END_VERSIONS > versions.yml
@@ -62,6 +73,17 @@ process DDI_EXTRACTION {
             DDI_QUERY = '''
                 SELECT domain_id_a AS domain_1, domain_id_b AS domain_2,
                        NOT negative AS interaction
+                FROM domain_domain_interaction;
+            '''
+
+            # Same rows plus the provenance list. `source` is a comma-joined list
+            # of every source that contributed the pair (domainsplit keys
+            # `domain_domain_interaction` UNIQUE on the pair), so a DDI with
+            # "single_domain_ppi,PPIDM,PPIDM_Gold" counts towards all three
+            # per-source performance rows in the report.
+            SOURCES_QUERY = '''
+                SELECT domain_id_a AS domain_1, domain_id_b AS domain_2,
+                       NOT negative AS interaction, source
                 FROM domain_domain_interaction;
             '''
 
@@ -87,7 +109,7 @@ process DDI_EXTRACTION {
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
                 ).fetchone() is not None
 
-            out_dir = f"${meta.id}/DDI"
+            out_dir = "ddi_out/DDI"
             os.makedirs(out_dir, exist_ok=True)
 
             for split in "${splits}".split():
@@ -96,6 +118,9 @@ process DDI_EXTRACTION {
                     continue
                 with sqlite3.connect(path) as conn:
                     pd.read_sql(DDI_QUERY, conn).to_csv(f"{out_dir}/{split}.csv", index=False)
+                    pd.read_sql(SOURCES_QUERY, conn).to_csv(
+                        f"{out_dir}/{split}_sources.csv", index=False
+                    )
                     if has_table(conn, "ddi_split_membership"):
                         pd.read_sql(INSTANCE_QUERY, conn).to_csv(
                             f"{out_dir}/{split}_instances.csv", index=False

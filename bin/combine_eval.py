@@ -99,6 +99,8 @@ def write_multiqc_config(outdir) -> str:
     pr_heatmep_block = pick(r"model_performance_heatmap_pr$")
     pr_heatmap_ci = pick(r"model_performance_heatmap_pr_ci$")
 
+    source_block = pick(r"source_accuracy_by_ddi_source")
+
     db_blocks = pick(r"database_analysis")
     degree_blocks = pick(r"_degree_distribution")
     betweenness_blocks = pick(r"_betweenness_distribution")
@@ -120,6 +122,7 @@ def write_multiqc_config(outdir) -> str:
         + pr_heatmap_ci
         + roc_curves_block
         + pr_curves_block
+        + source_block
     )
 
     # Now add old report blocks that are not already present
@@ -257,6 +260,250 @@ def relabel_multiqc_block(block, db_name):
         if "title" in block["pconfig"]:
             block["pconfig"]["title"] = add_title(block["pconfig"]["title"])
     return block
+
+
+#: Written by eval_multiqc.py, one per (database, test variant). Not a
+#: `*_mqc.json` block on purpose -- the per-source view only makes sense as one
+#: cross-dataset figure, which is assembled here.
+SOURCE_ACCURACY_SIDECAR = "source_accuracy.json"
+
+#: Baseline row: the whole test set, i.e. what the ordinary overview tables show.
+ALL_SOURCES = "ALL"
+
+#: Extra bar per source group: unweighted mean over the models in that group.
+AVERAGE_CAT = "Average"
+
+#: Extra tab: every dataset pooled. Exact, not an average of averages -- summed
+#: `correct` over summed `n_scored`.
+COMBINED_LABEL = "Combined"
+
+
+def read_source_accuracy(report_dir):
+    """Load one report's per-source sidecar, or None when it has none."""
+    path = os.path.join(report_dir, SOURCE_ACCURACY_SIDECAR)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as e:
+        logging.info(f"[WARN] Could not read {path}: {e}")
+        return None
+
+
+def _model_palette(models):
+    """Stable model -> colour map, so a bar keeps its colour across every tab."""
+    cmap = plt.get_cmap("tab20")
+    palette = {}
+    for i, model in enumerate(models):
+        rgb = cmap((i % 20) / 19.0)
+        palette[model] = "#{:02x}{:02x}{:02x}".format(
+            int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
+        )
+    return palette
+
+
+def _combine_datasets(sidecars):
+    """Pool every dataset into one synthetic `Combined` sidecar.
+
+    Accuracy is recomputed from summed `correct` / `n_scored` rather than
+    averaged, so a dataset with ten times the DDIs of another carries ten times
+    the weight -- which is what pooling the test sets would have given.
+    """
+    totals = {}
+    models = {}
+    for sidecar in sidecars:
+        for source, counts in sidecar.get("totals", {}).items():
+            acc = totals.setdefault(source, {"n": 0, "n_pos": 0, "n_neg": 0})
+            for key in ("n", "n_pos", "n_neg"):
+                acc[key] += int(counts.get(key, 0))
+        for model, by_source in sidecar.get("models", {}).items():
+            per_model = models.setdefault(model, {})
+            for source, stats in by_source.items():
+                acc = per_model.setdefault(source, {"n_scored": 0, "correct": 0})
+                acc["n_scored"] += int(stats.get("n_scored", 0))
+                acc["correct"] += int(stats.get("correct", 0))
+    for by_source in models.values():
+        for stats in by_source.values():
+            stats["accuracy"] = (
+                stats["correct"] / stats["n_scored"] if stats["n_scored"] else None
+            )
+    return {"db_name": COMBINED_LABEL, "test_split": COMBINED_LABEL,
+            "totals": totals, "models": models}
+
+
+def _source_order(totals):
+    """DDI count descending, `ALL` pinned to the bottom as the summary row."""
+    sources = sorted(
+        (s for s in totals if s != ALL_SOURCES),
+        key=lambda s: (-int(totals[s].get("n", 0)), s),
+    )
+    if ALL_SOURCES in totals:
+        sources.append(ALL_SOURCES)
+    return sources
+
+
+def _counts_table_html(sidecars, source_order):
+    """The DDI counts, as text above the plot rather than as bars.
+
+    Sources are mostly single-class -- `3did` is all positives, `sampled_negative`
+    all negatives -- so the positive/negative split is what tells you whether a
+    row's accuracy is a recall or a specificity in disguise.
+    """
+    head = "".join(f"<th style='text-align:right'>{sc['db_name']}</th>" for sc in sidecars)
+    rows = []
+    for source in source_order:
+        cells = []
+        for sidecar in sidecars:
+            counts = sidecar.get("totals", {}).get(source)
+            if not counts:
+                cells.append("<td style='text-align:right'>&ndash;</td>")
+                continue
+            cells.append(
+                "<td style='text-align:right'>{n:,} "
+                "<span style='color:#888'>({pos:,}&#8593;/{neg:,}&#8595;)</span></td>".format(
+                    n=int(counts.get("n", 0)),
+                    pos=int(counts.get("n_pos", 0)),
+                    neg=int(counts.get("n_neg", 0)),
+                )
+            )
+        label = f"<b>{source}</b>" if source == ALL_SOURCES else source
+        rows.append(f"<tr><td>{label}</td>{''.join(cells)}</tr>")
+    return (
+        "<p>DDIs per source in each test set, as "
+        "<code>total (positives&#8593;/negatives&#8595;)</code>. A DDI contributed by "
+        "several sources is counted under each of them, so the columns do not sum to "
+        f"<b>{ALL_SOURCES}</b>.</p>"
+        "<table class='table table-sm table-condensed' style='width:auto'>"
+        f"<thead><tr><th>Source</th>{head}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _coverage_notes(sidecars):
+    """Flag (dataset, model, source) cells scored on less than the full source.
+
+    Models do not all see the same DDIs: an ML model drops pairs whose domains
+    have no usable features, and a graph model only scores the pairs its network
+    reaches. Accuracy is computed over what each model actually scored, so a low
+    coverage cell is a weaker claim than its neighbours and has to say so.
+    """
+    notes = []
+    for sidecar in sidecars:
+        # The pooled tab has no coverage of its own -- it inherits whatever the
+        # real datasets already reported, so listing it again says nothing new.
+        if sidecar.get("db_name") == COMBINED_LABEL:
+            continue
+        for model in sorted(sidecar.get("models", {})):
+            partial = []
+            for source, stats in sorted(sidecar["models"][model].items()):
+                n = int(sidecar.get("totals", {}).get(source, {}).get("n", 0))
+                scored = int(stats.get("n_scored", 0))
+                if n and scored < n:
+                    partial.append(f"{source} {100.0 * scored / n:.1f}%")
+            if partial:
+                shown = ", ".join(partial[:6])
+                more = f", +{len(partial) - 6} more" if len(partial) > 6 else ""
+                notes.append(f"{sidecar['db_name']} / {model}: {shown}{more}")
+    if not notes:
+        return ""
+    return (
+        "<p><b>Partial coverage.</b> These models scored fewer DDIs than the source "
+        "contains; their accuracy is over the scored subset only.<br><small>"
+        + "<br>".join(notes)
+        + "</small></p>"
+    )
+
+
+def source_accuracy_bargraph(sidecars, outdir):
+    """One tabbed bar graph: bars = models, groups = sources, tabs = datasets.
+
+    A table would have been the natural shape here, but MultiQC 1.32 renders only
+    the first dataset of a custom-content `table` and ignores `data_labels`
+    (`custom_content.py`, the `PlotType.TABLE` branch), so there is no tabbed
+    table to be had. A bar graph switches datasets natively, and the counts that
+    do not belong on a value axis move into the section description.
+    """
+    sidecars = [sc for sc in sidecars if sc and sc.get("models")]
+    if not sidecars:
+        print("[INFO] No per-source sidecars found; skipping the by-source section.")
+        return
+
+    sidecars = sorted(sidecars, key=lambda sc: sc.get("db_name", ""))
+    if len(sidecars) > 1:
+        sidecars = sidecars + [_combine_datasets(sidecars)]
+
+    palette = _model_palette(sorted({m for sc in sidecars for m in sc["models"]}))
+
+    data, categories, data_labels = [], [], []
+    for sidecar in sidecars:
+        models = sorted(sidecar["models"])
+        order = _source_order(sidecar.get("totals", {})) or sorted(
+            {s for by_source in sidecar["models"].values() for s in by_source}
+        )
+
+        dataset = {}
+        for source in order:
+            cell, accuracies = {}, []
+            for model in models:
+                stats = sidecar["models"][model].get(source)
+                if not stats or not stats.get("n_scored"):
+                    continue
+                accuracy = 100.0 * stats["correct"] / stats["n_scored"]
+                cell[model] = round(accuracy, 2)
+                accuracies.append(accuracy)
+            if not accuracies:
+                continue
+            cell[AVERAGE_CAT] = round(sum(accuracies) / len(accuracies), 2)
+            dataset[source] = cell
+        if not dataset:
+            continue
+
+        present = [m for m in models if any(m in cell for cell in dataset.values())]
+        cats = {m: {"name": m, "color": palette[m]} for m in present}
+        cats[AVERAGE_CAT] = {"name": AVERAGE_CAT, "color": "#4d4d4d"}
+
+        data.append(dataset)
+        categories.append(cats)
+        data_labels.append({"name": sidecar["db_name"], "title": sidecar["db_name"]})
+
+    if not data:
+        print("[INFO] Per-source sidecars held no scored sources; skipping the section.")
+        return
+
+    block = {
+        "id": "source_accuracy_by_ddi_source",
+        "section_name": "Accuracy by DDI source",
+        "description": _counts_table_html(sidecars, _source_order(sidecars[-1]["totals"]))
+        + _coverage_notes(sidecars),
+        "plot_type": "bargraph",
+        "categories": categories,
+        "pconfig": {
+            "id": "source_accuracy_by_ddi_source",
+            "title": "Accuracy by DDI source",
+            "ylab": "Accuracy (%)",
+            "ymin": 0,
+            "ymax": 100,
+            # Grouped, not stacked: the bars are independent accuracies, and a
+            # stack of them would add up to a meaningless total.
+            "stacking": "group",
+            "cpswitch": False,
+            "hide_zero_cats": False,
+            "sort_samples": False,
+            "use_legend": True,
+            "tt_decimals": 1,
+            "tt_suffix": "%",
+            "data_labels": data_labels,
+        },
+        "data": data,
+    }
+    out_path = os.path.join(outdir, "source_accuracy_by_ddi_source_mqc.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(block, fh, indent=2)
+    print(
+        f"[INFO] Wrote {out_path} ({len(data)} datasets, "
+        f"{len(data_labels)} tabs incl. {COMBINED_LABEL if len(sidecars) > 1 else 'none'})"
+    )
 
 
 def cross_db_comparison(all_blocks, outdir):
@@ -645,6 +892,7 @@ def main():
 
     all_blocks = []
     db_names = []
+    source_sidecars = []
 
     # Collect and relabel all blocks from each report
     for report_dir in args.reports:
@@ -652,6 +900,13 @@ def main():
         db_name = get_db_name_from_dir(report_dir)
         db_names.append(db_name)
         print(f"[INFO] Extracted db name: {db_name}")
+
+        # Per-source accuracy is rendered once, across every dataset, so it is
+        # collected here instead of copied through as a per-report block.
+        sidecar = read_source_accuracy(report_dir)
+        if sidecar:
+            sidecar.setdefault("db_name", db_name)
+            source_sidecars.append(sidecar)
 
         for fn in os.listdir(report_dir):
             if fn.endswith("_mqc.json"):
@@ -686,6 +941,7 @@ def main():
 
     # Cross-database comparison
     cross_db_comparison(all_blocks, outdir_json)
+    source_accuracy_bargraph(source_sidecars, outdir_json)
 
     # create_section_header("models_header", "Models Results", outdir_json)
     # create_section_header("db_header", "Database Results", outdir_json)

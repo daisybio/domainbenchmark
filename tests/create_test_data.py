@@ -120,6 +120,22 @@ def sequence(rng, length):
     return "".join(rng.choice(list(AA), size=length))
 
 
+# Provenance labels, mirroring what domainsplit writes: `source` is a
+# comma-joined list of every source that contributed the pair, positives and
+# negatives come from disjoint sources, and one pair is left without a source at
+# all so the report's `unknown` bucket has something to collect.
+POSITIVE_SOURCES = ["3did", "single_domain_ppi,PPIDM,PPIDM_Gold", "PPIDM"]
+NEGATIVE_SOURCES = ["sampled_negative", "negatome"]
+UNSOURCED_DDI_INDEX = 4
+
+
+def ddi_source(idx: int, negative: int):
+    if idx == UNSOURCED_DDI_INDEX:
+        return None
+    pool = NEGATIVE_SOURCES if negative else POSITIVE_SOURCES
+    return pool[(idx // 2) % len(pool)]
+
+
 def build_split(path: Path, method: str, split: str, offset: int) -> None:
     """Write one split database.
 
@@ -234,7 +250,7 @@ def build_split(path: Path, method: str, split: str, offset: int) -> None:
     for idx, (domain_a, domain_b) in enumerate(pairs):
         ddi_id = idx + 1
         negative = 1 if idx % 2 else 0
-        ddi_rows.append((ddi_id, domain_a, domain_b, negative, "TEST"))
+        ddi_rows.append((ddi_id, domain_a, domain_b, negative, ddi_source(idx, negative)))
         for instance_a in instances_by_domain[domain_a]:
             for instance_b in instances_by_domain[domain_b]:
                 first, second = sorted((instance_a, instance_b))

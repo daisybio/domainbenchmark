@@ -28,6 +28,132 @@ from sklearn.metrics import (
 from eval_multiqc_functions import bootstrap_metric
 
 
+#: Row label for the whole test set, used as the per-source table's baseline.
+ALL_SOURCES = "ALL"
+
+#: Row label for DDIs whose `source` is NULL/empty, plus any scored pair the
+#: split's `domain_domain_interaction` does not list at all. Only emitted when
+#: it actually collects rows.
+UNKNOWN_SOURCE = "unknown"
+
+
+def _pair_keys(domain_a, domain_b) -> np.ndarray:
+    """Order-independent join key for a domain pair (``"12\\t34"``).
+
+    Predictions and the source table both come from the same
+    `domain_domain_interaction` rows, so the two columns are already aligned --
+    but graph models rebuild their pair set from an undirected network and may
+    hand back the flipped orientation, so canonicalise rather than trust it.
+    """
+    a = np.asarray(domain_a, dtype=str)
+    b = np.asarray(domain_b, dtype=str)
+    lo = np.where(a <= b, a, b)
+    hi = np.where(a <= b, b, a)
+    return np.char.add(np.char.add(lo, "\t"), hi)
+
+
+def _read_sources(path: str) -> tuple:
+    """Read `<split>_sources.csv` into (exploded pair->source frame, totals).
+
+    `source` is a comma-joined provenance list, so a DDI contributed by several
+    sources is exploded into one row per source and therefore counts towards
+    each of their performance rows.
+
+    Returns ``(exploded, totals)`` where `exploded` has columns
+    ``pair``/``source`` and `totals` maps source -> ground-truth counts in this
+    test split (i.e. the denominator the model's coverage is measured against).
+    """
+    df = pd.read_csv(path, dtype={"domain_1": str, "domain_2": str, "source": str})
+    df["pair"] = _pair_keys(df["domain_1"], df["domain_2"])
+    df["interaction"] = df["interaction"].astype(np.int8)
+    df["source"] = df["source"].fillna("")
+
+    def _split(raw: str):
+        parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+        return parts or [UNKNOWN_SOURCE]
+
+    df["source"] = df["source"].map(_split)
+    exploded = df.explode("source", ignore_index=True)
+
+    totals = {}
+    for source, grp in exploded.groupby("source", sort=True):
+        n_pos = int(grp["interaction"].sum())
+        totals[source] = {
+            "n": int(len(grp)),
+            "n_pos": n_pos,
+            "n_neg": int(len(grp) - n_pos),
+        }
+    n_pos_all = int(df["interaction"].sum())
+    totals[ALL_SOURCES] = {
+        "n": int(len(df)),
+        "n_pos": n_pos_all,
+        "n_neg": int(len(df) - n_pos_all),
+    }
+    return exploded[["pair", "source"]], totals
+
+
+def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
+    """Accuracy per DDI source for one model's predictions.
+
+    Sources are usually single-class (`3did` is all positive, `sampled_negative`
+    all negative), so accuracy is the only metric that survives for most rows --
+    everything else would either be undefined or degenerate. `n_scored` is
+    reported next to the split's ground-truth `n` so partial coverage (a model
+    that could not score every DDI) is visible instead of silently inflating or
+    deflating the row.
+    """
+    if not sources_path or not os.path.isfile(sources_path):
+        print(f"[eval_one] no source table at {sources_path}; skipping per-source metrics")
+        return {}
+
+    exploded, totals = _read_sources(sources_path)
+
+    preds = pd.DataFrame(
+        {
+            "pair": _pair_keys(df["domain_a"], df["domain_b"]),
+            "correct": (
+                df["true_interaction"].to_numpy() == df["predicted_interaction"].to_numpy()
+            ).astype(np.int8),
+            "true_interaction": df["true_interaction"].to_numpy(),
+        }
+    )
+
+    merged = preds.merge(exploded, on="pair", how="left")
+    merged["source"] = merged["source"].fillna(UNKNOWN_SOURCE)
+
+    per_source = {}
+    for source, grp in merged.groupby("source", sort=True):
+        n_scored = int(len(grp))
+        n_pos = int((grp["true_interaction"] == 1).sum())
+        ground = totals.get(source, {})
+        per_source[source] = {
+            "n": int(ground.get("n", n_scored)),
+            "n_pos": int(ground.get("n_pos", n_pos)),
+            "n_neg": int(ground.get("n_neg", n_scored - n_pos)),
+            "n_scored": n_scored,
+            "correct": int(grp["correct"].sum()),
+            "accuracy": float(grp["correct"].sum()) / n_scored if n_scored else float("nan"),
+        }
+
+    n_all = int(len(preds))
+    correct_all = int(preds["correct"].sum())
+    ground_all = totals.get(ALL_SOURCES, {})
+    per_source[ALL_SOURCES] = {
+        "n": int(ground_all.get("n", n_all)),
+        "n_pos": int(ground_all.get("n_pos", int((preds["true_interaction"] == 1).sum()))),
+        "n_neg": int(ground_all.get("n_neg", 0)),
+        "n_scored": n_all,
+        "correct": correct_all,
+        "accuracy": float(correct_all) / n_all if n_all else float("nan"),
+    }
+
+    # `unknown` is a real bucket only when something landed in it.
+    if per_source.get(UNKNOWN_SOURCE, {}).get("n_scored", 0) == 0:
+        per_source.pop(UNKNOWN_SOURCE, None)
+
+    return per_source
+
+
 def _read_predictions(path: str) -> pd.DataFrame:
     if path.endswith(".parquet") or path.endswith(".pq"):
         df = pd.read_parquet(path)
@@ -99,6 +225,11 @@ def main():
     p.add_argument("--predictions", required=True)
     p.add_argument("--model_name", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--sources", default=None,
+        help="`<split>_sources.csv` from DDI_EXTRACTION (domain pair -> comma-joined "
+             "provenance list). Enables the per-source accuracy block; skipped when absent.",
+    )
     p.add_argument("--max_curve_points", type=int, default=600)
     p.add_argument("--bootstrap_n", type=int, default=1000,
                    help="Bootstrap resamples for ROC_AUC / PR_AP confidence intervals.")
@@ -156,6 +287,10 @@ def main():
         # comparisons without re-reading predictions. ~8KB per metric per model.
         "roc_auc_samples": [float(v) for v in roc_samples],
         "pr_ap_samples": [float(v) for v in pr_samples],
+        # Per-DDI-source accuracy. Computed here because this is the only stage
+        # that holds the predictions themselves -- `eval_multiqc.py` sees only
+        # these sidecars (the scatter that fixed the 300 GB evaluation OOM).
+        "per_source": _per_source_metrics(df, args.sources),
     }
 
     out = Path(args.out)
