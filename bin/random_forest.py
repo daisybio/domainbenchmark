@@ -75,9 +75,7 @@ def _oversample_minority(x, y, seed):
     return x_out[perm], y_out[perm]
 
 
-def _load_train_with_balance(
-    args, balance_method: str, samples_per_ddi: int, seed: int
-):
+def _load_train_with_balance(args, balance_method: str, seed: int):
     """Load training arrays under one of the three balance strategies."""
     if balance_method not in BALANCE_METHODS:
         raise ValueError(f"Unknown balance_method: {balance_method}")
@@ -89,7 +87,6 @@ def _load_train_with_balance(
         args.ddi_path,
         "train",
         balance_classes=downsample,
-        samples_per_ddi=samples_per_ddi,
     )
     if balance_method == "oversample":
         x_train, y_train = _oversample_minority(x_train, y_train, seed)
@@ -109,8 +106,8 @@ class RandomForestTrainer(DDIModelTrainer):
     def _balance_keys(self):
         return ["balance_method"]
 
-    def _load_train_data(self, args, balance_method, samples_per_ddi, seed):
-        return _load_train_with_balance(args, balance_method, samples_per_ddi, seed)
+    def _load_train_data(self, args, balance_method, seed):
+        return _load_train_with_balance(args, balance_method, seed)
 
     def _predict_proba(self, classifier, x):
         return classifier.predict_proba(x.astype(np.float32))[:, 1]
@@ -131,10 +128,10 @@ class RandomForestTrainer(DDIModelTrainer):
         gs.fit(x, y)
         return gs
 
-    def _refit(self, best_params, best_balance, args, config, num_features, samples_per_ddi):
+    def _refit(self, best_params, best_balance, args, config, num_features):
         from cuml.ensemble import RandomForestClassifier
         x_train, y_train = self._load_train_data(
-            args, best_balance, samples_per_ddi, args.seed
+            args, best_balance, args.seed
         )
         classifier = RandomForestClassifier(**best_params)
         print("Refitting best parameter model on training data...")

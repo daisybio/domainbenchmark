@@ -1,10 +1,21 @@
 #! /usr/bin/env python3
 
-# Create dummy script for graph models
+# Entrypoint for the graph-based DDI models.
+#
+# A graph model is trained on the database's train split and then scored
+# against every test split it ships (`test_balanced` + `test_realistic`, or a
+# single `test`). Training is the expensive phase, so it happens once and only
+# the scoring loop fans out -- one predictions file per variant.
 
 import os
 from kgiddi import run_kgiddi
 from ddiparsimony import run_ddiparsimony
+
+
+def variant_of(test_split):
+    """`test_balanced` -> `balanced`, `test` -> `test`."""
+    return test_split[len("test_"):] if test_split.startswith("test_") else test_split
+
 
 if __name__ == "__main__":
     import argparse
@@ -21,7 +32,15 @@ if __name__ == "__main__":
         "--out_dir", required=True, help="Output model path for additional files"
     )
     parser.add_argument(
-        "--out_predictions", required=False, help="Output predictions file path"
+        "--out_predictions_dir",
+        required=True,
+        help="Directory to write predictions_<variant>.parquet into",
+    )
+    parser.add_argument(
+        "--test_splits",
+        nargs="+",
+        default=["test"],
+        help="Test split names to score (e.g. test_balanced test_realistic)",
     )
     parser.add_argument(
         "--id", dest="run_id", default=None,
@@ -35,26 +54,32 @@ if __name__ == "__main__":
     if args.run_id:
         print(f"[run_graph_models] run_id={args.run_id}")
 
-    if args.model == "kgiddi":
-        json_file = os.path.join(args.params, "kgiddi.json")
-        print(
-            f"Run KGIDDI graph model with database {args.database} and parameters from {json_file}, output to {args.out_dir} and predictions to {args.out_predictions}"
+    os.makedirs(args.out_predictions_dir, exist_ok=True)
+    test_splits = {
+        variant_of(split): (
+            split,
+            os.path.join(args.out_predictions_dir, f"predictions_{variant_of(split)}.parquet"),
         )
-        run_kgiddi(args.database, json_file, args.out_dir, args.out_predictions, threads=args.threads)
-    elif args.model == "kgiddi_random":
-        json_file = os.path.join(args.params, "kgiddi_random.json")
-        print(
-            f"Run KGIDDI_RANDOM graph model with database {args.database} and parameters from {json_file}, output to {args.out_dir} and predictions to {args.out_predictions}"
-        )
-        run_kgiddi(args.database, json_file, args.out_dir, args.out_predictions, threads=args.threads)
-    elif args.model == "ddiparsimony":
-        json_file = os.path.join(args.params, "ddiparsimony.json")
-        print(
-            f"Run DDIParsimony graph model with database {args.database} and parameters from {json_file}, output to {args.out_dir} and predictions to {args.out_predictions}"
-        )
-        run_ddiparsimony(args.database, json_file, args.out_dir, args.out_predictions, threads=args.threads)
-    else:
+        for split in args.test_splits
+    }
+
+    runners = {
+        "kgiddi": (run_kgiddi, "kgiddi.json"),
+        "kgiddi_random": (run_kgiddi, "kgiddi_random.json"),
+        "ddiparsimony": (run_ddiparsimony, "ddiparsimony.json"),
+    }
+    if args.model not in runners:
         raise ValueError(f"Unknown model: {args.model}")
+
+    runner, params_name = runners[args.model]
+    json_file = os.path.join(args.params, params_name)
+    print(
+        f"Run {args.model.upper()} graph model with database {args.database} and "
+        f"parameters from {json_file}, output to {args.out_dir} and predictions "
+        f"to {sorted(path for _, path in test_splits.values())}"
+    )
+    runner(args.database, json_file, args.out_dir, test_splits, threads=args.threads)
 
     with open(f"{args.out_dir}/model.txt", "w") as f:
         f.write(f"Run {args.model} model using database {args.database}\n")
+        f.write(f"Test splits: {', '.join(args.test_splits)}\n")

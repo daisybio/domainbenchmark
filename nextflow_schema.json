@@ -12,16 +12,14 @@
             "description": "Define where the pipeline should find input data and save output data.",
             "required": ["outdir"],
             "properties": {
-                 "input": {
+                "input": {
                     "type": "string",
-                    "format": "file-path",
+                    "format": "path",
                     "exists": true,
-                    "schema": "assets/schema_input.json",
-                    "mimetype": "text/csv",
-                    "pattern": "^\\S+\\.csv$",
-                    "description": "Path to comma-separated samplesheet listing database splits to run.",
-                    "help_text": "CSV with one row per database split (columns: id, db_path). Relative db_path values are resolved against the project directory.",
-                    "fa_icon": "fas fa-file-csv"
+                    "pattern": "^\\S+$",
+                    "description": "Samplesheet CSV, or a directory of database directories.",
+                    "help_text": "Two forms are accepted. A path ending in .csv is read as a samplesheet (columns: id, db_path; relative db_path values resolve against the project directory). A directory is scanned for immediate subdirectories containing train.sqlite3 -- the layout daisybio/domainsplit publishes under databases/ -- and each becomes a dataset named after its directory. Every dataset directory must hold train.sqlite3, validation.sqlite3, and one or more test*.sqlite3; each test split is benchmarked separately against the same trained models.",
+                    "fa_icon": "fas fa-folder-open"
                 },
                 "outdir": {
                     "type": "string",
@@ -78,13 +76,6 @@
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of features whose embedding dim makes ML / RF tasks need the heavy GPU label (process_gpu_large).",
                     "fa_icon": "fas fa-weight-hanging"
-                },
-                "max_protein_combinations_per_ddi": {
-                    "type": ["integer", "null"],
-                    "default": null,
-                    "minimum": 1,
-                    "description": "Cap on protein-pair instantiations per DDI domain pair for ML / RF training and prediction. Sampled without replacement; if fewer combinations exist than the cap, all are used. Leave null / unset to use every available combination. Default: 15.",
-                    "fa_icon": "fas fa-random"
                 },
                 "modeljson": {
                     "type": "string",

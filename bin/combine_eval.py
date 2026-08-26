@@ -234,17 +234,28 @@ def get_db_name_from_dir(report_dir):
 
 
 def relabel_multiqc_block(block, db_name):
-    # Append db_name to id, section_name, and pconfig fields for uniqueness
+    # Append db_name to id, section_name, and pconfig fields for uniqueness.
+    # eval_multiqc.py already labels its database-analysis blocks with the run
+    # name, so skip blocks that carry it to avoid "… (random_balanced)
+    # (random_balanced)".
     suffix = f"_{db_name}"
+    parenthesised = f"({db_name})"
+
+    def add_id(value):
+        return value if value.endswith(suffix) else value + suffix
+
+    def add_title(value):
+        return value if value.endswith(parenthesised) else f"{value} {parenthesised}"
+
     if "id" in block:
-        block["id"] += suffix
+        block["id"] = add_id(block["id"])
     if "section_name" in block:
-        block["section_name"] += f" ({db_name})"
+        block["section_name"] = add_title(block["section_name"])
     if "pconfig" in block:
         if "id" in block["pconfig"]:
-            block["pconfig"]["id"] += suffix
+            block["pconfig"]["id"] = add_id(block["pconfig"]["id"])
         if "title" in block["pconfig"]:
-            block["pconfig"]["title"] += f" ({db_name})"
+            block["pconfig"]["title"] = add_title(block["pconfig"]["title"])
     return block
 
 

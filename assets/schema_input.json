@@ -18,7 +18,7 @@
                 "format": "directory-path",
                 "exists": true,
                 "pattern": "^\\S+$",
-                "errorMessage": "Database path must be a directory containing train/test/optimization sqlite splits."
+                "errorMessage": "Database path must be a directory containing train.sqlite3, validation.sqlite3, and one or more test*.sqlite3 splits."
             }
         },
         "required": ["id", "db_path"]

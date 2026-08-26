@@ -21,7 +21,7 @@ def load_ddi(path_to_database: Path) -> pd.DataFrame:
         ddi_df = pd.read_sql(
             """
             SELECT d1.pfam_id AS domain_1, d2.pfam_id AS domain_2,
-                    NOT negative AS interaction, is_evaluation_relevant as eval_relevant
+                    NOT negative AS interaction
             FROM domain_domain_interaction, domain as d1, domain as d2
             WHERE domain_domain_interaction.domain_id_a = d1.id AND
                 domain_domain_interaction.domain_id_b = d2.id;
@@ -29,7 +29,11 @@ def load_ddi(path_to_database: Path) -> pd.DataFrame:
             conn,
         )
 
-        ddi_df["eval_relevant"] = ddi_df["eval_relevant"].fillna(0).astype(int)
+        # domainsplit's SUBSET_SPLIT_DB copies only the rows this split owns,
+        # so every DDI row in the file is evaluation-relevant by construction.
+        # The old `is_evaluation_relevant` column no longer exists; the flag is
+        # kept so downstream consumers (ddi_dict tuples) keep their shape.
+        ddi_df["eval_relevant"] = 1
 
         domain_a = []
         domain_b = []

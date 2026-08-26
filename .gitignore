@@ -1,6 +1,6 @@
 .nextflow*
 work/
-data/
+/data/
 results/
 .DS_Store
 testing/
@@ -187,6 +187,8 @@ cython_debug/
 *.log*
 work/
 *.sqlite*
+# ...except the in-repo test fixture, which -profile test needs on a fresh clone.
+!tests/data/databases/**/*.sqlite3
 *.fasta
 *.tsv
 *.pkl

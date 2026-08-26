@@ -31,6 +31,17 @@ process EVAL_ONE {
             python: \$(python --version 2>&1 | sed 's/Python //')
         END_VERSIONS
         """
+
+    stub:
+        """
+        mkdir -p per_model
+        echo '{}' > per_model/${meta.model}.json
+
+        cat <<-END_VERSIONS > versions.yml
+        "${task.process}":
+            stub: true
+        END_VERSIONS
+        """
 }
 
 
@@ -51,12 +62,17 @@ process EVALUATION {
     script:
         def jsons_list     = per_model_jsons instanceof java.util.List ? per_model_jsons.join(' ') : per_model_jsons
         def old_report_arg = old_report ? "--report ${old_report}" : ''
+        // One report per (database, test variant): the train and validation
+        // splits are shared, only the test set differs.
+        def test_split     = meta.split ?: 'test'
         """
         mkdir -p evaluation
 
         eval_multiqc.py \\
             --database ${database} \\
             --per_model_metrics ${jsons_list} \\
+            --db_name ${meta.run_label ?: meta.id} \\
+            --test_split ${test_split} \\
             --out_dir evaluation/ \\
             ${old_report_arg}
 
@@ -64,6 +80,17 @@ process EVALUATION {
         "${task.process}":
             python: \$(python --version 2>&1 | sed 's/Python //')
             multiqc: \$(multiqc --version 2>&1 | sed -e 's/.*version //' -e 's/[, ].*//')
+        END_VERSIONS
+        """
+
+    stub:
+        """
+        mkdir -p evaluation
+        echo "${meta.id} (${meta.split})" > evaluation/evaluation.html
+
+        cat <<-END_VERSIONS > versions.yml
+        "${task.process}":
+            stub: true
         END_VERSIONS
         """
 }
@@ -113,6 +140,18 @@ process COMBINE_EVAL {
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":
             python: \$(python --version 2>&1 | sed 's/Python //')
+        END_VERSIONS
+        """
+
+    stub:
+        def ids_list = ids instanceof java.util.List ? ids : [ids]
+        """
+        mkdir -p evaluation
+        printf '%s\\n' ${ids_list.collect { "'${it}'" }.join(' ')} > evaluation/ddi_report.html
+
+        cat <<-END_VERSIONS > versions.yml
+        "${task.process}":
+            stub: true
         END_VERSIONS
         """
 }

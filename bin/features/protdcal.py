@@ -5,13 +5,22 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
+from features import embeddings
 
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+    # Interaction encoding: the group is the domain *pair* and the subgroup the
+    # instance *pair*. Keys are joined with "_" but are never split apart again
+    # -- the ML loader looks them up whole, built from the same instance ids the
+    # DDI instance CSV carries.
     domain_sequence_df = pd.read_sql(
-        """
-                SELECT domain_id_a AS domain_1_id, dpm_1.protein_id AS protein_1_id, UPPER(dpm_1.domain_sequence) AS sequence_1,
-                       domain_id_b AS domain_2_id, dpm_2.protein_id AS protein_2_id, UPPER(dpm_2.domain_sequence) AS sequence_2
+        f"""
+                SELECT domain_id_a AS domain_1_id,
+                       {embeddings.instance_key_sql("dpm_1")} AS instance_1_key,
+                       UPPER(dpm_1.domain_sequence) AS sequence_1,
+                       domain_id_b AS domain_2_id,
+                       {embeddings.instance_key_sql("dpm_2")} AS instance_2_key,
+                       UPPER(dpm_2.domain_sequence) AS sequence_2
                 FROM domain_domain_interaction
                 JOIN domain_protein_map AS dpm_1 ON domain_id_a = dpm_1.domain_id
                 JOIN domain_protein_map AS dpm_2 ON domain_id_b = dpm_2.domain_id;
@@ -21,29 +30,30 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
 
     for (
         domain_id_1,
-        uniprot_1,
+        instance_1,
         seq_1,
         domain_id_2,
-        uniprot_2,
+        instance_2,
         seq_2,
     ) in domain_sequence_df.itertuples(index=False):
         encoding = protdcal_encode(seq_1, seq_2)
 
-        def write_to_h5(pfam_key, uniprot_key):
-            # create a group for each pfam_id and put uniprot_id as a subgroup
-            if pfam_key not in out_file:
-                pfam_group = out_file.create_group(pfam_key)
+        def write_to_h5(pair_key, instance_key):
+            # create a group for each domain pair and put the instance pair
+            # underneath it
+            if pair_key not in out_file:
+                pair_group = out_file.create_group(pair_key)
             else:
-                pfam_group = out_file[pfam_key]
+                pair_group = out_file[pair_key]
 
-            if uniprot_key in pfam_group:
-                print(f"Warning: Duplicate entry for {uniprot_key} in {pfam_key}.")
+            if instance_key in pair_group:
+                print(f"Warning: Duplicate entry for {instance_key} in {pair_key}.")
             else:
-                pfam_group[uniprot_key] = encoding
+                pair_group[instance_key] = encoding
 
         # write both directions
-        write_to_h5(f"{domain_id_1}_{domain_id_2}", f"{uniprot_1}_{uniprot_2}")
-        write_to_h5(f"{domain_id_2}_{domain_id_1}", f"{uniprot_2}_{uniprot_1}")
+        write_to_h5(f"{domain_id_1}_{domain_id_2}", f"{instance_1}_{instance_2}")
+        write_to_h5(f"{domain_id_2}_{domain_id_1}", f"{instance_2}_{instance_1}")
 
 
 protdcal_table = pd.read_csv(Path(__file__).parent / "protdcal_table.csv", index_col=0)

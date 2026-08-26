@@ -48,7 +48,7 @@ class NeuralNetworkTrainer(DDIModelTrainer):
     def _balance_keys(self):
         return ["balance_method"]
 
-    def _load_train_data(self, args, balance_method, samples_per_ddi, seed):
+    def _load_train_data(self, args, balance_method, seed):
         if balance_method not in ("downsample", "none"):
             raise ValueError(
                 f"NeuralNetworkTrainer supports 'downsample' and 'none', got '{balance_method}'"
@@ -57,7 +57,7 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         random.seed(seed)
         return load_embedding_data(
             args.features_path, args.features, args.ddi_path, "train",
-            balance_classes=downsample, samples_per_ddi=samples_per_ddi,
+            balance_classes=downsample,
         )
 
     def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
@@ -90,9 +90,9 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         gs.fit(x, y)
         return gs
 
-    def _refit(self, best_params, best_balance, args, config, num_features, samples_per_ddi):
+    def _refit(self, best_params, best_balance, args, config, num_features):
         x_train, y_train = self._load_train_data(
-            args, best_balance, samples_per_ddi, args.seed
+            args, best_balance, args.seed
         )
         n_pos = int(np.sum(y_train == 1))
         n_neg = int(np.sum(y_train == 0))

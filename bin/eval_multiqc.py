@@ -60,6 +60,19 @@ def parse_arguments():
         "--out_dir", required=True, help="Output directory to store evaluation results."
     )
     p.add_argument(
+        "--db_name",
+        default=None,
+        help="Label for this run in the report (default: the --database directory "
+             "name). The pipeline passes the run label, so the two test variants of "
+             "one database identify themselves separately.",
+    )
+    p.add_argument(
+        "--test_split",
+        default="test",
+        help="Test split of --database to profile (e.g. test_balanced). Each "
+             "test set of a database is reported as its own dataset.",
+    )
+    p.add_argument(
         "--report",
         default=None,
         help="Path to previous MultiQC report to merge data from.",
@@ -156,7 +169,7 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
     # Prepare data for MultiQC table
 
     data = {}
-    for db_type in db_analysis:  # db_type: train/optimization/test
+    for db_type in db_analysis:  # db_type: train/validation/test
         db_data = db_analysis[db_type]
         for interaction_type in ["ppi", "ddi"]:
             network_data = db_data[f"{interaction_type}_network_data"]
@@ -193,7 +206,7 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
         json.dump(db_block, f, indent=2)
 
     # Create violin plots for network distributions
-    # Separate DDI and PPI for databases, each violinplot contains the three databases (train/optimization/test), if available
+    # Separate DDI and PPI for databases, each violinplot contains the three databases (train/validation/test), if available
     degree_distributions = {}
     betweenness_distributions = {}
     clustering_distributions = {}
@@ -203,7 +216,7 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
         degree_distributions[network_type] = {}
         betweenness_distributions[network_type] = {}
         clustering_distributions[network_type] = {}
-        for db_type in db_analysis:  # db_type: train/optimization/test
+        for db_type in db_analysis:  # db_type: train/validation/test
             db_data = db_analysis[db_type]
             degree_distributions[network_type][db_type] = db_data[
                 f"{network_type}_network_data"
@@ -679,7 +692,7 @@ def main():
     logging.info(f"[INFO] Arguments: {args}")
     print(f"[INFO] Arguments: {args}")
 
-    db_name = os.path.basename(os.path.normpath(args.database))
+    db_name = args.db_name or os.path.basename(os.path.normpath(args.database))
     print(f"[INFO] Database name: {db_name}")
 
     old_db_names = []
@@ -752,7 +765,7 @@ def main():
             f"[INFO] Database analysis for '{db_name}' already present in old report. Skipping re-analysis."
         )
     else:
-        db_analysis = analyse_database(args.database)
+        db_analysis = analyse_database(args.database, test_split=args.test_split)
         write_multiqc_json_database_analysis(db_analysis, args.out_dir, db_name)
 
     print(f"[INFO] Database analysis completed for: {db_name}")

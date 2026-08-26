@@ -35,7 +35,7 @@ output:
     - - meta:
           type: map
           description: Groovy Map with database and model info.
-      - "${meta.model}/predictions.parquet":
+      - "${meta.model}/predictions_*.parquet":
           type: file
           description: Per-prediction parquet table.
           pattern: "*.parquet"

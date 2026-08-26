@@ -262,12 +262,23 @@ def preprocessing(
 
 
 def run_ddiparsimony(
-    database: str, params_file: str, out_dir: str, out_predictions: str, threads: int = 1
+    database: str, params_file: str, out_dir: str, test_splits: dict, threads: int = 1
 ):
+    """Train once, score every test split.
+
+    `test_splits` maps variant -> (split name, output predictions path). The
+    reliability rate and pw-score cutoff are optimised on the train split once
+    and reused for each test set.
+    """
     db_train = Path(os.path.join(database, "train.sqlite3"))
-    db_test = Path(os.path.join(database, "test.sqlite3"))
     check_file_existence(db_train)
-    check_file_existence(db_test)
+
+    test_dbs = {
+        variant: Path(os.path.join(database, f"{split}.sqlite3"))
+        for variant, (split, _) in test_splits.items()
+    }
+    for db_test in test_dbs.values():
+        check_file_existence(db_test)
 
     # Load json parameters
     with open(params_file) as f:
@@ -404,9 +415,37 @@ def run_ddiparsimony(
         )
         gc.collect()
 
-    logging.info(
-        f"Testing with best reliability: {best_r} and pw-score cutoff: {best_cutoff}"
-    )
+    if best_cutoff is None:
+        best_cutoff = 1.0  # default when no optimisation ran
+
+    for variant, (split, out_predictions) in test_splits.items():
+        logging.info(
+            f"Testing split {split} (variant {variant}) with best reliability: "
+            f"{best_r} and pw-score cutoff: {best_cutoff}"
+        )
+        score_test_split(
+            test_dbs[variant],
+            out_predictions,
+            variant,
+            best_r,
+            best_cutoff,
+            params_json,
+            out_dir,
+            threads,
+        )
+
+
+def score_test_split(
+    db_test,
+    out_predictions,
+    variant,
+    best_r,
+    best_cutoff,
+    params_json,
+    out_dir,
+    threads,
+):
+    """Score one test split with the reliability/cutoff chosen on the train split."""
     # Preprocessing on test data
     domain_pairs, random_x_matrix, ddi_dict, protein_domains, ppi_list, ddi_score = (
         preprocessing(db_test, Path(out_dir), threads)
@@ -416,10 +455,6 @@ def run_ddiparsimony(
     domain_pair_to_idx = {pair: idx for idx, pair in enumerate(domain_pairs)}
 
     # Call function evaluate_reliability_test
-    if best_cutoff is None:
-        best_cutoff = (
-            1.0  # or another default float value appropriate for your use case
-        )
     eval_rel_args = (
         best_r,
         best_cutoff,
@@ -437,7 +472,7 @@ def run_ddiparsimony(
     )
 
     # Save test log files
-    suffix = "test"
+    suffix = variant
     with open(os.path.join(out_dir, f"pw_scores_{suffix}.json"), "w") as f:
         json.dump({f"{k[0]}_{k[1]}": v for k, v in pw_scores.items()}, f, indent=4)
     avg_score, n_runs, avg_x_vec = compute_lp_score(
@@ -455,24 +490,23 @@ def run_ddiparsimony(
         observed_x_avg = avg_x_vec
         np.save(os.path.join(out_dir, f"observed_x_avg_{suffix}.npy"), observed_x_avg)
 
-    params_json["optimized"] = {
+    optimized = {
         "reliability_rate": best_r,
         "pw_cutoff": best_cutoff,
         "accuracy": accuracy,
         "fp_rate": fp_rate,
     }
 
-    with open(os.path.join(out_dir, "ddiparsimony.json"), "w") as jf:
-        json.dump(params_json, jf, indent=4)
+    with open(os.path.join(out_dir, f"ddiparsimony_{variant}.json"), "w") as jf:
+        json.dump(dict(params_json, optimized=optimized), jf, indent=4)
 
     # Prepare output
     output_rows = []
     for pair in domain_pairs:
-        # Check if eval_relevant
+        # Every DDI row in a split database belongs to that split by
+        # construction (domainsplit's SUBSET_SPLIT_DB) -- nothing to filter.
         d1, d2 = pair
-        observed, eval_relevant = ddi_dict.get(pair, (0, 0))
-        if not eval_relevant:
-            continue
+        observed, _ = ddi_dict.get(pair, (0, 0))
         if best_cutoff is not None:
             predicted = int(pw_scores.get(pair, 0) <= best_cutoff)
         else:
@@ -530,5 +564,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--out_predictions", required=False, help="Output predictions file path"
     )
+    parser.add_argument(
+        "--test_split", default="test", help="Name of the test split to score"
+    )
     args = parser.parse_args()
-    run_ddiparsimony(args.database, args.params, args.out_dir, args.out_predictions)
+    variant = (
+        args.test_split[len("test_"):]
+        if args.test_split.startswith("test_")
+        else args.test_split
+    )
+    run_ddiparsimony(
+        args.database,
+        args.params,
+        args.out_dir,
+        {variant: (args.test_split, args.out_predictions)},
+    )

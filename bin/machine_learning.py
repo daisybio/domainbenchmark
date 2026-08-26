@@ -27,7 +27,7 @@ from typing import List
 interaction_encodings = ["protdcal"]
 
 # B3 / A2: bounded cache (was unbounded dict — held every (features, dataset,
-# samples_per_ddi, balance) variant of train/opt/test simultaneously, which on
+# balance) variant of train/validation/test simultaneously, which on
 # ESM/ProtT5 features stacked to many GB and dominated the GPU process RAM).
 #
 # Now: keep at most one entry. Outer-loop callers either reload (cheap with
@@ -40,6 +40,15 @@ _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 def clear_load_cache() -> None:
     """Drop every cached embedding array. Call between training phases."""
     _load_cache.clear()
+
+
+def variant_of(test_split: str) -> str:
+    """`test_balanced` -> `balanced`, `test` -> `test`.
+
+    The variant names the prediction file and, downstream, the evaluation
+    directory, so each test set of a database is reported as its own dataset.
+    """
+    return test_split[len("test_"):] if test_split.startswith("test_") else test_split
 
 
 def _aggregate_to_ddi_level(ddi_pairs, y_true, y_score):
@@ -89,12 +98,36 @@ def _tune_threshold_mcc(y_true, y_score, n_candidates: int = 200):
     return best_thr, float(best_mcc)
 
 
+def load_instance_pairs(ddi_path: Path, dataset: str):
+    """`(domain_a, domain_b, interaction)` -> sorted list of `(instance_a, instance_b)`.
+
+    Read from `<dataset>_instances.csv`, which DDI_EXTRACTION derives from the
+    database's own `ddi_split_membership` table: exactly the domain-instance
+    pairs the splitter assigned to this split. Instantiating anything else
+    would reintroduce pairs the split deliberately excluded.
+
+    Returns None when the file is absent, in which case the caller falls back
+    to the full cross-product of the instances present in the feature files.
+    """
+    instances_csv = ddi_path / f"{dataset}_instances.csv"
+    if not instances_csv.exists():
+        return None
+
+    pairs = collections.defaultdict(set)
+    for row in pd.read_csv(instances_csv).itertuples(index=False):
+        domain_a, domain_b = str(row.domain_1), str(row.domain_2)
+        instance_a, instance_b = str(row.instance_1), str(row.instance_2)
+        pairs[(domain_a, domain_b, row.interaction)].add((instance_a, instance_b))
+        pairs[(domain_b, domain_a, row.interaction)].add((instance_b, instance_a))
+
+    return {key: sorted(combos) for key, combos in pairs.items()}
+
+
 def load_embedding_data(
     features_path: Path,
     features: List[str],
     ddi_path: Path,
     dataset: str = "train",
-    samples_per_ddi=10,
     balance_classes=False,
     return_ddi_pairs=False,
     return_protein_pairs=False,
@@ -104,7 +137,6 @@ def load_embedding_data(
         str(features_path),
         str(ddi_path),
         dataset,
-        samples_per_ddi,
         bool(balance_classes),
     )
     if cache_key in _load_cache:
@@ -153,12 +185,21 @@ def load_embedding_data(
         rng = random.Random(42)
         labeled_domain_pairs = rng.sample(pos, n) + rng.sample(neg, n)
 
+    # The domain-instance pairs this split assigns, when the database carries
+    # `ddi_split_membership`. None = fall back to the cross-product.
+    instance_pairs = load_instance_pairs(ddi_path, dataset)
+    if instance_pairs is None:
+        print(
+            f"No {dataset}_instances.csv found — falling back to the full "
+            "instance cross-product per DDI pair."
+        )
+
     x = []
     y = []
     result_ddi_pairs = []
     result_protein_pairs = []
 
-    # Load embeddings and sample proteins
+    # Load embeddings and instantiate the domain pairs
     with ExitStack() as stack:
         domain_encoding_files = []
         interaction_encoding_files = []
@@ -186,52 +227,49 @@ def load_embedding_data(
                 # print(f"Skipping pair ({domain_a}, {domain_b}) as one of the domains is missing in embeddings.")
                 continue
 
-            # get common proteins for both domains
-            def get_interaction_protein_combinations(f):
-                protein_combos = f[combined_domain_id].keys()
-                return {tuple(protein.split("_")) for protein in protein_combos}
-
-            def get_domain_protein_combinations(f):
-                proteins_a = set(f[domain_a].keys())
-                proteins_b = set(f[domain_b].keys())
-                return set(itertools.product(proteins_a, proteins_b))
-
-            # start by first getting all possible combinations from interaction encodings
-            # or from domain encodings if no interaction encodings are present
-            possible_protein_combinations = []
-            if interaction_encoding_files:
-                possible_protein_combinations = get_interaction_protein_combinations(
-                    interaction_encoding_files[0]
+            # Candidate instance pairs for this DDI. Instance keys are opaque
+            # strings and are never parsed apart — they are looked up whole.
+            if instance_pairs is not None:
+                candidate_combinations = set(
+                    instance_pairs.get((domain_a, domain_b, interaction), [])
+                )
+            elif domain_encoding_files:
+                candidate_combinations = set(
+                    itertools.product(
+                        domain_encoding_files[0][domain_a].keys(),
+                        domain_encoding_files[0][domain_b].keys(),
+                    )
                 )
             else:
-                possible_protein_combinations = get_domain_protein_combinations(
-                    domain_encoding_files[0]
+                raise ValueError(
+                    f"{dataset}: interaction encodings alone need "
+                    f"{dataset}_instances.csv — instance keys cannot be "
+                    "recovered from an interaction-encoding group name."
                 )
 
-            # filter combinations to only those present in all files
-            for f in interaction_encoding_files:
-                possible_protein_combinations.intersection_update(
-                    get_interaction_protein_combinations(f)
-                )
-            for f in domain_encoding_files:
-                possible_protein_combinations.intersection_update(
-                    get_domain_protein_combinations(f)
-                )
+            # Keep only the combinations every feature file actually carries.
+            def combination_available(combo):
+                instance_a, instance_b = combo
+                for f in domain_encoding_files:
+                    if instance_a not in f[domain_a] or instance_b not in f[domain_b]:
+                        return False
+                joined = f"{instance_a}_{instance_b}"
+                for f in interaction_encoding_files:
+                    if joined not in f[combined_domain_id]:
+                        return False
+                return True
 
-            # Sample protein combinations without replacement; cap at min(K, available).
-            sorted_combos = sorted(possible_protein_combinations)
-            if samples_per_ddi is not None and len(sorted_combos) > samples_per_ddi:
-                proteins_combinations = random.sample(sorted_combos, k=samples_per_ddi)
-            else:
-                proteins_combinations = sorted_combos
-            if not proteins_combinations:
+            instance_combinations = sorted(
+                combo for combo in candidate_combinations if combination_available(combo)
+            )
+            if not instance_combinations:
                 continue
-            proteins_a, proteins_b = zip(*proteins_combinations)
-            interactions = [f"{pa}_{pb}" for pa, pb in proteins_combinations]
+            proteins_a, proteins_b = zip(*instance_combinations)
+            interactions = [f"{ia}_{ib}" for ia, ib in instance_combinations]
 
-            # load embeddings for the sampled proteins
+            # load embeddings for the instance pairs
             # we will concatenate the embeddings from all features for both domains and the interaction
-            # the embeddings should have the shape (samples_per_ddi, embedding_size) where embedding_size is the sum of the sizes of all features
+            # the embeddings should have the shape (n_instance_pairs, embedding_size) where embedding_size is the sum of the sizes of all features
             # so each row corresponds to a specific protein pair and the columns correspond to the concatenated features for that pair
             embeddings_a = []
             embeddings_b = []
@@ -282,7 +320,7 @@ def load_embedding_data(
             y.extend([interaction] * joined_embeddings.shape[0])
             result_ddi_pairs.extend([(domain_a, domain_b)] * joined_embeddings.shape[0])
             result_protein_pairs.extend(
-                np.array(proteins_combinations)[nan_filter].tolist()
+                np.array(instance_combinations)[nan_filter].tolist()
             )
     if len(x) == 0:
         raise ValueError(
@@ -324,7 +362,7 @@ class DDIModelTrainer(ABC):
         """Config keys to exclude from the hyperparameter grid."""
 
     @abstractmethod
-    def _load_train_data(self, args, balance_method: str, samples_per_ddi, seed: int):
+    def _load_train_data(self, args, balance_method: str, seed: int):
         """Load training data with the given balance strategy. Returns (x, y)."""
 
     @abstractmethod
@@ -332,7 +370,7 @@ class DDIModelTrainer(ABC):
         """Create and fit a RandomizedSearchCV. Returns the fitted object."""
 
     @abstractmethod
-    def _refit(self, best_params, best_balance, args, config, num_features, samples_per_ddi):
+    def _refit(self, best_params, best_balance, args, config, num_features):
         """Refit on full training data with best params. Returns the classifier."""
 
     @abstractmethod
@@ -358,14 +396,22 @@ class DDIModelTrainer(ABC):
         argparser.add_argument("--features_path", type=Path, required=True)
         argparser.add_argument("--ddi_path", type=Path, required=True)
         argparser.add_argument("--config", type=Path, required=True)
-        argparser.add_argument("--out_predictions", type=Path, required=True)
+        argparser.add_argument(
+            "--out_predictions_dir", type=Path, required=True,
+            help="Directory to write predictions_<variant>.parquet into, one per test split.",
+        )
+        argparser.add_argument(
+            "--test_splits", nargs="+", default=["test"],
+            help="Test split names to predict on (e.g. test_balanced test_realistic). "
+                 "The model is trained once and applied to each.",
+        )
+        argparser.add_argument(
+            "--val_split", default="validation",
+            help="Split used for hyperparameter search and threshold tuning.",
+        )
         argparser.add_argument("--out_model_dir", type=Path, required=False)
         argparser.add_argument("--model_dir", type=Path, required=False)
         argparser.add_argument("--predict-only", action="store_true")
-        argparser.add_argument(
-            "--max_protein_combinations_per_ddi", type=int, default=None,
-            help="Optional cap on protein-pair instantiations per DDI pair (sampled without replacement). None = use all available combinations.",
-        )
         argparser.add_argument("--seed", type=int, default=42)
         argparser.add_argument(
             "--id", dest="run_id", default=None,
@@ -394,37 +440,45 @@ class DDIModelTrainer(ABC):
         self.predict(args, classifier, threshold)
 
     def predict(self, args, classifier, threshold=0.5):
-        print("Predicting on test data...")
-        print(args.features)
-        print(args)
-        random.seed(args.seed)
-        x_test, y_test, ddi_pairs = load_embedding_data(
-            args.features_path, args.features, args.ddi_path, "test",
-            samples_per_ddi=args.max_protein_combinations_per_ddi,
-            balance_classes=False, return_ddi_pairs=True,
-        )
+        """Predict on every test split with the one trained model.
 
-        print(f"Test data shape: {x_test.shape}, Labels shape: {y_test.shape}")
-        print(
-            f"Number of positive samples: {np.sum(y_test == 1)}, Number of negative samples: {np.sum(y_test == 0)}"
-        )
+        Datasets with an internal test set ship both `test_balanced` and
+        `test_realistic`; both are scored by the same model and threshold, so
+        training happens once and only the scoring loop fans out.
+        """
+        args.out_predictions_dir.mkdir(parents=True, exist_ok=True)
 
-        y_test_pred_proba = self._predict_proba(classifier, x_test)
+        for test_split in args.test_splits:
+            variant = variant_of(test_split)
+            print(f"Predicting on test data ({test_split})...")
+            random.seed(args.seed)
+            x_test, y_test, ddi_pairs = load_embedding_data(
+                args.features_path, args.features, args.ddi_path, test_split,
+                balance_classes=False, return_ddi_pairs=True,
+            )
 
-        predictions_df = _aggregate_to_ddi_level(ddi_pairs, y_test, y_test_pred_proba)
-        predictions_df["predicted_interaction"] = (
-            predictions_df["predicted_probability"].values >= threshold
-        ).astype(np.int8)
-        predictions_df["true_interaction"] = predictions_df["true_interaction"].astype(np.int8)
-        predictions_df = predictions_df[
-            ["domain_a", "domain_b", "true_interaction", "predicted_interaction", "predicted_probability"]
-        ]
-        out_path = str(args.out_predictions)
-        if out_path.endswith(".csv"):
-            predictions_df.to_csv(out_path, index=False)
-        else:
+            print(f"Test data shape: {x_test.shape}, Labels shape: {y_test.shape}")
+            print(
+                f"Number of positive samples: {np.sum(y_test == 1)}, Number of negative samples: {np.sum(y_test == 0)}"
+            )
+
+            y_test_pred_proba = self._predict_proba(classifier, x_test)
+
+            predictions_df = _aggregate_to_ddi_level(ddi_pairs, y_test, y_test_pred_proba)
+            predictions_df["predicted_interaction"] = (
+                predictions_df["predicted_probability"].values >= threshold
+            ).astype(np.int8)
+            predictions_df["true_interaction"] = predictions_df["true_interaction"].astype(np.int8)
+            predictions_df = predictions_df[
+                ["domain_a", "domain_b", "true_interaction", "predicted_interaction", "predicted_probability"]
+            ]
+            out_path = args.out_predictions_dir / f"predictions_{variant}.parquet"
             predictions_df.to_parquet(out_path, index=False, compression="zstd")
-        print(f"Predictions saved to {out_path}")
+            print(f"Predictions saved to {out_path}")
+
+            del x_test, y_test, ddi_pairs, y_test_pred_proba
+            clear_load_cache()
+            gc.collect()
 
     def train(self, args):
         self._pre_train_hook()
@@ -435,7 +489,6 @@ class DDIModelTrainer(ABC):
         hyperparameters = config["model_parameters"]
         search_parameters = config["search_parameters"]
         balance_methods = self._get_balance_methods(hyperparameters)
-        samples_per_ddi = args.max_protein_combinations_per_ddi
         balance_opt_set = search_parameters[
             "balance_positive_and_negative_interactions_opt_set"
         ]
@@ -444,14 +497,14 @@ class DDIModelTrainer(ABC):
             search_parameters["models_to_evaluate"] / len(balance_methods)
         )
 
-        print("Loading optimization data...")
+        print(f"Loading {args.val_split} data...")
         random.seed(args.seed)
         x_opt, y_opt = load_embedding_data(
-            args.features_path, args.features, args.ddi_path, "optimization",
-            samples_per_ddi=samples_per_ddi, balance_classes=balance_opt_set,
+            args.features_path, args.features, args.ddi_path, args.val_split,
+            balance_classes=balance_opt_set,
         )
         num_features = x_opt.shape[1]
-        print(f"Optimization data shape: {x_opt.shape}, Labels shape: {y_opt.shape}")
+        print(f"Validation data shape: {x_opt.shape}, Labels shape: {y_opt.shape}")
         print(
             f"Number of positive samples: {np.sum(y_opt == 1)}, Number of negative samples: {np.sum(y_opt == 0)}"
         )
@@ -466,7 +519,7 @@ class DDIModelTrainer(ABC):
         for balance_method in balance_methods:
             print(f"[grid] balance_method={balance_method}")
             x_train, y_train = self._load_train_data(
-                args, balance_method, samples_per_ddi, args.seed
+                args, balance_method, args.seed
             )
 
             x = np.concatenate([x_train, x_opt], axis=0)
@@ -493,18 +546,18 @@ class DDIModelTrainer(ABC):
         gc.collect()
 
         classifier = self._refit(
-            best_params, best_balance, args, config, num_features, samples_per_ddi
+            best_params, best_balance, args, config, num_features
         )
 
         random.seed(args.seed)
         x_opt, y_opt, opt_ddi_pairs = load_embedding_data(
-            args.features_path, args.features, args.ddi_path, "optimization",
-            samples_per_ddi=samples_per_ddi, balance_classes=balance_opt_set,
+            args.features_path, args.features, args.ddi_path, args.val_split,
+            balance_classes=balance_opt_set,
             return_ddi_pairs=True,
         )
         assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
 
-        print("Tuning decision threshold on DDI-aggregated optimization data via MCC...")
+        print("Tuning decision threshold on DDI-aggregated validation data via MCC...")
         y_opt_proba = self._predict_proba(classifier, x_opt)
         opt_agg = _aggregate_to_ddi_level(opt_ddi_pairs, y_opt, y_opt_proba)
         best_thr, best_mcc = _tune_threshold_mcc(

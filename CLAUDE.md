@@ -4,13 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-DomainBenchmark is a Nextflow DSL2 pipeline for benchmarking domain-domain interaction (DDI) prediction methods. Built from the `nf-core/tools 4.0.2` template. For each database split it runs feature extraction → ML classifiers (RF, NN) → graph-based models (KGIDDI, DDIParsimony) → MultiQC evaluation, then aggregates across splits.
+DomainBenchmark is a Nextflow DSL2 pipeline for benchmarking domain-domain interaction (DDI) prediction methods. Built from the `nf-core/tools 4.0.2` template. For each database it runs feature extraction → ML classifiers (RF, NN) → graph-based models (KGIDDI, DDIParsimony) → MultiQC evaluation, then aggregates across databases. A database with an internal test set ships `test_balanced` + `test_realistic`; both are scored by the same trained models and reported as separate datasets.
 
 ## Common commands
 
 ```bash
-# full run across all database splits in the samplesheet
+# full run across every database in the samplesheet
 nextflow run . --input assets/samplesheet.csv -profile slurm,singularity -resume
+
+# same, straight off a domainsplit output directory
+nextflow run . --input /path/to/domainsplit/results/databases -profile slurm,singularity -resume
 
 # stub run (smoke test)
 nextflow run . -profile test,singularity -stub-run
@@ -25,7 +28,7 @@ nf-core pipelines lint --dir .
 nf-test test tests/default.nf.test
 ```
 
-Samplesheet schema (`assets/schema_input.json`): array of `{id, db_path}` rows. `db_path` must be a directory containing `train.sqlite3`, `test.sqlite3`, `optimization.sqlite3`. Skip stages via `--skip aacomp,kgiddi` (comma-separated, matches feature or graph model names).
+`--input` takes either a samplesheet CSV or a directory. Samplesheet schema (`assets/schema_input.json`): array of `{id, db_path}` rows. Directory form: every immediate subdirectory holding a `train.sqlite3` is a dataset named after the directory (what domainsplit publishes under `databases/`). Either way each database directory must contain `train.sqlite3`, `validation.sqlite3`, and one or more `test*.sqlite3`. Skip stages via `--skip aacomp,kgiddi` (comma-separated, matches feature or graph model names).
 
 Python deps managed via conda — `environments/general.yml` (extraction/RF/graph/eval) and `environments/ml.yml` (PyTorch CU128 + cuML for NN training). No `pyproject.toml` / `requirements.txt`.
 
@@ -34,25 +37,25 @@ Python deps managed via conda — `environments/general.yml` (extraction/RF/grap
 ### Top-level layout
 - `main.nf` — entry. Defines `DOMAINBENCHMARK` workflow (MultiQC + versions/methods boilerplate) and `DAISYBIO_DOMAINBENCHMARK` (the science workflow).
 - `workflows/domainbenchmark.nf` — wires sample channel → `PER_DB_BENCHMARK` (scattered per DB) → `AGGREGATE_EVAL`.
-- `subworkflows/local/per_db_benchmark/main.nf` — scatter: `DDI_EXTRACTION` → `FEATURE_EXTRACTION` (fan-out feature × split) → `NEURAL_NETWORK` + `RANDOM_FOREST` (per-feature singletons + one all-feature concat run, gated by `params.machine_learning_models`) + `GRAPH_MODEL` → `EVAL_ONE` (per-prediction) → `EVALUATION` (per-DB MultiQC reduce).
+- `subworkflows/local/per_db_benchmark/main.nf` — scatter: `DDI_EXTRACTION` → `FEATURE_EXTRACTION` (fan-out feature × split) → `NEURAL_NETWORK` + `RANDOM_FOREST` (per-feature singletons + one all-feature concat run, gated by `params.machine_learning_models`) + `GRAPH_MODEL` → `EVAL_ONE` (per-prediction) → `EVALUATION` (per (db, test variant) MultiQC reduce). `runLabel()` there defines the `<db>_<variant>` run name used downstream.
 - `subworkflows/local/aggregate_eval/main.nf` — runs `COMBINE_EVAL` across per-DB reports to produce `results/evaluation/ddi_report.html`.
 - `subworkflows/local/utils_nfcore_domainbenchmark_pipeline/main.nf` — nf-core boilerplate (initialise, completion, citations).
-- `nextflow.config` — single source of truth for `db_list` (legacy), `graph_models`, `machine_learning_models`, `machine_learning_features`, `large_features`, `max_protein_combinations_per_ddi`, `skip`, `out_dir`, profiles.
+- `nextflow.config` — single source of truth for `db_list` (legacy), `graph_models`, `machine_learning_models`, `machine_learning_features`, `large_features`, `skip`, `out_dir`, profiles.
 - `conf/{base,slurm,test,test_full,modules}.config` — layered config. `conf/base.config` carries retry strategy and per-label resources.
 - `assets/<ModelName>.json` — per-model hyperparameter grid + search config. Filename must match `model_name` and the Python script in `bin/`.
 - `modules/local/<stage>/main.nf` — Nextflow process defs (`ddi_extraction`, `feature_extraction`, `neural_network`, `random_forest`, `graph_model`, `evaluation`).
 - `bin/` — Python entrypoints invoked by modules (`run_models.py`, `random_forest.py`, `run_graph_models.py`, `kgiddi.py`, `ddiparsimony.py`, `extract_features.py`, `eval_one.py`, `eval_multiqc.py`, `combine_eval.py`, `load_data_gm.py`). Auto on `PATH` from Nextflow.
-- `bin/features/` — feature encoders (`aacomp`, `aaencode`, `dummy`, `embeddings`, `protdcal`, `esm3_*`, `esmc_*`, `prott5_*`). New feature = new file here + entry in `params.machine_learning_features`. Heavy ones go in `params.large_features` → routed to `process_gpu_large`.
+- `bin/features/` — feature encoders (`aacomp`, `aaencode`, `dummy`, `embeddings`, `protdcal`, `esm3_*`, `esmc_*`, `prott5_*`). New feature = new file here + entry in `params.machine_learning_features`; key the HDF5 by instance via `embeddings.INSTANCE_KEY_SQL` / `embeddings.write_instance()`. Heavy ones go in `params.large_features` → routed to `process_gpu_large`.
 - `docker/`, `containers_{docker,singularity,conda_lock}_{amd64,arm64}.config` — container/lock matrices.
 
 ### Data flow
-1. Input: samplesheet of `{id, db_path}`. Each `db_path` contains `train/test/optimization.sqlite3` (tables: DDI, DGO, PD, DomSeq, PPI, PGO, Embeddings).
-2. `DDI_EXTRACTION` → SQL → CSV per split.
-3. `FEATURE_EXTRACTION` (fan-out per feature × split) → per-feature `train/test/optimization.h5` under `results/<db>/data/<feature>/`.
-4. `NEURAL_NETWORK` / `RANDOM_FOREST` consume `.h5`, grid-search via model JSON, predictions to `results/<db>/nn_output/` and `results/<db>/rf_output/`.
-5. `GRAPH_MODEL` (KGIDDI, DDIParsimony, KGIDDI_RANDOM) runs independently against sqlite splits → `results/<db>/graph_models/<model>/`.
-6. `EVAL_ONE` per-prediction → `EVALUATION` per-DB MultiQC → `results/<db>/evaluation/evaluation.html`.
-7. `AGGREGATE_EVAL` / `COMBINE_EVAL` → `results/evaluation/ddi_report.html`.
+1. Input: samplesheet of `{id, db_path}` or a `databases/` directory. Each database dir contains `train.sqlite3`, `validation.sqlite3`, and one or more `test*.sqlite3` (tables: `domain`, `domain_go_terms`, `domain_domain_interaction`, `protein`, `protein_go_terms`, `protein_protein_interaction`, `domain_protein_map`, `ddi_split_membership`).
+2. `DDI_EXTRACTION` → SQL → `<split>.csv` plus `<split>_instances.csv` (the domain-instance pairs `ddi_split_membership` assigns to that split — what the ML loader instantiates, instead of a cross-product).
+3. `FEATURE_EXTRACTION` (fan-out per feature × split) → per-feature `<split>.h5` under `results/<db>/data/<feature>/`. HDF5 layout is `h5[domain_id][instance_key]` — instance-level, because one protein can carry two instances of the same family.
+4. `NEURAL_NETWORK` / `RANDOM_FOREST` consume `.h5`, grid-search via model JSON on train+validation, then score every test split → `predictions_<variant>.parquet` under `results/<db>/nn_output/` and `results/<db>/rf_output/`.
+5. `GRAPH_MODEL` (KGIDDI, DDIParsimony, KGIDDI_RANDOM) trains once on the train split and scores every test split → `results/<db>/graph_models/<model>/predictions_<variant>.parquet`.
+6. `EVAL_ONE` per-prediction → `EVALUATION` per (db, test variant) MultiQC → `results/<db>/evaluation/<variant>/`.
+7. `AGGREGATE_EVAL` / `COMBINE_EVAL` → `results/evaluation/ddi_report.html`, with each (db, variant) as its own dataset entry.
 
 The scatter design (`EVAL_ONE` → `EVALUATION` reduce) replaced a monolithic evaluation that hit 300 GB OOM. See comment in `modules/local/evaluation/main.nf`.
 

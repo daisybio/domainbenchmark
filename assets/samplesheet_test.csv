@@ -1,2 +1,3 @@
 id,db_path
-db_minimal,tests/data/db_minimal
+random,tests/data/databases/random
+external_test,tests/data/databases/external_test

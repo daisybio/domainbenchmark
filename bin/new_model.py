@@ -30,14 +30,14 @@ class NewModelTrainer(DDIModelTrainer):
         # Config keys handled by balance loop, excluded from sklearn param grid.
         return ["balance_method"]
 
-    def _load_train_data(self, args, balance_method, samples_per_ddi, seed):
+    def _load_train_data(self, args, balance_method, seed):
         # Load training data with the requested balance strategy.
         # Must return (x, y) numpy arrays.
         downsample = balance_method == "downsample"
         random.seed(seed)
         return load_embedding_data(
             args.features_path, args.features, args.ddi_path, "train",
-            balance_classes=downsample, samples_per_ddi=samples_per_ddi,
+            balance_classes=downsample,
         )
 
     def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
@@ -47,11 +47,11 @@ class NewModelTrainer(DDIModelTrainer):
         # Set refit=False — the base class handles refitting via _refit().
         raise NotImplementedError("Replace with your classifier + RandomizedSearchCV")
 
-    def _refit(self, best_params, best_balance, args, config, num_features, samples_per_ddi):
+    def _refit(self, best_params, best_balance, args, config, num_features):
         # Retrain on full training data with best hyperparameters.
         # Must return the fitted classifier.
         x_train, y_train = self._load_train_data(
-            args, best_balance, samples_per_ddi, args.seed
+            args, best_balance, args.seed
         )
         raise NotImplementedError("Create classifier with best_params, fit, return it")
 

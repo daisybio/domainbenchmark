@@ -83,18 +83,37 @@ workflow PIPELINE_INITIALISATION {
     // Custom tests
     //
     if (params.input) {
-        db_ch = Channel
-            .fromPath(params.input, checkIfExists: true)
-            .splitCsv(header: true)
-            .map { row ->
-                def db_path = row.db_path.startsWith('/')
-                    ? file(row.db_path, checkIfExists: true)
-                    : file("${workflow.projectDir}/${row.db_path}", checkIfExists: true)
-                def id      = row.id ?: db_path.getName()
-                tuple([ id: id, db: id ], db_path)
+        def input_path = file(params.input, checkIfExists: true)
+
+        if (input_path.isDirectory()) {
+            // Directory mode: `--input databases/` as published by
+            // daisybio/domainsplit. Every immediate subdirectory holding a
+            // train.sqlite3 is a dataset, named after the directory.
+            def dataset_dirs = input_path
+                .listFiles()
+                .findAll { it.isDirectory() && it.resolve('train.sqlite3').exists() }
+                .sort { it.getName() }
+
+            if (!dataset_dirs) {
+                error("No dataset directories containing train.sqlite3 found under ${input_path}")
             }
+
+            db_ch = Channel.fromList(
+                dataset_dirs.collect { dir -> datasetTuple(dir.getName(), dir) }
+            )
+        } else {
+            db_ch = Channel
+                .fromPath(params.input, checkIfExists: true)
+                .splitCsv(header: true)
+                .map { row ->
+                    def db_path = row.db_path.startsWith('/')
+                        ? file(row.db_path, checkIfExists: true)
+                        : file("${workflow.projectDir}/${row.db_path}", checkIfExists: true)
+                    datasetTuple(row.id ?: db_path.getName(), db_path)
+                }
+        }
     } else {
-        error "No input provided: set --input <samplesheet.csv>"
+        error "No input provided: set --input <samplesheet.csv|databases/>"
     }
 
     emit:
@@ -152,6 +171,48 @@ workflow PIPELINE_COMPLETION {
     FUNCTIONS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
+
+//
+// Discover the sqlite splits inside one database directory.
+//
+// daisybio/domainsplit publishes `databases/<dataset>/<split>.sqlite3` with
+// `train`, `validation`, and one or more `test*` splits: `test` for a dataset
+// whose test set comes from BUILD_EXTERNAL_TEST, `test_balanced` +
+// `test_realistic` for one with an internal test set. Each test split is
+// benchmarked separately against the same trained models.
+//
+// Returns [ splits, tests ]:
+//   splits — ordered split names, i.e. the sqlite stems
+//   tests  — variant -> split name (`test_balanced` -> `balanced`, `test` -> `test`)
+//
+def discoverSplits(db_dir) {
+    def names = db_dir.list().findAll { it.endsWith('.sqlite3') }.collect { it - '.sqlite3' }
+
+    ['train', 'validation'].each { required ->
+        if (!names.contains(required)) {
+            error("Database directory ${db_dir} is missing ${required}.sqlite3 (found: ${names.sort().join(', ')})")
+        }
+    }
+
+    def test_splits = names.findAll { it == 'test' || it.startsWith('test_') }.sort()
+    if (!test_splits) {
+        error("Database directory ${db_dir} contains no test*.sqlite3 split (found: ${names.sort().join(', ')})")
+    }
+
+    def tests = test_splits.collectEntries { split ->
+        [ (split == 'test' ? 'test' : split - 'test_'), split ]
+    }
+
+    return [ ['train', 'validation'] + test_splits, tests ]
+}
+
+//
+// Build the (meta, db_path) tuple for one database directory.
+//
+def datasetTuple(id, db_dir) {
+    def (splits, tests) = discoverSplits(db_dir)
+    return tuple([ id: id, db: id, splits: splits, tests: tests ], db_dir)
+}
 
 //
 // Validate channels from input samplesheet

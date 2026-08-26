@@ -19,10 +19,18 @@
 
 **daisybio/domainbenchmark** is a bioinformatics benchmarking pipeline for protein **domain-domain
 interaction (DDI)** prediction. Given one or more pre-split DDI databases
-(`train.sqlite3`, `test.sqlite3`, `optimization.sqlite3` plus matching
-embeddings), the pipeline trains a panel of machine-learning and
-graph-based predictors, evaluates each one against a held-out test split,
-and produces a unified MultiQC report comparing them.
+(`train.sqlite3`, `validation.sqlite3`, and one or more `test*.sqlite3`, plus
+matching embeddings — the layout [daisybio/domainsplit](https://github.com/daisybio/domainsplit)
+publishes under `databases/`), the pipeline trains a panel of machine-learning
+and graph-based predictors, evaluates each one against every held-out test
+split, and produces a unified MultiQC report comparing them.
+
+A database with an internal test set ships **two** test splits,
+`test_balanced.sqlite3` and `test_realistic.sqlite3`. Both are benchmarked
+against the *same* trained models: DDI extraction, feature extraction and model
+fitting run once per database, and only scoring and evaluation fan out. Each
+test split is then reported as its own dataset — `random_balanced`,
+`random_realistic` — with its own curves, table rows and heatmap entries.
 
 The pipeline runs the following stages:
 
@@ -83,7 +91,27 @@ random_ddi,/path/to/random_ddi
 ```
 
 Schema in `assets/schema_input.json`. Each `db_path` must contain
-`train.sqlite3`, `test.sqlite3`, `optimization.sqlite3`.
+`train.sqlite3`, `validation.sqlite3`, and one or more `test*.sqlite3`.
+
+### Directory (no samplesheet)
+
+`--input` also accepts a directory — every immediate subdirectory holding a
+`train.sqlite3` becomes a dataset named after the directory, which is exactly
+what domainsplit publishes:
+
+```bash
+nextflow run . \
+    -profile <docker/singularity/conda>,slurm \
+    --input /path/to/domainsplit/results/databases \
+    --outdir results
+```
+
+```
+databases/
+├── random/          train, validation, test_balanced, test_realistic
+├── minimal_leakage/ train, validation, test_balanced, test_realistic
+└── external_test/   train, validation, test
+```
 
 ### Cluster (Slurm + Singularity)
 
@@ -122,7 +150,7 @@ CI and by `nf-test`.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--input` | `null` | **Required.** Samplesheet CSV (one row per database split). |
+| `--input` | `null` | **Required.** Samplesheet CSV (one row per database), or a directory of database directories. |
 | `--outdir` | `./results` | Output directory. |
 | `--modeljson` | `${projectDir}/assets` | Directory of model hyperparameter JSONs. |
 | `--skip` | `''` | Comma-separated feature/model names to skip. |
@@ -130,7 +158,6 @@ CI and by `nf-test`.
 | `--machine_learning_features` | `aacomp,aaencode,prott5_*,esm3_*,esmc_*` | Feature encodings to compute. |
 | `--large_features` | `prott5_*,esm3_*,esmc_*` | Features routed to `process_gpu_large`. |
 | `--machine_learning_models` | `neural_network,random_forest` | ML models to run. |
-| `--max_protein_combinations_per_ddi` | `null` | Cap on protein-pair instantiations per DDI pair (sampled without replacement). Null = use all. |
 | `--seed` | `42` | Global RNG seed. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
 
@@ -143,29 +170,36 @@ For each database split processed, a subdirectory under `--outdir/<db_name>/`:
 
 ```
 <outdir>/<db_name>/
+├── ddi/
+│   └── <db_name>/DDI/
+│       ├── <split>.csv            # domain pairs + label
+│       └── <split>_instances.csv  # the split's domain-instance pairs
 ├── data/
-│   └── <feature>/
+│   └── <db_name>/<feature>/
 │       ├── train.h5
-│       ├── test.h5
-│       └── optimization.h5
+│       ├── validation.h5
+│       └── <test_split>.h5
 ├── nn_output/
 │   └── neural_network_<feature_combo>/
-│       ├── predictions.parquet
+│       ├── predictions_<variant>.parquet   # one per test split
 │       └── model/
 ├── rf_output/
 │   └── random_forest_<feature_combo>/
-│       ├── predictions.parquet
+│       ├── predictions_<variant>.parquet
 │       └── model/
 ├── graph_models/
 │   └── <model_name>/
-│       ├── predictions.parquet
+│       ├── predictions_<variant>.parquet
 │       └── model/
 └── evaluation/
-    └── multiqc_report.html
+    └── <variant>/                          # one report per test split
+        └── ddi_report.html
 ```
 
-When the samplesheet contains more than one database, a top-level
-cross-database report is also written: `<outdir>/evaluation/ddi_report.html`.
+Shared work (DDI CSVs, features, fitted models) sits directly under the
+database directory; only `evaluation/` fans out per test variant. A top-level
+cross-database report is always written to `<outdir>/evaluation/ddi_report.html`
+and lists every (database, test variant) pair as a separate dataset.
 
 A full description of each output is in [`docs/output.md`](docs/output.md).
 

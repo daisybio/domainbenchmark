@@ -1,9 +1,12 @@
-// Parallelise feature extraction across train/test/optimization splits.
+// Parallelise feature extraction across a database's sqlite splits.
 //
 // The `FEATURE_EXTRACTION` (lower-case) inner workflow fans out
 // (feature × split) into independent jobs and stages the resulting h5
 // files into the per-feature directory layout that ML / RF / graph_model
-// already expect (`features/<feature>/<train|test|optimization>.h5`).
+// already expect (`features/<feature>/<split>.h5`). The split set comes from
+// `meta.splits` — `train`, `validation`, and one or more `test*` — so a
+// database shipping both `test_balanced` and `test_realistic` produces an h5
+// for each while training data is extracted once.
 // Downstream channel signatures are unchanged — only the granularity
 // of work changes.
 
@@ -100,21 +103,21 @@ workflow FEATURE_EXTRACTION {
         db_ch          // channel: tuple(meta, db_path)  — multi-DB capable
 
     main:
-        ds_ch = Channel.from('train', 'test', 'optimization')
-
         // Build per-(db, feature, split) tasks. Each task gets a unique meta
-        // so groupTuple can re-cluster downstream by (db, feature).
+        // so groupTuple can re-cluster downstream by (db, feature). The split
+        // list is per-database (`meta.splits`), not a pipeline constant.
         per_task = db_ch
             .combine(feature_ch)
-            .combine(ds_ch)
-            .map { db_meta, db_path, feat, ds ->
-                def m = [
-                    id     : "${db_meta.id}_${feat}_${ds}",
-                    db     : db_meta.id,
-                    feature: feat,
-                    dataset: ds
-                ]
-                tuple(m, db_path)
+            .flatMap { db_meta, db_path, feat ->
+                (db_meta.splits ?: ['test']).collect { ds ->
+                    def m = [
+                        id     : "${db_meta.id}_${feat}_${ds}",
+                        db     : db_meta.id,
+                        feature: feat,
+                        dataset: ds
+                    ]
+                    tuple(m, db_path)
+                }
             }
 
         per_split = FEATURE_EXTRACTION_ONE(per_task)

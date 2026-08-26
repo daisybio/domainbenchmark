@@ -11,15 +11,22 @@ The pipeline auto-discovers features by name: extract_features.py calls
 importlib.import_module(f"features.{feature_name}").extract_features(conn, out_file).
 
 Database schema (domain_protein_map table):
-    domain_id       TEXT    -- Pfam domain ID (e.g. PF00001)
-    protein_id      TEXT    -- UniProt protein ID (e.g. P12345)
+    domain_id       INT     -- FK to domain.id
+    protein_id      INT     -- FK to protein.id
     domain_sequence TEXT    -- amino acid sequence of the domain
-    start_pos       INT    -- domain start position in protein sequence
-    end_pos         INT    -- domain end position in protein sequence
+    start_pos       INT     -- domain start position in protein sequence
+    end_pos         INT     -- domain end position in protein sequence
+    instance_id     TEXT    -- domainsplit's domain-instance id (opaque, may be NULL)
     (+ embedding columns like esm3_per_domain, esmc_per_residue, etc.)
 
 HDF5 output structure (required by downstream ML models):
-    /<domain_id>/<protein_id> = numpy array of shape (feature_dim,)
+    /<domain_id>/<instance_key> = numpy array of shape (feature_dim,)
+
+The key is the *instance*, not the protein: domain_protein_map is unique on
+(domain_id, protein_id, start_pos, end_pos), so a protein carrying two copies
+of one family has two rows that would collide on protein_id. Use
+`embeddings.INSTANCE_KEY_SQL` in the SELECT and `embeddings.write_instance()`
+to write, as every shipped encoder does. Never parse an instance key apart.
 
 See aacomp.py for a minimal example, embeddings.py for pre-computed
 embedding extraction with helper utilities.
@@ -29,38 +36,35 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
+from features import embeddings
 
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
-        conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
-              optimization.sqlite3. Read-only — do not write.
-        out_file: Writable HDF5 file. Write one dataset per (domain, protein)
+        conn: SQLite connection to one of train.sqlite3 / validation.sqlite3 /
+              test*.sqlite3. Read-only — do not write.
+        out_file: Writable HDF5 file. Write one dataset per (domain, instance)
                   pair, grouped by domain_id.
     """
     domain_protein_df = pd.read_sql(
-        """
-        SELECT domain_id, protein_id, UPPER(domain_sequence) AS sequence
+        f"""
+        SELECT domain_id, {embeddings.INSTANCE_KEY_SQL},
+               UPPER(domain_sequence) AS sequence
         FROM domain_protein_map;
         """,
         conn,
     )
 
     domain_protein_df["domain_id"] = domain_protein_df["domain_id"].astype(str)
-    domain_protein_df["protein_id"] = domain_protein_df["protein_id"].astype(str)
+    domain_protein_df["instance_key"] = domain_protein_df["instance_key"].astype(str)
 
-    for domain_id, protein_id, sequence in domain_protein_df.itertuples(index=False):
+    for domain_id, instance_key, sequence in domain_protein_df.itertuples(index=False):
         # --- Replace this block with your feature computation ---
         feature_vector = np.zeros(128, dtype=np.float32)  # placeholder
         # --------------------------------------------------------
 
-        if domain_id not in out_file:
-            pfam_group = out_file.create_group(domain_id)
-        else:
-            pfam_group = out_file[domain_id]
-
-        pfam_group[protein_id] = feature_vector
+        embeddings.write_instance(out_file, domain_id, instance_key, feature_vector)
 
     print(f"new_feature: wrote {len(domain_protein_df)} entries")

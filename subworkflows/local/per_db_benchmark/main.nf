@@ -3,17 +3,21 @@
     PER_DB_BENCHMARK -- run the full per-database benchmark
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     Given a channel of (db_meta, db_path) tuples, scatter:
-        DDI_EXTRACTION
+        DDI_EXTRACTION                                  (per db)
             ↓
         FEATURE_EXTRACTION  (scatter (db × feature × split))
             ↓
-        NEURAL_NETWORK + RANDOM_FOREST + GRAPH_MODEL  (per db × combo / model)
-            ↓
+        NEURAL_NETWORK + RANDOM_FOREST + GRAPH_MODEL    (per db × combo / model)
+            ↓                 one predictions_<variant>.parquet per test split
         EVAL_ONE  (scatter — one tiny JSON per prediction)
             ↓
-        EVALUATION  (per-DB MultiQC reduce)
-    and emit one (meta, evaluation_dir) pair per DB plus a merged versions
-    channel.
+        EVALUATION  (per (db, test variant) MultiQC reduce)
+    and emit one (meta, evaluation_dir) pair per (db, test variant) plus a
+    merged versions channel.
+
+    Training data (train + validation) is shared across a database's test
+    variants: everything up to and including model fitting runs once per
+    database, and only scoring and evaluation fan out per test set.
 ----------------------------------------------------------------------------*/
 
 include { DDI_EXTRACTION                                } from '../../../modules/local/ddi_extraction/main.nf'
@@ -30,6 +34,15 @@ def csvToList(s) {
     // `--graph_models none` (or `--graph_models ''` once nf-schema allows it).
     def items = s instanceof List ? s : (s ? s.tokenize(',') : [])
     items*.trim().findAll { it && it.toLowerCase() != 'none' }
+}
+
+def runLabel(db_id, variant) {
+    // A database with an internal test set produces two runs
+    // (`random_balanced`, `random_realistic`); one with a single `test` keeps
+    // its bare name. The label identifies the run everywhere downstream --
+    // process tags, the evaluation directory, and the entry in the combined
+    // cross-database report.
+    variant == 'test' ? "${db_id}".toString() : "${db_id}_${variant}".toString()
 }
 
 workflow PER_DB_BENCHMARK {
@@ -94,7 +107,8 @@ workflow PER_DB_BENCHMARK {
                     db      : meta.db,
                     model   : 'neural_network',
                     features: combo,
-                    combo_id: combo_id
+                    combo_id: combo_id,
+                    tests   : meta.tests
                 ]
                 tuple(m, ddi_dir, feature_dirs, cfg)
             } : Channel.empty()
@@ -111,7 +125,8 @@ workflow PER_DB_BENCHMARK {
                     db      : meta.db,
                     model   : 'random_forest',
                     features: combo,
-                    combo_id: combo_id
+                    combo_id: combo_id,
+                    tests   : meta.tests
                 ]
                 tuple(m, ddi_dir, feature_dirs, cfg)
             } : Channel.empty()
@@ -127,7 +142,8 @@ workflow PER_DB_BENCHMARK {
                 def m = [
                     id   : "${meta.id}_${model_name}",
                     db   : meta.id,
-                    model: model_name
+                    model: model_name,
+                    tests: meta.tests
                 ]
                 tuple(m, db_path, modeljson)
             }
@@ -135,34 +151,64 @@ workflow PER_DB_BENCHMARK {
 
         // ---------------------------------------------------------------
         // Per-prediction evaluation (scatter)
+        //
+        // Each model emits one `predictions_<variant>.parquet` per test split
+        // of its database. The variant is the fan-out axis from here on: every
+        // test set is evaluated and reported as if it were its own dataset,
+        // under the run label `<db>_<variant>` (bare `<db>` when the database
+        // ships a single `test`).
         // ---------------------------------------------------------------
         all_predictions_ch = NEURAL_NETWORK.out.predictions
             .mix(RANDOM_FOREST.out.predictions)
             .mix(GRAPH_MODEL.out.predictions)
-            .map { meta, pred ->
-                def f          = pred instanceof java.util.List ? pred[0] : pred
-                def model_name = file(f).getParent().getName()
-                def m_eval     = [
-                    id   : "${meta.db}_${model_name}",
-                    db   : meta.db,
-                    model: model_name
-                ]
-                tuple(m_eval, f)
+            .flatMap { meta, pred ->
+                def files = pred instanceof java.util.List ? pred : [pred]
+                files.collect { f ->
+                    def pf         = file(f)
+                    def model_name = pf.getParent().getName()
+                    def variant    = pf.getSimpleName() - 'predictions_'
+                    def run_label  = runLabel(meta.db, variant)
+                    def m_eval     = [
+                        id       : "${run_label}_${model_name}",
+                        db       : meta.db,
+                        variant  : variant,
+                        run_label: run_label,
+                        model    : model_name
+                    ]
+                    tuple(m_eval, pf)
+                }
             }
         EVAL_ONE(all_predictions_ch)
 
         // ---------------------------------------------------------------
-        // Per-DB MultiQC reduce. Group EVAL_ONE outputs by DB, then join
-        // back to db_ch to recover (meta, db_path) for the EVALUATION call.
+        // Per-(DB, variant) MultiQC reduce. Group EVAL_ONE outputs by
+        // (db, variant), then join back to the expanded db channel to recover
+        // (meta, db_path) for the EVALUATION call.
         // ---------------------------------------------------------------
         per_model_jsons_ch = EVAL_ONE.out.metrics
-            .map { meta, j -> tuple(meta.db, j) }
+            .map { meta, j -> tuple("${meta.db}::${meta.variant}".toString(), j) }
             .groupTuple()
 
-        evaluation_input_ch = db_ch
-            .map { meta, db_path -> tuple(meta.id, meta, db_path) }
+        // One entry per (database, test variant). Train/validation splits are
+        // shared, so only the test split differs between an entry pair.
+        db_variant_ch = db_ch
+            .flatMap { meta, db_path ->
+                meta.tests.collect { variant, split ->
+                    def run_label = runLabel(meta.id, variant)
+                    def m = [
+                        id       : run_label,
+                        db       : meta.id,
+                        variant  : variant,
+                        split    : split,
+                        run_label: run_label
+                    ]
+                    tuple("${meta.id}::${variant}".toString(), m, db_path)
+                }
+            }
+
+        evaluation_input_ch = db_variant_ch
             .join(per_model_jsons_ch)
-            .map { _id, meta, db_path, jsons ->
+            .map { _key, meta, db_path, jsons ->
                 tuple(
                     meta,
                     db_path,

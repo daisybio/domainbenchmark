@@ -45,7 +45,7 @@ output:
     - - meta:
           type: map
           description: Groovy Map with database and feature-combo info.
-      - "random_forest_*/predictions.parquet":
+      - "random_forest_*/predictions_*.parquet":
           type: file
           description: Per-prediction parquet table.
           pattern: "*.parquet"

@@ -8,8 +8,8 @@ from features import embeddings
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     # export domain embeddings as hdf using h5py
     embeddings_chunks = pd.read_sql(
-        """
-               SELECT domain_id, protein_id, start_pos, end_pos, esmc_per_residue as embedding
+        f"""
+               SELECT domain_id, {embeddings.INSTANCE_KEY_SQL}, start_pos, end_pos, esmc_per_residue as embedding
                FROM domain_protein_map, protein
                WHERE protein_id = protein.id AND
                    embedding IS NOT NULL;

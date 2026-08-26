@@ -245,21 +245,29 @@ def _db_cache_key(db_files: dict) -> str:
     return h.hexdigest()
 
 
-def analyse_database(input_dir, cache_dir: str | None = None) -> dict[str, object]:
+def analyse_database(
+    input_dir, test_split: str = "test", cache_dir: str | None = None
+) -> dict[str, object]:
     """
-    Analyse train/test/optimization splits of an input dir.
+    Analyse the train / validation / test splits of an input dir.
+
+    test_split names which test set of the database to profile: a database with
+    an internal test set ships `test_balanced` and `test_realistic`, and each is
+    reported as its own dataset, sharing the same train and validation splits.
 
     cache_dir: if provided, memoize the JSON-serialized result keyed by
     (split paths + size + mtime). On a re-run this skips the entire PPI/DDI
-    load + graph build (which used to dominate `evaluation` memory).
+    load + graph build (which used to dominate `evaluation` memory). Because the
+    key covers the resolved paths, the two variants of one database cache
+    independently.
     Default cache dir is `${input_dir}/.cobinet_cache`.
     """
     db_files = {
         k: v
         for k, v in {
             "train": os.path.join(input_dir, "train.sqlite3"),
-            "optimization": os.path.join(input_dir, "optimization.sqlite3"),
-            "test": os.path.join(input_dir, "test.sqlite3"),
+            "validation": os.path.join(input_dir, "validation.sqlite3"),
+            "test": os.path.join(input_dir, f"{test_split}.sqlite3"),
         }.items()
         if os.path.exists(v)
     }

@@ -640,12 +640,24 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold):
     return connected_components, group_ddi_chi2
 
 
-def run_kgiddi(database_path, params_file, out_dir, out_predictions, threads=1):
+def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1):
+    """Train once, score every test split.
+
+    `test_splits` maps variant -> output predictions path, e.g.
+    {"balanced": ".../predictions_balanced.parquet"}. A database shipping both
+    `test_balanced` and `test_realistic` shares one training phase -- the
+    expensive part -- and only the scoring phase runs per variant.
+    """
 
     db_train = Path(os.path.join(database_path, "train.sqlite3"))
-    db_test = Path(os.path.join(database_path, "test.sqlite3"))
     check_file_existence(db_train)
-    check_file_existence(db_test)
+
+    test_dbs = {
+        variant: Path(os.path.join(database_path, f"{split}.sqlite3"))
+        for variant, (split, _) in test_splits.items()
+    }
+    for db_test in test_dbs.values():
+        check_file_existence(db_test)
 
     # Load json parameters
     with open(params_file) as f:
@@ -750,6 +762,39 @@ def run_kgiddi(database_path, params_file, out_dir, out_predictions, threads=1):
     if not training:
         best_params = optimized_params
 
+    for variant, (split, out_predictions) in test_splits.items():
+        logging.info(f"----- Scoring test split {split} (variant {variant}) -----")
+        score_test_split(
+            test_dbs[variant],
+            out_predictions,
+            variant,
+            best_params,
+            params_json,
+            go_graph_nx,
+            go_levels,
+            aps_paths,
+            out_dir,
+            threshold,
+            permutation,
+            threads,
+        )
+
+
+def score_test_split(
+    db_test,
+    out_predictions,
+    variant,
+    best_params,
+    params_json,
+    go_graph_nx,
+    go_levels,
+    aps_paths,
+    out_dir,
+    threshold,
+    permutation,
+    threads,
+):
+    """Score one test split with parameters already chosen on the train split."""
     # Run preprocessing for test data
     (
         ddi_df_test,
@@ -812,10 +857,10 @@ def run_kgiddi(database_path, params_file, out_dir, out_predictions, threads=1):
         list(ddi_network_edges_test), columns=["domain_a", "domain_b"]
     )
     ddi_network_df.to_csv(
-        os.path.join(out_dir, "kgiddi_ddi_network_test.csv"), index=False
+        os.path.join(out_dir, f"kgiddi_ddi_network_{variant}.csv"), index=False
     )
 
-    with open(os.path.join(out_dir, "predicted_ddis_test.txt"), "w") as f:
+    with open(os.path.join(out_dir, f"predicted_ddis_{variant}.txt"), "w") as f:
         for d1, d2 in predicted_ddis_test:
             f.write(f"{d1}\t{d2}\n")
     # Delete large test objects
@@ -840,9 +885,8 @@ def run_kgiddi(database_path, params_file, out_dir, out_predictions, threads=1):
         "fp_rate": fp_rate_test,
     }
     # Add to original json
-    params_json["optimized"] = optimized_params_output
-    with open(os.path.join(out_dir, "kgiddi.json"), "w") as f:
-        json.dump(params_json, f, indent=2)
+    with open(os.path.join(out_dir, f"kgiddi_{variant}.json"), "w") as f:
+        json.dump(dict(params_json, optimized=optimized_params_output), f, indent=2)
 
     chi2_scores = {
         (entry["ddi"][0], entry["ddi"][1]): entry["chi2"]
@@ -850,8 +894,8 @@ def run_kgiddi(database_path, params_file, out_dir, out_predictions, threads=1):
         for entry in group_ddis
     }
     # Prepare output: Domain id1, domain id2, true interaction (0/1), predicted interaction (0/1), predicted probability (chi2 score normalized)
-    # Filter for eval_relevant DDIs only
-    ddi_df_test = ddi_df_test[ddi_df_test["eval_relevant"] == 1].reset_index(drop=True)
+    # Every DDI row in a split database belongs to that split by construction
+    # (domainsplit's SUBSET_SPLIT_DB), so there is nothing to filter out.
     ddi_actual = {
         (row["domain_a"], row["domain_b"]): row["interaction"]
         for _, row in ddi_df_test.iterrows()
@@ -918,6 +962,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--out_predictions", required=False, help="Output predictions file path"
     )
+    parser.add_argument(
+        "--test_split", default="test", help="Name of the test split to score"
+    )
     args = parser.parse_args()
     print("Starting KGIDDI...")
-    run_kgiddi(args.database, args.params, args.out_dir, args.out_predictions)
+    variant = (
+        args.test_split[len("test_"):]
+        if args.test_split.startswith("test_")
+        else args.test_split
+    )
+    run_kgiddi(
+        args.database,
+        args.params,
+        args.out_dir,
+        {variant: (args.test_split, args.out_predictions)},
+    )

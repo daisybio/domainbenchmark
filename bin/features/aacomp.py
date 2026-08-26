@@ -2,6 +2,7 @@
 import h5py
 import pandas as pd
 import sqlite3
+from features import embeddings
 
 AA = "ACDEFGHIKLMNPQRSTVWY"
 
@@ -18,8 +19,9 @@ def get_aa_comp(seq: str) -> list[float]:
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     domain_sequence_df = pd.read_sql(
-        """
-                SELECT domain_id, protein_id, UPPER(domain_sequence) AS sequence
+        f"""
+                SELECT domain_id, {embeddings.INSTANCE_KEY_SQL},
+                       UPPER(domain_sequence) AS sequence
                 FROM domain_protein_map;
             """,
         conn,
@@ -27,17 +29,14 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
 
     domain_sequence_df["aacomp"] = domain_sequence_df["sequence"].apply(get_aa_comp)
     domain_sequence_df["domain_id"] = domain_sequence_df["domain_id"].astype(str)
-    domain_sequence_df["protein_id"] = domain_sequence_df["protein_id"].astype(str)
+    domain_sequence_df["instance_key"] = domain_sequence_df["instance_key"].astype(str)
 
-    for domain_id, uniprot_id, domain_sequence, aacomp in domain_sequence_df.itertuples(
-        index=False
-    ):
-        # create a group for each domain_id and put uniprot_id as a subgroup
-        if domain_id not in out_file:
-            pfam_group = out_file.create_group(domain_id)
-        else:
-            pfam_group = out_file[domain_id]
-
-        pfam_group[uniprot_id] = aacomp
+    for (
+        domain_id,
+        instance_key,
+        domain_sequence,
+        aacomp,
+    ) in domain_sequence_df.itertuples(index=False):
+        embeddings.write_instance(out_file, domain_id, instance_key, aacomp)
 
     print(domain_sequence_df.head())

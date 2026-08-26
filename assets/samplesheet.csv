@@ -1,2 +1,4 @@
 id,db_path
-minimal_leakage,/nfs/data/CoBiNet_Masterpraktikum/databases/minimal_leakage_domain
+random,/nfs/data/CoBiNet_Masterpraktikum/databases/random
+minimal_leakage,/nfs/data/CoBiNet_Masterpraktikum/databases/minimal_leakage
+external_test,/nfs/data/CoBiNet_Masterpraktikum/databases/external_test
