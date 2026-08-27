@@ -1,14 +1,23 @@
 // Parallelise feature extraction across a database's sqlite splits.
 //
 // The `FEATURE_EXTRACTION` (lower-case) inner workflow fans out
-// (feature × split) into independent jobs and stages the resulting h5
-// files into the per-feature directory layout that ML / RF / graph_model
-// already expect (`features/<feature>/<split>.h5`). The split set comes from
-// `meta.splits` — `train`, `validation`, and one or more `test*` — so a
-// database shipping both `test_balanced` and `test_realistic` produces an h5
-// for each while training data is extracted once.
-// Downstream channel signatures are unchanged — only the granularity
-// of work changes.
+// (feature × split) into independent jobs. Each job writes exactly one
+// `<feature>__<split>.h5`, and NN / RF stage the whole set flat into
+// `features/` — the filename carries the layout, so nothing in between has to
+// materialise a `features/<feature>/<split>.h5` tree.
+//
+// There used to be a STAGE_FEATURE_DIR process building that tree with `cp`. It
+// cost one scheduled job per (db, feature) to copy a handful of files, and on a
+// node that cannot loop-mount the SIF, singularity unpacked the whole image to
+// a temporary sandbox first — which outlived the label's walltime and killed the
+// run with exit 140 after three attempts. `bin/machine_learning.py`'s
+// `resolve_feature_file` reads both layouts, so a pre-existing per-feature
+// directory tree still works.
+//
+// The split set comes from `meta.splits` — `train`, `validation`, and one or
+// more `test*` — so a database shipping both `test_balanced` and
+// `test_realistic` produces an h5 for each while training data is extracted
+// once.
 
 process FEATURE_EXTRACTION_ONE {
     tag "${meta.id}"
@@ -21,78 +30,48 @@ process FEATURE_EXTRACTION_ONE {
         tuple val(meta), path(database_dir)
 
     output:
-        tuple val(meta), path("${meta.dataset}.h5"), emit: h5
-        path "versions.yml",                         emit: versions
+        // optional: a split absent from this database produces no file at all.
+        // The previous zero-byte placeholder existed only so the stager could
+        // skip it; with no stager, an empty .h5 would just break h5py.
+        tuple val(meta), path("${meta.feature}__${meta.dataset}.h5"), emit: h5, optional: true
 
     script:
-        def out = "${meta.dataset}.h5"
+        def out          = "${meta.feature}__${meta.dataset}.h5"
         def feature_name = meta.feature
         def dataset      = meta.dataset
 
-        def script_body
         if (database_dir.isFile()) {
             // Single-file db inputs only support a 'test' split.
             if (dataset != 'test') {
-                script_body = ": > ${out}"
+                """
+                echo "Single-file database ${database_dir} has no '${dataset}' split — nothing to extract."
+                """
             } else {
-                script_body = """extract_features.py \\
+                """
+                extract_features.py \\
                     --db ${database_dir} \\
                     --feature ${feature_name} \\
-                    --out ${out}"""
+                    --out ${out} \\
+                    --seed ${params.seed}
+                """
             }
         } else {
-            script_body = """if [ -f "${database_dir}/${dataset}.sqlite3" ]; then
+            """
+            if [ -f "${database_dir}/${dataset}.sqlite3" ]; then
                 extract_features.py \\
                     --db ${database_dir}/${dataset}.sqlite3 \\
                     --feature ${feature_name} \\
-                    --out ${out}
+                    --out ${out} \\
+                    --seed ${params.seed}
             else
-                # Split missing in this database — emit zero-byte placeholder
-                # so the stager can skip it without breaking groupTuple sizing.
-                : > ${out}
-            fi"""
+                echo "Database ${database_dir} has no ${dataset}.sqlite3 — nothing to extract."
+            fi
+            """
         }
 
+    stub:
         """
-        ${script_body}
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-        END_VERSIONS
-        """
-}
-
-
-process STAGE_FEATURE_DIR {
-    tag "${meta.id}"
-    label 'feature_stage'
-
-    conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
-
-    input:
-        tuple val(meta), path(h5_files)
-
-    output:
-        tuple val(meta), path("${meta.db}/${meta.feature}"), emit: feature_dir
-        path "versions.yml",                                 emit: versions
-
-    script:
-        def h5_list = h5_files instanceof java.util.List ? h5_files.join(' ') : h5_files
-        """
-        mkdir -p ${meta.db}/${meta.feature}
-        for f in ${h5_list}; do
-            # Skip empty placeholders for splits that didn't exist in this db.
-            if [ -s "\$f" ]; then
-                cp -L "\$f" ${meta.db}/${meta.feature}/\$(basename "\$f")
-            fi
-        done
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            posix_cp: \$(cp --version 2>&1 | head -n1 | awk '{print \$NF}')
-        END_VERSIONS
+        touch ${meta.feature}__${meta.dataset}.h5
         """
 }
 
@@ -103,9 +82,8 @@ workflow FEATURE_EXTRACTION {
         db_ch          // channel: tuple(meta, db_path)  — multi-DB capable
 
     main:
-        // Build per-(db, feature, split) tasks. Each task gets a unique meta
-        // so groupTuple can re-cluster downstream by (db, feature). The split
-        // list is per-database (`meta.splits`), not a pipeline constant.
+        // Build per-(db, feature, split) tasks. The split list is per-database
+        // (`meta.splits`), not a pipeline constant.
         per_task = db_ch
             .combine(feature_ch)
             .flatMap { db_meta, db_path, feat ->
@@ -122,23 +100,8 @@ workflow FEATURE_EXTRACTION {
 
         per_split = FEATURE_EXTRACTION_ONE(per_task)
 
-        // Group per-split outputs back to (db, feature). The stripped meta
-        // (no dataset key) is what flows downstream into ML/RF.
-        grouped = per_split.h5
-            .map { meta, h5 ->
-                def m = [
-                    id     : "${meta.db}_${meta.feature}",
-                    db     : meta.db,
-                    feature: meta.feature
-                ]
-                tuple(m.id, m, h5)
-            }
-            .groupTuple()
-            .map { _id, metas, h5s -> tuple(metas[0], h5s) }
-
-        staged = STAGE_FEATURE_DIR(grouped)
-
     emit:
-        feature_dir = staged.feature_dir
-        versions    = staged.versions.mix(per_split.versions)
+        // tuple(db_id, h5) — one item per (db, feature, split). The caller
+        // groupTuple()s by db_id to get every feature file of one database.
+        h5 = per_split.h5.map { meta, h5 -> tuple(meta.db, h5) }
 }

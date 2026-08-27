@@ -2,7 +2,6 @@
 """Random Forest DDI prediction model (cuML GPU-accelerated)."""
 
 import gc
-import random
 import sys
 
 import numpy as np
@@ -95,13 +94,13 @@ def _load_train_with_balance(args, balance_method: str, seed: int):
     if balance_method not in BALANCE_METHODS:
         raise ValueError(f"Unknown balance_method: {balance_method}")
     downsample = balance_method == "downsample"
-    random.seed(seed)
     x_train, y_train = load_embedding_data(
         args.features_path,
         args.features,
         args.ddi_path,
         "train",
         balance_classes=downsample,
+        seed=seed,
     )
     if balance_method == "oversample":
         x_train, y_train = _oversample_minority(x_train, y_train, seed)
@@ -131,9 +130,25 @@ class RandomForestTrainer(DDIModelTrainer):
         return RandomForestClassifier
 
     def _rf_extra_kwargs(self):
-        # cuML parallelises across the GPU; sklearn needs to be told to use
-        # every core, since the search itself runs with n_jobs=1.
-        return {} if self._use_gpu else {"n_jobs": -1}
+        # Both branches trade throughput for a reproducible forest.
+        #
+        # GPU (n_streams=1): cuML's forest builder produces different results
+        # run to run with more than one CUDA stream, because per-node histogram
+        # reductions land in a nondeterministic order. random_state does not
+        # pin it.
+        #
+        # CPU (n_jobs=1): fitting is fine in parallel -- trees are built
+        # independently and stored in order, and the fitted .pkl was already
+        # byte-identical across runs with n_jobs=-1. `predict_proba` is not:
+        # sklearn accumulates per-tree probabilities under joblib, so the
+        # summation order and the last bits of each probability depend on thread
+        # scheduling. That moved the MCC-tuned decision threshold between runs
+        # (visibly, in model_parameters.json) without flipping any prediction,
+        # and the same wobble reaches the average_precision scores
+        # RandomizedSearchCV ranks candidates by -- where it *could* flip which
+        # model wins. The CPU path only runs under --allow_cpu (CI, laptops);
+        # production uses cuML, where n_jobs does not apply.
+        return {"n_streams": 1} if self._use_gpu else {"n_jobs": 1}
 
     def _get_balance_methods(self, hyperparameters):
         return hyperparameters.get("balance_method", ["none"])

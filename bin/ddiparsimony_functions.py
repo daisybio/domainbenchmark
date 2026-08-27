@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import networkx as nx
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import scipy.optimize as opt
+from concurrent.futures import ProcessPoolExecutor
 from sklearn import metrics
+
+from determinism import derive_seed
 
 
 def build_domain_pairs(ppi_list, protein_domains, ddi_dict):
@@ -179,7 +181,14 @@ def compute_lp_score(
 
 # --- Parallelized version ---
 def process_one_random(
-    run_idx, A, protein_domains, domain_pair_to_idx, domain_pairs, proteins, ddi_score
+    run_idx,
+    A,
+    protein_domains,
+    domain_pair_to_idx,
+    domain_pairs,
+    proteins,
+    ddi_score,
+    seed=42,
 ):
     G = (
         nx.from_scipy_sparse_array(A)
@@ -189,13 +198,24 @@ def process_one_random(
     nswap = int(G.number_of_edges() * 0.8)
     max_tries = nswap * 20
     try:
-        randomized_G = nx.double_edge_swap(G, nswap=nswap, max_tries=max_tries)
+        # seed: this runs in a ProcessPoolExecutor worker, which inherits no RNG
+        # state, so an unseeded double_edge_swap randomised the network
+        # differently on every run. derive_seed keys on run_idx, so iteration
+        # `i` gets the same rewiring whatever worker picks it up.
+        randomized_G = nx.double_edge_swap(
+            G, nswap=nswap, max_tries=max_tries, seed=derive_seed(seed, run_idx)
+        )
         rand_net = (
             nx.to_scipy_sparse_array(randomized_G)
             if hasattr(nx, "to_scipy_sparse_array")
             else nx.to_scipy_sparse_matrix(randomized_G)
         )  # type: ignore
-    except nx.NetworkXAlgorithmError:
+    except nx.NetworkXException:
+        # Was NetworkXAlgorithmError only, which does not cover the
+        # NetworkXError double_edge_swap raises for a graph with fewer than
+        # four nodes -- a degenerate input killed the whole task instead of
+        # taking the intended "rewiring impossible, use the original network"
+        # fallback. Both derive from NetworkXException.
         rand_net = A.copy()
 
     G_rand = (
@@ -226,6 +246,7 @@ def compute_random_x_matrix_parallel(
     ddi_score,
     num_iterations=1000,
     max_workers=1,
+    seed=42,
 ):
     random_x_matrix = np.zeros((num_iterations, len(domain_pairs)))
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -239,10 +260,16 @@ def compute_random_x_matrix_parallel(
                 domain_pairs,
                 proteins,
                 ddi_score,
+                seed,
             )
             for run_idx in range(num_iterations)
         ]
-        for run_idx, future in enumerate(as_completed(futures)):
+        # Submission order, not as_completed: the previous loop numbered rows by
+        # the order results came *back*, so iteration i's vector landed in a row
+        # that depended on worker scheduling. Every row of the matrix moved
+        # between runs even though the set of rows was the same. All futures
+        # still run concurrently; only the collection is ordered.
+        for run_idx, future in enumerate(futures):
             x_vec = future.result()
             if x_vec is not None:
                 random_x_matrix[run_idx, :] = x_vec

@@ -2,20 +2,65 @@
 """Neural network DDI prediction model (skorch + PyTorch MLP)."""
 
 import gc
-import random
 from typing import List
 
 import numpy as np
 import torch
 from sklearn.model_selection import RandomizedSearchCV
 from skorch import NeuralNetBinaryClassifier
-from skorch.callbacks import EarlyStopping
+from skorch.callbacks import Callback, EarlyStopping
 from skorch.dataset import ValidSplit
 
+from determinism import seed_everything
 from machine_learning import DDIModelTrainer, load_embedding_data
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+class SeedFit(Callback):
+    """Reseed every RNG at the start of each training loop.
+
+    RandomizedSearchCV runs candidate fits with n_jobs > 1 and joblib executes
+    them in worker *processes*, which inherit none of the parent's RNG state --
+    so dropout masks and batch order differed run to run even with --seed set.
+    Applied to the refit too, so the saved model does not depend on how many
+    candidates happened to run before it.
+
+    Not sufficient on its own: skorch calls `initialize()` -- and therefore
+    draws the initial weights -- before it notifies `on_train_begin`. See
+    SeededNeuralNetBinaryClassifier.
+    """
+
+    def __init__(self, seed):
+        self.seed = seed
+
+    def on_train_begin(self, net, X=None, y=None, **kwargs):
+        seed_everything(self.seed)
+
+
+class SeededNeuralNetBinaryClassifier(NeuralNetBinaryClassifier):
+    """A skorch classifier that seeds itself before drawing its weights.
+
+    `initialize()` instantiates the module, which samples every Linear layer's
+    weights from the global torch RNG. skorch runs it inside `fit()` *before*
+    the `on_train_begin` notification, so a callback cannot get there first --
+    in a joblib worker process, which starts with no inherited RNG state, that
+    left the initial weights random and every fitted model different.
+
+    `seed` is a plain constructor attribute, which is what skorch's
+    `_get_param_names` reads, so `sklearn.clone` carries it into each
+    RandomizedSearchCV candidate.
+    """
+
+    def __init__(self, *args, seed=42, **kwargs):
+        # Before super(): skorch collects params from __dict__.
+        self.seed = seed
+        super().__init__(*args, **kwargs)
+
+    def initialize(self):
+        seed_everything(self.seed)
+        return super().initialize()
 
 
 class MLPModule(torch.nn.Module):
@@ -54,10 +99,9 @@ class NeuralNetworkTrainer(DDIModelTrainer):
                 f"NeuralNetworkTrainer supports 'downsample' and 'none', got '{balance_method}'"
             )
         downsample = balance_method == "downsample"
-        random.seed(seed)
         return load_embedding_data(
             args.features_path, args.features, args.ddi_path, "train",
-            balance_classes=downsample,
+            balance_classes=downsample, seed=seed,
         )
 
     def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
@@ -73,14 +117,19 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         # balance_classes=True concatenates `pos + neg`, so unshuffled batches
         # are class-pure and the model collapses to majority prediction.
         # Stratified valid split keeps positives in the holdout used by EarlyStopping.
-        classifier = NeuralNetBinaryClassifier(
+        classifier = SeededNeuralNetBinaryClassifier(
             MLPModule,
+            seed=self._seed,
             max_epochs=config["search_parameters"]["grid_search_epochs"],
             device=device,
             verbose=0,
             module__input_size=num_features,
             iterator_train__shuffle=True,
-            train_split=ValidSplit(0.2, stratified=True),
+            # random_state: an unseeded ValidSplit draws a different holdout on
+            # every fit, which moves both the EarlyStopping signal and the score
+            # the search ranks candidates by.
+            train_split=ValidSplit(0.2, stratified=True, random_state=self._seed),
+            callbacks=[SeedFit(self._seed)],
         )
         gs = RandomizedSearchCV(
             classifier, hyperparameters, n_iter=n_iter,
@@ -107,8 +156,9 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         elif device == "auto":
             device = "cuda"
 
-        classifier = NeuralNetBinaryClassifier(
+        classifier = SeededNeuralNetBinaryClassifier(
             MLPModule,
+            seed=self._seed,
             max_epochs=config["search_parameters"]["retrain_epochs"],
             device=device,
             **best_params,
@@ -116,8 +166,11 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             module__input_size=num_features,
             criterion__pos_weight=pos_weight,
             iterator_train__shuffle=True,
-            train_split=ValidSplit(0.2, stratified=True),
-            callbacks=[EarlyStopping(patience=5, monitor="valid_loss")],
+            train_split=ValidSplit(0.2, stratified=True, random_state=self._seed),
+            callbacks=[
+                SeedFit(self._seed),
+                EarlyStopping(patience=5, monitor="valid_loss"),
+            ],
         )
         print("Refitting best parameter model on training data...")
         classifier.fit(x_train, y_train)

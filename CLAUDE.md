@@ -35,29 +35,40 @@ Python deps managed via conda — `environments/general.yml` (extraction/RF/grap
 ## Architecture
 
 ### Top-level layout
-- `main.nf` — entry. Defines `DOMAINBENCHMARK` workflow (MultiQC + versions/methods boilerplate) and `DAISYBIO_DOMAINBENCHMARK` (the science workflow).
-- `workflows/domainbenchmark.nf` — wires sample channel → `PER_DB_BENCHMARK` (scattered per DB) → `AGGREGATE_EVAL`.
+- `main.nf` — entry. `PIPELINE_INITIALISATION` → `DAISYBIO_DOMAINBENCHMARK` (the science workflow: `PER_DB_BENCHMARK` scattered per DB → `AGGREGATE_EVAL`) → `PIPELINE_COMPLETION`. There is no pipeline-level MULTIQC process and no software-version collection: the report is built by `bin/eval_multiqc.py` / `bin/combine_eval.py`, which write their own MultiQC configs.
 - `subworkflows/local/per_db_benchmark/main.nf` — scatter: `DDI_EXTRACTION` → `FEATURE_EXTRACTION` (fan-out feature × split) → `NEURAL_NETWORK` + `RANDOM_FOREST` (per-feature singletons + one all-feature concat run, gated by `params.machine_learning_models`) + `GRAPH_MODEL` → `EVAL_ONE` (per-prediction) → `EVALUATION` (per (db, test variant) MultiQC reduce). `runLabel()` there defines the `<db>_<variant>` run name used downstream.
 - `subworkflows/local/aggregate_eval/main.nf` — runs `COMBINE_EVAL` across per-DB reports to produce `results/evaluation/ddi_report.html`.
-- `subworkflows/local/utils_nfcore_domainbenchmark_pipeline/main.nf` — nf-core boilerplate (initialise, completion, citations).
+- `subworkflows/local/utils_nfcore_domainbenchmark_pipeline/main.nf` — nf-core boilerplate (initialise, completion) plus `discoverSplits()` / `datasetTuple()`, which turn a database directory into `meta.splits` / `meta.tests`.
 - `nextflow.config` — single source of truth for `db_list` (legacy), `graph_models`, `machine_learning_models`, `machine_learning_features`, `large_features`, `skip`, `out_dir`, profiles.
 - `conf/{base,slurm,test,test_full,modules}.config` — layered config. `conf/base.config` carries retry strategy and per-label resources.
 - `assets/<ModelName>.json` — per-model hyperparameter grid + search config. Filename must match `model_name` and the Python script in `bin/`.
 - `modules/local/<stage>/main.nf` — Nextflow process defs (`ddi_extraction`, `feature_extraction`, `neural_network`, `random_forest`, `graph_model`, `evaluation`).
 - `bin/` — Python entrypoints invoked by modules (`run_models.py`, `random_forest.py`, `run_graph_models.py`, `kgiddi.py`, `ddiparsimony.py`, `extract_features.py`, `eval_one.py`, `eval_multiqc.py`, `combine_eval.py`, `load_data_gm.py`). Auto on `PATH` from Nextflow.
+- `bin/determinism.py` — `seed_everything(seed)` (seeds `random`/`numpy`/`torch`, kills cuDNN autotuning, asks torch for deterministic kernels) and `derive_seed(seed, *tokens)` (stable child seed for a worker, keyed on its own identity rather than completion order). Every entrypoint calls it. `PYTHONHASHSEED=0` and `CUBLAS_WORKSPACE_CONFIG` are set in the `env` scope of `nextflow.config` — they must exist before the interpreter starts.
 - `bin/features/` — feature encoders (`aacomp`, `aaencode`, `dummy`, `embeddings`, `protdcal`, `esm3_*`, `esmc_*`, `prott5_*`). New feature = new file here + entry in `params.machine_learning_features`; key the HDF5 by instance via `embeddings.INSTANCE_KEY_SQL` / `embeddings.write_instance()`. Heavy ones go in `params.large_features` → routed to `process_gpu_large`.
-- `docker/`, `containers_{docker,singularity,conda_lock}_{amd64,arm64}.config` — container/lock matrices.
+- `docker/` — image definitions. One image per environment, referenced directly in each module's `container` directive.
 
 ### Data flow
 1. Input: samplesheet of `{id, db_path}` or a `databases/` directory. Each database dir contains `train.sqlite3`, `validation.sqlite3`, and one or more `test*.sqlite3` (tables: `domain`, `domain_go_terms`, `domain_domain_interaction`, `protein`, `protein_go_terms`, `protein_protein_interaction`, `domain_protein_map`, `ddi_split_membership`).
 2. `DDI_EXTRACTION` → SQL → `<split>.csv` plus `<split>_instances.csv` (the domain-instance pairs `ddi_split_membership` assigns to that split — what the ML loader instantiates, instead of a cross-product).
-3. `FEATURE_EXTRACTION` (fan-out per feature × split) → per-feature `<split>.h5` under `results/<db>/data/<feature>/`. HDF5 layout is `h5[domain_id][instance_key]` — instance-level, because one protein can carry two instances of the same family.
+3. `FEATURE_EXTRACTION` (fan-out per feature × split) → one `<feature>__<split>.h5` per task under `results/<db>/data/`. The flat name carries the layout; NN/RF stage the whole set into `features/` and `machine_learning.py:resolve_feature_file` resolves it (a pre-existing `features/<feature>/<split>.h5` tree also still works). HDF5 layout is `h5[domain_id][instance_key]` — instance-level, because one protein can carry two instances of the same family. There is deliberately no staging process in between: the old `STAGE_FEATURE_DIR` cost a scheduled job per (db, feature) to run `cp`, and on a node that cannot loop-mount the SIF, singularity unpacked the whole image first and blew through the label's walltime (exit 140).
 4. `NEURAL_NETWORK` / `RANDOM_FOREST` consume `.h5`, grid-search via model JSON on train+validation, then score every test split → `predictions_<variant>.parquet` under `results/<db>/nn_output/` and `results/<db>/rf_output/`.
 5. `GRAPH_MODEL` (KGIDDI, DDIParsimony, KGIDDI_RANDOM) trains once on the train split and scores every test split → `results/<db>/graph_models/<model>/predictions_<variant>.parquet`.
 6. `EVAL_ONE` per-prediction → `EVALUATION` per (db, test variant) MultiQC → `results/<db>/evaluation/<variant>/`.
 7. `AGGREGATE_EVAL` / `COMBINE_EVAL` → `results/evaluation/ddi_report.html`, with each (db, variant) as its own dataset entry.
 
 The scatter design (`EVAL_ONE` → `EVALUATION` reduce) replaced a monolithic evaluation that hit 300 GB OOM. See comment in `modules/local/evaluation/main.nf`.
+
+### Reproducibility
+
+The pipeline is bit-reproducible for a given commit + input + `--seed`, and `nf-test` asserts it by snapshotting model and prediction contents. Anything that draws from an RNG must take a `--seed`, call `determinism.seed_everything`, and use `derive_seed` for work inside a process pool. Two traps worth knowing:
+
+- Never iterate a `set`/`dict` of strings where the order affects output, even with `PYTHONHASHSEED` fixed — sort it. The fixed salt makes it reproducible, but the sort makes it obvious.
+- joblib/`ProcessPoolExecutor` workers inherit no RNG state. Reseed inside the worker (skorch's `on_train_begin`, or a `seed` argument), and never key a result's position on completion order — `compute_random_x_matrix_parallel` used to number rows by `as_completed`. skorch is worse than it looks: `initialize()` draws the weights *before* `on_train_begin` fires, so the callback alone is not enough (hence `SeededNeuralNetBinaryClassifier`).
+- A model can be bit-identical while something derived from it is not. sklearn's `RandomForest.predict_proba` parallelises the per-tree sum, so with `n_jobs=-1` the `.pkl` matched run to run but the MCC-tuned threshold in `model_parameters.json` did not. Fitting is deterministic; prediction is where the reduction order leaks. The CPU path is therefore `n_jobs=1`.
+- **Nextflow's own ordering is a reproducibility surface.** `groupTuple()` and `collect()` emit in task-completion order. If that list becomes a command-line argument order, it reaches the output: MultiQC writes its JSON in the order it was fed, so `--per_model_metrics` had to be sorted. Sort every grouped list before it reaches a script — it also stabilises the task hash for `-resume`.
+
+Do not re-add entries to `tests/.nftignore` to make a snapshot pass: that hides real regressions. Regenerate the snapshot instead, and only for a change you can explain.
 
 ### Adding things
 - **New ML model:** add `assets/<Name>.json` (must include `model_name`, `data`, `search_parameters`, `model_parameters`) + matching Python file in `bin/`. Picked up automatically.

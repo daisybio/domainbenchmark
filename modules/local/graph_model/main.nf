@@ -11,7 +11,6 @@ process GRAPH_MODEL {
     output:
         tuple val(meta), path("${meta.model}/predictions_*.parquet"), emit: predictions
         tuple val(meta), path("${meta.model}/model/"),                emit: model
-        path "versions.yml",                                          emit: versions
 
     script:
         def output_model_dir = "${meta.model}/model"
@@ -28,13 +27,8 @@ process GRAPH_MODEL {
             --out_dir ${output_model_dir} \\
             --out_predictions_dir ${meta.model} \\
             --test_splits ${test_splits} \\
-            --threads ${task.cpus}
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            networkx: \$(python -c 'import networkx; print(networkx.__version__)')
-        END_VERSIONS
+            --threads ${task.cpus} \\
+            --seed ${params.seed}
         """
 
     stub:
@@ -45,10 +39,5 @@ process GRAPH_MODEL {
             touch ${meta.model}/predictions_\${v}.parquet
         done
         touch ${meta.model}/model/model.txt
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            stub: true
-        END_VERSIONS
         """
 }

@@ -8,7 +8,6 @@ Steps to add a new model:
 4. Wire it into subworkflows/local/per_db_benchmark/main.nf
 """
 
-import random
 import pickle
 
 import numpy as np
@@ -34,10 +33,9 @@ class NewModelTrainer(DDIModelTrainer):
         # Load training data with the requested balance strategy.
         # Must return (x, y) numpy arrays.
         downsample = balance_method == "downsample"
-        random.seed(seed)
         return load_embedding_data(
             args.features_path, args.features, args.ddi_path, "train",
-            balance_classes=downsample,
+            balance_classes=downsample, seed=seed,
         )
 
     def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):

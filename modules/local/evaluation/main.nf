@@ -15,7 +15,6 @@ process EVAL_ONE {
 
     output:
         tuple val(meta), path("per_model/${meta.model}.json"), emit: metrics
-        path "versions.yml",                                    emit: versions
 
     script:
         // `<split>_sources.csv` carries each test DDI's comma-joined provenance
@@ -31,22 +30,12 @@ process EVAL_ONE {
             --model_name ${meta.model} \\
             ${sources_arg} \\
             --out per_model/${meta.model}.json
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-        END_VERSIONS
         """
 
     stub:
         """
         mkdir -p per_model
         echo '{}' > per_model/${meta.model}.json
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            stub: true
-        END_VERSIONS
         """
 }
 
@@ -63,10 +52,12 @@ process EVALUATION {
 
     output:
         tuple val(meta), path('evaluation/'), emit: report
-        path "versions.yml",                  emit: versions
 
     script:
-        def jsons_list     = per_model_jsons instanceof java.util.List ? per_model_jsons.join(' ') : per_model_jsons
+        // Sorted, not as-received: the argument order reaches MultiQC's JSON
+        // output, so it has to be a function of the file names and nothing else.
+        def jsons_list     = (per_model_jsons instanceof java.util.List ? per_model_jsons : [per_model_jsons])
+            .collect { it.toString() }.toSorted().join(' ')
         def old_report_arg = old_report ? "--report ${old_report}" : ''
         // One report per (database, test variant): the train and validation
         // splits are shared, only the test set differs.
@@ -81,23 +72,12 @@ process EVALUATION {
             --test_split ${test_split} \\
             --out_dir evaluation/ \\
             ${old_report_arg}
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            multiqc: \$(multiqc --version 2>&1 | sed -e 's/.*version //' -e 's/[, ].*//')
-        END_VERSIONS
         """
 
     stub:
         """
         mkdir -p evaluation
         echo "${meta.id} (${meta.split})" > evaluation/evaluation.html
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            stub: true
-        END_VERSIONS
         """
 }
 
@@ -122,7 +102,6 @@ process COMBINE_EVAL {
 
     output:
         tuple val(meta), path('evaluation/'), emit: combined_report
-        path "versions.yml",                  emit: versions
 
     script:
         def ids_list = ids instanceof java.util.List ? ids : [ids]
@@ -142,11 +121,6 @@ process COMBINE_EVAL {
         combine_eval.py \\
             --reports reports/*/evaluation \\
             --out_dir evaluation
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-        END_VERSIONS
         """
 
     stub:
@@ -154,10 +128,5 @@ process COMBINE_EVAL {
         """
         mkdir -p evaluation
         printf '%s\\n' ${ids_list.collect { "'${it}'" }.join(' ')} > evaluation/ddi_report.html
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            stub: true
-        END_VERSIONS
         """
 }

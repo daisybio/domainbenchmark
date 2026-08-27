@@ -15,7 +15,6 @@ process DDI_EXTRACTION {
         // caller's domainsplit output (and into the test fixture, whose stale
         // copies are still tracked). `ddi_out/` cannot collide with a staged input.
         tuple val(meta), path("ddi_out/DDI"), emit: ddi
-        path "versions.yml",                  emit: versions
 
     script:
         // Every DDI row in a split database *is* that split: domainsplit's
@@ -55,12 +54,6 @@ process DDI_EXTRACTION {
             ddi_df.to_csv("ddi_out/DDI/test.csv", index=False)
             source_df.to_csv("ddi_out/DDI/test_sources.csv", index=False)
             PYEOF
-
-            cat <<-END_VERSIONS > versions.yml
-            "${task.process}":
-                python: \$(python --version 2>&1 | sed 's/Python //')
-                pandas: \$(python -c 'import pandas as pd; print(pd.__version__)')
-            END_VERSIONS
             """
         } else {
             """
@@ -126,12 +119,6 @@ process DDI_EXTRACTION {
                             f"{out_dir}/{split}_instances.csv", index=False
                         )
             PYEOF
-
-            cat <<-END_VERSIONS > versions.yml
-            "${task.process}":
-                python: \$(python --version 2>&1 | sed 's/Python //')
-                pandas: \$(python -c 'import pandas as pd; print(pd.__version__)')
-            END_VERSIONS
             """
         }
 }

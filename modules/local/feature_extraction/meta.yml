@@ -2,10 +2,10 @@ name: feature_extraction
 description: |
   Compute a single feature encoding for one `(database × split)` cell.
   `FEATURE_EXTRACTION_ONE` is fanned out by the inner `FEATURE_EXTRACTION`
-  workflow across all `(feature × split)` combinations so downstream ML,
-  RF, and graph modules can consume the canonical
-  `features/<feature>/<split>.h5` layout (train, validation, and one
-  file per test split).
+  workflow across all `(feature × split)` combinations. Each task writes one
+  `<feature>__<split>.h5`, and the ML modules stage the whole set flat into
+  `features/` -- the filename carries the layout, so no intermediate process
+  builds a per-feature directory tree.
 keywords:
   - feature extraction
   - domain embeddings
@@ -38,17 +38,12 @@ output:
     - - meta:
           type: map
           description: Groovy Map with database, feature, and split info.
-      - "${meta.dataset}.h5":
+      - "${meta.feature}__${meta.dataset}.h5":
           type: file
-          description: HDF5 feature matrix for one split.
+          description: |
+            HDF5 feature matrix for one (feature, split). Absent when the
+            database has no such split -- the output is optional.
           pattern: "*.h5"
-  versions:
-    - - ${task.process}:
-          type: string
-          description: The process the versions were collected from
-      - python:
-          type: string
-          description: Python interpreter version
 authors:
   - "@konstantinpelz"
 maintainers:

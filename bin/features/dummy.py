@@ -19,8 +19,6 @@ from features import embeddings
 
 DUMMY_DIM = 512
 
-_RNG = np.random.default_rng()
-
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     domain_protein_df = pd.read_sql(
@@ -39,7 +37,11 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
             out_file,
             domain_id,
             instance_key,
-            _RNG.standard_normal(DUMMY_DIM, dtype=np.float32),
+            # The module-global numpy RNG, seeded by extract_features.py from
+            # --seed. A private default_rng() with no seed made every run of
+            # this encoder emit a different h5, and every model trained on it
+            # irreproducible.
+            np.random.standard_normal(DUMMY_DIM).astype(np.float32),
         )
 
     print(

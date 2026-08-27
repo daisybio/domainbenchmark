@@ -23,6 +23,8 @@ from sklearn.metrics import matthews_corrcoef
 from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
 from typing import List
 
+from determinism import seed_everything
+
 
 interaction_encodings = ["protdcal"]
 
@@ -123,6 +125,21 @@ def load_instance_pairs(ddi_path: Path, dataset: str):
     return {key: sorted(combos) for key, combos in pairs.items()}
 
 
+def resolve_feature_file(features_path: Path, feature: str, dataset: str) -> Path:
+    """Locate one feature's h5 file for `dataset`.
+
+    Two layouts are accepted. Nextflow stages the extraction outputs flat, one
+    file per (feature, split), named `<feature>__<split>.h5` -- there is no
+    process in between reshaping them into per-feature directories any more. A
+    hand-built or pre-existing `<feature>/<split>.h5` tree still works, and is
+    tried first so an explicit directory layout always wins.
+    """
+    nested = features_path / feature / f"{dataset}.h5"
+    if nested.exists():
+        return nested
+    return features_path / f"{feature}__{dataset}.h5"
+
+
 def load_embedding_data(
     features_path: Path,
     features: List[str],
@@ -131,6 +148,7 @@ def load_embedding_data(
     balance_classes=False,
     return_ddi_pairs=False,
     return_protein_pairs=False,
+    seed: int = 42,
 ):
     cache_key = (
         tuple(features),
@@ -138,6 +156,7 @@ def load_embedding_data(
         str(ddi_path),
         dataset,
         bool(balance_classes),
+        int(seed),
     )
     if cache_key in _load_cache:
         # Move-to-end so LRU eviction works.
@@ -152,7 +171,9 @@ def load_embedding_data(
         return x, y
 
     ddi_csv_path = ddi_path / f"{dataset}.csv"
-    feature_paths = [features_path / feature / f"{dataset}.h5" for feature in features]
+    feature_paths = [
+        resolve_feature_file(features_path, feature, dataset) for feature in features
+    ]
 
     # Check if the files exist
     if not ddi_csv_path.exists():
@@ -164,25 +185,33 @@ def load_embedding_data(
                 f"Embeddings file {embeddings_file} does not exist."
             )
 
-    # Load DDI network
+    # Load DDI network.
+    #
+    # `sorted`, not the raw set: str hashing is salted per interpreter, so
+    # iterating the set gave a different order on every run. That order decides
+    # which pairs the balancing step below samples, the row order of x/y (and so
+    # the batches a network sees), and the row order of the predictions parquet
+    # -- it was the single largest source of run-to-run drift.
     labeled_domain_pairs = set()
     ddi_df = pd.read_csv(ddi_csv_path)
     for row in ddi_df.itertuples(index=False):
         domain_a = str(row.domain_1)
         domain_b = str(row.domain_2)
-        interaction = row.interaction
+        interaction = int(row.interaction)
 
         labeled_domain_pairs.add((domain_a, domain_b, interaction))
         labeled_domain_pairs.add((domain_b, domain_a, interaction))
+    labeled_domain_pairs = sorted(labeled_domain_pairs)
 
     # If balance_classes is True, we will balance the classes by resampling
     # to have an equal number of positive and negative samples in the dataset
     if balance_classes:
-        labeled_domain_pairs = list(labeled_domain_pairs)
         pos = [t for t in labeled_domain_pairs if t[2] == 1]
         neg = [t for t in labeled_domain_pairs if t[2] == 0]
         n = min(len(pos), len(neg))
-        rng = random.Random(42)
+        # `seed`, not a hardcoded 42: --seed has to reach the one draw that
+        # decides which examples the model is trained on.
+        rng = random.Random(seed)
         labeled_domain_pairs = rng.sample(pos, n) + rng.sample(neg, n)
 
     # The domain-instance pairs this split assigns, when the database carries
@@ -204,7 +233,7 @@ def load_embedding_data(
         domain_encoding_files = []
         interaction_encoding_files = []
         for feature in features:
-            embeddings_file = features_path / feature / f"{dataset}.h5"
+            embeddings_file = resolve_feature_file(features_path, feature, dataset)
             print(f"Loading feature file: {embeddings_file}")
             embeddings_file = stack.enter_context(h5py.File(embeddings_file, "r"))
             if feature in interaction_encodings:
@@ -458,10 +487,9 @@ class DDIModelTrainer(ABC):
         for test_split in args.test_splits:
             variant = variant_of(test_split)
             print(f"Predicting on test data ({test_split})...")
-            random.seed(args.seed)
             x_test, y_test, ddi_pairs = load_embedding_data(
                 args.features_path, args.features, args.ddi_path, test_split,
-                balance_classes=False, return_ddi_pairs=True,
+                balance_classes=False, return_ddi_pairs=True, seed=args.seed,
             )
 
             print(f"Test data shape: {x_test.shape}, Labels shape: {y_test.shape}")
@@ -494,23 +522,13 @@ class DDIModelTrainer(ABC):
     def _seed_everything(self, seed: int):
         """Seed every RNG the search and the estimators draw from.
 
-        `--seed` previously only reached `random.seed()` in the balance helpers,
-        so RandomizedSearchCV sampled a different set of candidates on every
-        run and the estimators themselves were unseeded — two identical runs
-        picked different hyperparameters and produced different metrics.
-        Subclasses additionally pass `self._seed` to RandomizedSearchCV and to
-        their estimator.
+        Subclasses additionally pass `self._seed` to RandomizedSearchCV, to
+        their estimator, and -- because joblib runs candidate fits in worker
+        *processes* that inherit no RNG state -- to a per-fit reseed hook.
+        See bin/determinism.py for what `seed_everything` covers.
         """
         self._seed = seed
-        random.seed(seed)
-        np.random.seed(seed)
-        try:
-            import torch
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-        except ImportError:
-            pass
+        seed_everything(seed)
 
     def train(self, args):
         self._seed_everything(args.seed)
@@ -531,10 +549,9 @@ class DDIModelTrainer(ABC):
         )
 
         print(f"Loading {args.val_split} data...")
-        random.seed(args.seed)
         x_opt, y_opt = load_embedding_data(
             args.features_path, args.features, args.ddi_path, args.val_split,
-            balance_classes=balance_opt_set,
+            balance_classes=balance_opt_set, seed=args.seed,
         )
         num_features = x_opt.shape[1]
         print(f"Validation data shape: {x_opt.shape}, Labels shape: {y_opt.shape}")
@@ -582,11 +599,10 @@ class DDIModelTrainer(ABC):
             best_params, best_balance, args, config, num_features
         )
 
-        random.seed(args.seed)
         x_opt, y_opt, opt_ddi_pairs = load_embedding_data(
             args.features_path, args.features, args.ddi_path, args.val_split,
             balance_classes=balance_opt_set,
-            return_ddi_pairs=True,
+            return_ddi_pairs=True, seed=args.seed,
         )
         assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
 

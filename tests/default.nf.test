@@ -20,11 +20,11 @@ nextflow_pipeline {
             assert workflow.success
             assertAll(
                 { assert snapshot(
-                    // pipeline versions.yml file for multiqc from which Nextflow version is removed because we test pipelines on multiple Nextflow versions
-                    removeNextflowVersion("$outputDir/pipeline_info/domainbenchmark_software_mqc_versions.yml"),
                     // All stable path name, with a relative path
                     stable_path,
-                    // All files with stable contents
+                    // All files with stable contents. Trained models and
+                    // predictions are in here: the run is seeded end to end
+                    // (bin/determinism.py), so a diff means a real change.
                     stable_content
                 ).match() }
             )

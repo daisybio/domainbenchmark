@@ -42,13 +42,6 @@ output:
           type: directory
           description: Per-split DDI CSV directory (train/validation/test* tables).
           pattern: "DDI"
-  versions:
-    - - ${task.process}:
-          type: string
-          description: The process the versions were collected from
-      - python:
-          type: string
-          description: Python interpreter version
 authors:
   - "@konstantinpelz"
 maintainers:

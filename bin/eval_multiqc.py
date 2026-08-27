@@ -124,7 +124,7 @@ def merge_data(old, new):
     New values take precedence if sample/metric overlap.
     """
     merged = {}
-    all_samples = set(old.keys()).union(new.keys())
+    all_samples = sorted(set(old.keys()).union(new.keys()))
     print(len(old.keys()), len(new.keys()), len(all_samples))
     for sample in all_samples:
         merged[sample] = {}
@@ -506,7 +506,7 @@ def get_old_dbnames(old_report_path) -> list[str]:
                             db_names.append(m.group(1))
             except Exception:
                 pass
-    return list(set(db_names))
+    return sorted(set(db_names))
 
 
 def write_multiqc_config(

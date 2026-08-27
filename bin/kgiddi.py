@@ -15,8 +15,11 @@ import sys
 
 
 import multiprocessing as mp
+import random
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
+
+from determinism import derive_seed
 
 # Force spawn-based workers. The default 'fork' start method has each worker
 # inherit the parent's entire memory image via copy-on-write; once workers
@@ -334,7 +337,9 @@ def network_expansion(
             + str(bicluster_cutoff)
             + "\n"
         )
-        f.writelines(debug_lines)
+        # Sorted: the lines were appended in worker-completion order, so this
+        # debug dump differed between runs even though the predictions did not.
+        f.writelines(sorted(debug_lines))
 
     # Compute fold enrichment
     fold = fold_enrichment(predicted_ddis, known_ddis, all_domains)
@@ -351,6 +356,7 @@ def preprocessing(
     all_pairs_shortest_path_length,
     out_dir,
     permutation=False,
+    seed=42,
 ):
 
     logging.info(f"Starting preprocessing, loading data from {db_path}")
@@ -438,7 +444,13 @@ def preprocessing(
         )
         all_proteins = list(protein_go_terms.keys())
         all_go_terms = list(protein_go_terms.values())
-        np.random.shuffle(all_go_terms)
+        # Seeded per split (`train`, `test_balanced`, ...) rather than from the
+        # global numpy RNG: the permutation control has to be reproducible, and
+        # keying on the split stem keeps train and test permutations distinct
+        # without depending on the order the splits happen to be processed in.
+        random.Random(derive_seed(seed, "permutation", Path(db_path).stem)).shuffle(
+            all_go_terms
+        )
         permuted_protein_go_terms = {
             protein: go_terms for protein, go_terms in zip(all_proteins, all_go_terms)
         }
@@ -640,7 +652,7 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold):
     return connected_components, group_ddi_chi2
 
 
-def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1):
+def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1, seed=42):
     """Train once, score every test split.
 
     `test_splits` maps variant -> output predictions path, e.g.
@@ -705,6 +717,7 @@ def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1):
             aps_paths,
             out_dir,
             permutation=permutation,
+            seed=seed,
         )
 
         # Precompute parameter-independent structures
@@ -777,6 +790,7 @@ def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1):
             threshold,
             permutation,
             threads,
+            seed,
         )
 
 
@@ -793,6 +807,7 @@ def score_test_split(
     threshold,
     permutation,
     threads,
+    seed=42,
 ):
     """Score one test split with parameters already chosen on the train split."""
     # Run preprocessing for test data
@@ -803,7 +818,13 @@ def score_test_split(
         pd_df_test,
         shared_go_domains_test,
     ) = preprocessing(
-        db_test, go_graph_nx, go_levels, aps_paths, out_dir, permutation=permutation
+        db_test,
+        go_graph_nx,
+        go_levels,
+        aps_paths,
+        out_dir,
+        permutation=permutation,
+        seed=seed,
     )
     gc.collect()
     log_resource_usage("After preprocessing test data")
@@ -907,7 +928,12 @@ def score_test_split(
 
     multiplier = sys.float_info.epsilon * 1000
     # Generate for each key, randomly positive/negative or no jitter
-    random_jitter = np.random.uniform(-multiplier, multiplier, size=len(ddi_actual))
+    # Seeded per variant: the jitter only breaks score ties for ROC plotting,
+    # but drawn from the global RNG it made every predicted_probability differ
+    # in its last bits between runs.
+    random_jitter = np.random.default_rng(
+        derive_seed(seed, "jitter", variant)
+    ).uniform(-multiplier, multiplier, size=len(ddi_actual))
     # If a value is < 0 or > 1 after adding jitter, set it to 0 or 1 respectively, to avoid issues with log scale in roc curve plotting
     for i, ((d1, d2), actual) in enumerate(ddi_actual.items()):
         predicted = (d1, d2) in predicted_ddis_test or (d2, d1) in predicted_ddis_test

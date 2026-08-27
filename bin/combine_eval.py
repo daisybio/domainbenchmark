@@ -581,7 +581,7 @@ def combined_roc_curves(roc_data, outdir):
             )
 
     data = []
-    for model in set(d["model"] for d in data_tmp):
+    for model in sorted({d["model"] for d in data_tmp}):
         model_curves = [d for d in data_tmp if d["model"] == model]
         tmp = {}
         for curve in model_curves:
@@ -625,7 +625,7 @@ def combined_pr_curves(pr_data, outdir):
                 {"name": model, "points": metrics[model], "model": model, "db": db_name}
             )
 
-    for model in set(d["model"] for d in data_tmp):
+    for model in sorted({d["model"] for d in data_tmp}):
         model_curves = [d for d in data_tmp if d["model"] == model]
         tmp = {}
         for curve in model_curves:

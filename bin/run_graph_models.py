@@ -8,6 +8,8 @@
 # the scoring loop fans out -- one predictions file per variant.
 
 import os
+
+from determinism import seed_everything
 from kgiddi import run_kgiddi
 from ddiparsimony import run_ddiparsimony
 
@@ -50,9 +52,17 @@ if __name__ == "__main__":
         "--threads", type=int, default=1,
         help="Number of worker threads/processes (from task.cpus).",
     )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Master RNG seed. Every randomised step derives a child seed from "
+             "it and its own stable identity (split name, iteration index), so "
+             "results do not depend on --threads or on worker scheduling.",
+    )
     args = parser.parse_args()
     if args.run_id:
         print(f"[run_graph_models] run_id={args.run_id}")
+
+    seed_everything(args.seed)
 
     os.makedirs(args.out_predictions_dir, exist_ok=True)
     test_splits = {
@@ -78,7 +88,10 @@ if __name__ == "__main__":
         f"parameters from {json_file}, output to {args.out_dir} and predictions "
         f"to {sorted(path for _, path in test_splits.values())}"
     )
-    runner(args.database, json_file, args.out_dir, test_splits, threads=args.threads)
+    runner(
+        args.database, json_file, args.out_dir, test_splits,
+        threads=args.threads, seed=args.seed,
+    )
 
     with open(f"{args.out_dir}/model.txt", "w") as f:
         f.write(f"Run {args.model} model using database {args.database}\n")

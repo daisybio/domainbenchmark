@@ -14,29 +14,12 @@
 **/ddi_report_data/llms-full.txt
 **/multiqc_plots/{svg,pdf,png}/*.{svg,pdf,png}
 
-# --- Trained models and everything derived from them ----------------------
-# Not bit-reproducible across runs: the NeuralNetwork search runs with
-# n_jobs > 1, and joblib spawns worker *processes* that do not inherit the
-# RNG state seeded from `--seed`, so per-candidate scores wobble and a
-# different hyperparameter set can win. Hashing these would also break on any
-# torch/sklearn bump or a different core count. The snapshot still asserts the
-# full output *inventory* via `stable_path`, plus the deterministic extraction
-# and graph-topology outputs below.
-**/nn_output/**
-**/rf_output/**
-**/graph_models/**
-**/*.pkl
-**/model_parameters.json
-**/predictions_*.parquet
-
-# Metric/curve/significance exports are computed from those predictions.
-**/source_accuracy.json
-**/*model_eval_metrics*
-**/*model_performance_heatmap*
-**/*combined_metrics_table*
-**/*combined_pairwise_significance*
-**/*combined_pr*
-**/*combined_roc*
-**/*source_accuracy_by_ddi_source*
+# Everything else -- trained models, predictions, metrics, curves -- is asserted
+# by content. It used to be excluded because two runs with the same --seed still
+# diverged; see bin/determinism.py for what closed that gap (fixed
+# PYTHONHASHSEED, sorted iteration instead of set order, a per-fit reseed hook
+# for joblib workers, seeded valid splits, single-stream cuML). If a library
+# bump legitimately moves the numbers, regenerate the snapshot rather than
+# re-adding exclusions here -- an exclusion would also hide a real regression.
 
 pipeline_info/*.{html,json,txt,yml}

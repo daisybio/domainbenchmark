@@ -11,7 +11,6 @@ process NEURAL_NETWORK {
     output:
         tuple val(meta), path("neural_network_${meta.combo_id}/predictions_*.parquet"), emit: predictions
         tuple val(meta), path("neural_network_${meta.combo_id}/model/"),               emit: model
-        path "versions.yml",                                                            emit: versions
 
     script:
         def output_base        = "neural_network_${meta.combo_id}"
@@ -31,13 +30,6 @@ process NEURAL_NETWORK {
             --test_splits ${test_splits} \\
             --out_model_dir ${output_model_dir} \\
             --seed ${params.seed}
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            torch: \$(python -c 'import torch; print(torch.__version__)')
-            scikit-learn: \$(python -c 'import sklearn; print(sklearn.__version__)')
-        END_VERSIONS
         """
 
     stub:
@@ -49,11 +41,6 @@ process NEURAL_NETWORK {
             touch ${output_base}/predictions_\${v}.parquet
         done
         touch ${output_base}/model/model_parameters.json
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            stub: true
-        END_VERSIONS
         """
 }
 
@@ -72,7 +59,6 @@ process NEURAL_NETWORK_EVALUATION {
 
     output:
         tuple val(meta), path("neural_network_${meta.combo_id}/predictions_*.parquet"), emit: predictions
-        path "versions.yml",                                                          emit: versions
 
     script:
         def output_base    = "neural_network_${meta.combo_id}"
@@ -90,13 +76,6 @@ process NEURAL_NETWORK_EVALUATION {
             --test_splits ${test_splits} \\
             --model_dir ${model_dir} \\
             --predict-only
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            torch: \$(python -c 'import torch; print(torch.__version__)')
-            scikit-learn: \$(python -c 'import sklearn; print(sklearn.__version__)')
-        END_VERSIONS
         """
 
     stub:
@@ -107,10 +86,5 @@ process NEURAL_NETWORK_EVALUATION {
         for v in ${variants}; do
             touch ${output_base}/predictions_\${v}.parquet
         done
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            stub: true
-        END_VERSIONS
         """
 }

@@ -158,7 +158,7 @@ CI and by `nf-test`.
 | `--machine_learning_features` | `aacomp,aaencode,prott5_*,esm3_*,esmc_*` | Feature encodings to compute. |
 | `--large_features` | `prott5_*,esm3_*,esmc_*` | Features routed to `process_gpu_large`. |
 | `--machine_learning_models` | `neural_network,random_forest` | ML models to run. |
-| `--seed` | `42` | Global RNG seed. |
+| `--seed` | `42` | Master RNG seed. Reaches every randomised step, including workers in a process pool -- see [Reproducibility](#reproducibility). |
 | `--allow_cpu_ml` | `false` | Let `RANDOM_FOREST` train with scikit-learn when no GPU is usable, instead of exiting 140 for a retry on another GPU node. For GPU-less machines (CI, laptops); the `test` profile sets it. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
 
@@ -177,10 +177,9 @@ For each database split processed, a subdirectory under `--outdir/<db_name>/`:
 │       ├── <split>_instances.csv  # the split's domain-instance pairs
 │       └── <split>_sources.csv    # domain pairs + provenance list
 ├── data/
-│   └── <db_name>/<feature>/
-│       ├── train.h5
-│       ├── validation.h5
-│       └── <test_split>.h5
+│   ├── <feature>__train.h5
+│   ├── <feature>__validation.h5
+│   └── <feature>__<test_split>.h5
 ├── nn_output/
 │   └── neural_network_<feature_combo>/
 │       ├── predictions_<variant>.parquet   # one per test split
@@ -215,6 +214,54 @@ metric reported; the DDI counts per source sit in the section description,
 together with a note for any model that scored less than the full source.
 
 A full description of each output is in [`docs/output.md`](docs/output.md).
+
+## Reproducibility
+
+Two runs of the same commit, on the same input, with the same `--seed` produce
+byte-identical DDI tables, feature files, trained models, predictions and
+metrics. The only outputs that differ are MultiQC's own report metadata
+(`ddi_report.html` and parts of `ddi_report_data/`), which embed a run
+timestamp, absolute work-dir paths and the MultiQC version.
+
+What that takes, beyond passing `--seed` around:
+
+- **`PYTHONHASHSEED=0`**, set for every task in the `env` scope of
+  `nextflow.config`. Python salts string hashing per interpreter, so iterating
+  a `set` of domain IDs gave a different order every run -- which reordered
+  training rows, the class-balancing draw, and the rows of a predictions
+  parquet. It cannot be fixed from inside Python: the salt is chosen before the
+  interpreter starts.
+- **`bin/determinism.py`**. `seed_everything(seed)` seeds `random`, `numpy` and
+  `torch`, turns off cuDNN autotuning, and asks torch for deterministic
+  kernels. `derive_seed(seed, *tokens)` gives a stable child seed for anything
+  that runs in a worker: a process pool inherits no RNG state, and a worker
+  must not be seeded from its completion order.
+- **Per-fit reseeding.** `RandomizedSearchCV` runs the neural-network
+  candidates with `n_jobs > 1`, in joblib worker *processes*. A skorch
+  `on_train_begin` callback reseeds inside the worker, which is the only point
+  a seed can still reach weight init, dropout masks and batch order.
+- **Single-stream cuML.** `RandomForestClassifier(n_streams=1)`: with more
+  streams the GPU forest builder reduces histograms in a nondeterministic
+  order, and `random_state` does not pin it. The CPU fallback used under
+  `--allow_cpu_ml` takes `n_jobs=1` for the same reason -- sklearn accumulates
+  per-tree probabilities under joblib, so `predict_proba` depends on thread
+  scheduling in its last bits. That is enough to move the MCC-tuned decision
+  threshold, and to perturb the scores the hyperparameter search ranks by.
+- **Sorted channel groups.** `groupTuple()` and `collect()` emit in
+  task-completion order, and that order became `eval_multiqc.py`'s argument
+  order -- which MultiQC writes straight into its JSON. Grouped lists are
+  sorted before they reach a script, which also keeps task hashes stable for
+  `-resume`.
+- **`PYTHONDONTWRITEBYTECODE=1`.** Tasks get `bin/` on PATH from the pipeline
+  directory itself, so they would otherwise write `__pycache__` back into it and
+  the pipeline directory would carry state between runs.
+
+`nf-test` asserts all of this: `tests/default.nf.test` snapshots the contents
+of the model and prediction files, so a run that stops being reproducible fails
+CI. If a library bump legitimately moves the numbers, regenerate the snapshot --
+do not add exclusions to `tests/.nftignore`, which would also hide real
+regressions. Graph models are disabled in the `test` profile (they are far too
+slow for CI), so their seeding is not covered by the snapshot.
 
 ## Profiles
 

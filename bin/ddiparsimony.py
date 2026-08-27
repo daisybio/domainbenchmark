@@ -138,7 +138,7 @@ def evaluate_reliability_test(
 
 
 def preprocessing(
-    db_path: Path, output_dir: Path, threads: int = 1
+    db_path: Path, output_dir: Path, threads: int = 1, seed: int = 42
 ) -> Tuple[
     List[Tuple[str, str]],
     np.ndarray,
@@ -247,6 +247,7 @@ def preprocessing(
             ddi_score,
             num_iterations=1000,
             max_workers=threads,
+            seed=seed,
         )
         np.save(rxm_path, random_x_matrix)
 
@@ -262,7 +263,12 @@ def preprocessing(
 
 
 def run_ddiparsimony(
-    database: str, params_file: str, out_dir: str, test_splits: dict, threads: int = 1
+    database: str,
+    params_file: str,
+    out_dir: str,
+    test_splits: dict,
+    threads: int = 1,
+    seed: int = 42,
 ):
     """Train once, score every test split.
 
@@ -317,7 +323,7 @@ def run_ddiparsimony(
             protein_domains,
             ppi_list,
             ddi_score,
-        ) = preprocessing(db_train, Path(out_dir), threads)
+        ) = preprocessing(db_train, Path(out_dir), threads, seed)
         import gc
 
         domain_pair_to_idx = {pair: idx for idx, pair in enumerate(domain_pairs)}
@@ -432,6 +438,7 @@ def run_ddiparsimony(
             params_json,
             out_dir,
             threads,
+            seed,
         )
 
 
@@ -444,11 +451,12 @@ def score_test_split(
     params_json,
     out_dir,
     threads,
+    seed=42,
 ):
     """Score one test split with the reliability/cutoff chosen on the train split."""
     # Preprocessing on test data
     domain_pairs, random_x_matrix, ddi_dict, protein_domains, ppi_list, ddi_score = (
-        preprocessing(db_test, Path(out_dir), threads)
+        preprocessing(db_test, Path(out_dir), threads, seed)
     )
     import gc
 

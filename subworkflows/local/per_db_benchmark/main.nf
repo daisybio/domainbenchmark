@@ -12,8 +12,7 @@
         EVAL_ONE  (scatter — one tiny JSON per prediction)
             ↓
         EVALUATION  (per (db, test variant) MultiQC reduce)
-    and emit one (meta, evaluation_dir) pair per (db, test variant) plus a
-    merged versions channel.
+    and emit one (meta, evaluation_dir) pair per (db, test variant).
 
     Training data (train + validation) is shared across a database's test
     variants: everything up to and including model fitting runs once per
@@ -83,13 +82,20 @@ workflow PER_DB_BENCHMARK {
 
         FEATURE_EXTRACTION(Channel.from(ml_features), db_ch)
 
-        // Group staged feature dirs back to one entry per DB.
-        feature_dirs_per_db = FEATURE_EXTRACTION.out.feature_dir
-            .map { meta, dir -> tuple(meta.db, dir) }
+        // Group the per-(feature, split) h5 files back to one entry per DB. The
+        // files are staged flat into `features/` by NN/RF; their
+        // `<feature>__<split>.h5` names carry the layout, so no process in
+        // between has to build a per-feature directory tree.
+        // Sorted for the same reason as the EVAL_ONE group below: the list is
+        // staged as NN/RF's `features/*` input, and a task's hash covers its
+        // input file order -- an unsorted group makes -resume re-run every
+        // model on the next launch even when nothing changed.
+        feature_files_per_db = FEATURE_EXTRACTION.out.h5
             .groupTuple()
-        // emits: tuple(db_id, [feature_dir_1, feature_dir_2, ...])
+            .map { db_id, files -> tuple(db_id, files.toSorted { a, b -> a.name <=> b.name }) }
+        // emits: tuple(db_id, [aacomp__train.h5, aacomp__validation.h5, ...])
 
-        // Key DDI outputs by db_id so we can join with feature_dirs_per_db.
+        // Key DDI outputs by db_id so we can join with feature_files_per_db.
         ddi_keyed = ddi_ch.map { meta, ddi_dir -> tuple(meta.id, meta, ddi_dir) }
 
         // ---------------------------------------------------------------
@@ -97,10 +103,10 @@ workflow PER_DB_BENCHMARK {
         // params.machine_learning_models and --skip)
         // ---------------------------------------------------------------
         nn_input_ch = nn_enabled ? ddi_keyed
-            .join(feature_dirs_per_db)
+            .join(feature_files_per_db)
             .combine(Channel.fromList(feature_combos.collect { [it] }))
             .combine(Channel.value(ml_config))
-            .map { _db_id, meta, ddi_dir, feature_dirs, combo, cfg ->
+            .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
                 def combo_id = combo.size() == 1 ? combo[0] : 'all'
                 def m = [
                     id      : "${meta.id}_neural_network_${combo_id}",
@@ -110,15 +116,15 @@ workflow PER_DB_BENCHMARK {
                     combo_id: combo_id,
                     tests   : meta.tests
                 ]
-                tuple(m, ddi_dir, feature_dirs, cfg)
+                tuple(m, ddi_dir, feature_files, cfg)
             } : Channel.empty()
         NEURAL_NETWORK(nn_input_ch)
 
         rf_input_ch = rf_enabled ? ddi_keyed
-            .join(feature_dirs_per_db)
+            .join(feature_files_per_db)
             .combine(Channel.fromList(feature_combos.collect { [it] }))
             .combine(Channel.value(rf_config))
-            .map { _db_id, meta, ddi_dir, feature_dirs, combo, cfg ->
+            .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
                 def combo_id = combo.size() == 1 ? combo[0] : 'all'
                 def m = [
                     id      : "${meta.id}_random_forest_${combo_id}",
@@ -128,7 +134,7 @@ workflow PER_DB_BENCHMARK {
                     combo_id: combo_id,
                     tests   : meta.tests
                 ]
-                tuple(m, ddi_dir, feature_dirs, cfg)
+                tuple(m, ddi_dir, feature_files, cfg)
             } : Channel.empty()
         RANDOM_FOREST(rf_input_ch)
 
@@ -201,6 +207,12 @@ workflow PER_DB_BENCHMARK {
         per_model_jsons_ch = EVAL_ONE.out.metrics
             .map { meta, j -> tuple("${meta.db}::${meta.variant}".toString(), j) }
             .groupTuple()
+            // groupTuple() emits in task-completion order. That list becomes
+            // eval_multiqc.py's --per_model_metrics argument order, and MultiQC
+            // writes its JSON in the order it was fed -- so without this sort
+            // the report bytes flip between runs depending on which model
+            // finished first. It also stabilises the task hash for -resume.
+            .map { key, jsons -> tuple(key, jsons.toSorted { a, b -> a.name <=> b.name }) }
 
         // One entry per (database, test variant). Train/validation splits are
         // shared, so only the test split differs between an entry pair.
@@ -231,18 +243,6 @@ workflow PER_DB_BENCHMARK {
             }
         EVALUATION(evaluation_input_ch)
 
-        // ---------------------------------------------------------------
-        // Versions roll-up
-        // ---------------------------------------------------------------
-        ch_versions = DDI_EXTRACTION.out.versions
-            .mix(FEATURE_EXTRACTION.out.versions)
-            .mix(NEURAL_NETWORK.out.versions)
-            .mix(RANDOM_FOREST.out.versions)
-            .mix(GRAPH_MODEL.out.versions)
-            .mix(EVAL_ONE.out.versions)
-            .mix(EVALUATION.out.versions)
-
     emit:
-        report   = EVALUATION.out.report   // tuple(meta, evaluation/)
-        versions = ch_versions             // path versions.yml
+        report = EVALUATION.out.report   // tuple(meta, evaluation/)
 }

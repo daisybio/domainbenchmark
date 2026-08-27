@@ -11,7 +11,6 @@ process RANDOM_FOREST {
     output:
         tuple val(meta), path("random_forest_${meta.combo_id}/predictions_*.parquet"), emit: predictions
         tuple val(meta), path("random_forest_${meta.combo_id}/model/"),               emit: model
-        path "versions.yml",                                                          emit: versions
 
     script:
         def output_base        = "random_forest_${meta.combo_id}"
@@ -34,12 +33,6 @@ process RANDOM_FOREST {
             --test_splits ${test_splits} \\
             --out_model_dir ${output_model_dir} \\
             --seed ${params.seed} ${allow_cpu}
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            scikit-learn: \$(python -c 'import sklearn; print(sklearn.__version__)')
-        END_VERSIONS
         """
 
     stub:
@@ -51,11 +44,6 @@ process RANDOM_FOREST {
             touch ${output_base}/predictions_\${v}.parquet
         done
         touch ${output_base}/model/model_parameters.json
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            stub: true
-        END_VERSIONS
         """
 }
 
@@ -72,7 +60,6 @@ process RANDOM_FOREST_EVALUATION {
 
     output:
         tuple val(meta), path("random_forest_${meta.combo_id}/predictions_*.parquet"), emit: predictions
-        path "versions.yml",                                                         emit: versions
 
     script:
         def output_base    = "random_forest_${meta.combo_id}"
@@ -90,12 +77,6 @@ process RANDOM_FOREST_EVALUATION {
             --test_splits ${test_splits} \\
             --model_dir ${model_dir} \\
             --predict-only
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            scikit-learn: \$(python -c 'import sklearn; print(sklearn.__version__)')
-        END_VERSIONS
         """
 
     stub:
@@ -106,10 +87,5 @@ process RANDOM_FOREST_EVALUATION {
         for v in ${variants}; do
             touch ${output_base}/predictions_\${v}.parquet
         done
-
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            stub: true
-        END_VERSIONS
         """
 }

@@ -56,13 +56,6 @@ output:
       - "random_forest_*/model/":
           type: directory
           description: Trained model artefacts.
-  versions:
-    - - ${task.process}:
-          type: string
-          description: The process the versions were collected from
-      - python:
-          type: string
-          description: Python interpreter version
 authors:
   - "@konstantinpelz"
 maintainers:

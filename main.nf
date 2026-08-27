@@ -13,11 +13,10 @@
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
-include { DOMAINBENCHMARK  } from './workflows/domainbenchmark'
 include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_domainbenchmark_pipeline'
 include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_domainbenchmark_pipeline'
-include { PER_DB_BENCHMARK } from './subworkflows/local/per_db_benchmark/main.nf'
-include { AGGREGATE_EVAL   } from './subworkflows/local/aggregate_eval/main.nf'
+include { PER_DB_BENCHMARK        } from './subworkflows/local/per_db_benchmark/main.nf'
+include { AGGREGATE_EVAL          } from './subworkflows/local/aggregate_eval/main.nf'
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     NAMED WORKFLOWS FOR PIPELINE
@@ -39,7 +38,6 @@ workflow DAISYBIO_DOMAINBENCHMARK {
     emit:
         per_db_report = PER_DB_BENCHMARK.out.report
         combined      = AGGREGATE_EVAL.out.report
-        versions      = PER_DB_BENCHMARK.out.versions.mix(AGGREGATE_EVAL.out.versions)
 }
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
