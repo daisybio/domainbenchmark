@@ -3,7 +3,7 @@ process DDI_EXTRACTION {
     label 'process_low'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
         tuple val(meta), path(database_dir)

@@ -159,6 +159,7 @@ CI and by `nf-test`.
 | `--large_features` | `prott5_*,esm3_*,esmc_*` | Features routed to `process_gpu_large`. |
 | `--machine_learning_models` | `neural_network,random_forest` | ML models to run. |
 | `--seed` | `42` | Global RNG seed. |
+| `--allow_cpu_ml` | `false` | Let `RANDOM_FOREST` train with scikit-learn when no GPU is usable, instead of exiting 140 for a retry on another GPU node. For GPU-less machines (CI, laptops); the `test` profile sets it. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
 
 Full schema with defaults, types, and descriptions: `nextflow_schema.json`.

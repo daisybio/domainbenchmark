@@ -86,6 +86,9 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             classifier, hyperparameters, n_iter=n_iter,
             n_jobs=config["jobs"], cv=cv_split, refit=False,
             verbose=2, scoring="average_precision",
+            # Without random_state the search samples a different subset of the
+            # grid on every run, so repeated runs pick different models.
+            random_state=self._seed,
         )
         gs.fit(x, y)
         return gs

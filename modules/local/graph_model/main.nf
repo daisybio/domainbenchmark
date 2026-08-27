@@ -3,7 +3,7 @@ process GRAPH_MODEL {
     label 'process_high'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
         tuple val(meta), path(database), path(model_json)

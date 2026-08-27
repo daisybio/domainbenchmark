@@ -3,7 +3,7 @@ process NEURAL_NETWORK {
     label 'process_gpu'
 
     conda "${projectDir}/environments/ml.yml"
-    container "docker://konstantinpelz/domainbenchmark-gpu:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.0"
 
     input:
         tuple val(meta), path('DDI'), path('features/*'), path('config.json')
@@ -65,7 +65,7 @@ process NEURAL_NETWORK_EVALUATION {
     errorStrategy 'ignore'
 
     conda "${projectDir}/environments/ml.yml"
-    container "docker://konstantinpelz/domainbenchmark-gpu:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.0"
 
     input:
         tuple val(meta), path('DDI'), path('features/*'), path('config.json'), path(prev_results)

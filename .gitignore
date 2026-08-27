@@ -215,3 +215,8 @@ run_eval_multiqc_single.sh
 # Claude
 .claude/
 .mcp.json
+
+# nf-test working directory + the feature-extraction cache that `-profile test`
+# writes next to the in-repo fixture databases.
+.nf-test/
+tests/data/databases/*/.cobinet_cache/

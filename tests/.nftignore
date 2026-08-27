@@ -1,10 +1,42 @@
 .DS_Store
-multiqc/multiqc_data/multiqc.parquet
-multiqc/multiqc_data/multiqc.log
-multiqc/multiqc_data/multiqc_data.json
-multiqc/multiqc_data/multiqc_sources.txt
-multiqc/multiqc_data/multiqc_software_versions.txt
-multiqc/multiqc_data/llms-full.txt
-multiqc/multiqc_plots/{svg,pdf,png}/*.{svg,pdf,png}
-multiqc/multiqc_report.html
+
+# --- MultiQC run metadata -------------------------------------------------
+# MultiQC writes its report + data dir as `ddi_report.html` / `ddi_report_data/`
+# (see `--filename` in modules/local/evaluation). These embed a run timestamp,
+# absolute work-dir paths and the MultiQC version, so they differ on every run
+# and machine.
+**/ddi_report.html
+**/ddi_report_data/multiqc.log
+**/ddi_report_data/multiqc.parquet
+**/ddi_report_data/multiqc_data.json
+**/ddi_report_data/multiqc_sources.txt
+**/ddi_report_data/multiqc_software_versions.txt
+**/ddi_report_data/llms-full.txt
+**/multiqc_plots/{svg,pdf,png}/*.{svg,pdf,png}
+
+# --- Trained models and everything derived from them ----------------------
+# Not bit-reproducible across runs: the NeuralNetwork search runs with
+# n_jobs > 1, and joblib spawns worker *processes* that do not inherit the
+# RNG state seeded from `--seed`, so per-candidate scores wobble and a
+# different hyperparameter set can win. Hashing these would also break on any
+# torch/sklearn bump or a different core count. The snapshot still asserts the
+# full output *inventory* via `stable_path`, plus the deterministic extraction
+# and graph-topology outputs below.
+**/nn_output/**
+**/rf_output/**
+**/graph_models/**
+**/*.pkl
+**/model_parameters.json
+**/predictions_*.parquet
+
+# Metric/curve/significance exports are computed from those predictions.
+**/source_accuracy.json
+**/*model_eval_metrics*
+**/*model_performance_heatmap*
+**/*combined_metrics_table*
+**/*combined_pairwise_significance*
+**/*combined_pr*
+**/*combined_roc*
+**/*source_accuracy_by_ddi_source*
+
 pipeline_info/*.{html,json,txt,yml}

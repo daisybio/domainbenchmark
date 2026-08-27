@@ -3,7 +3,7 @@ process RANDOM_FOREST {
     label 'process_gpu'
 
     conda "${projectDir}/environments/ml.yml"
-    container "docker://konstantinpelz/domainbenchmark-gpu:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.0"
 
     input:
         tuple val(meta), path('DDI'), path('features/*'), path('config.json')
@@ -19,6 +19,9 @@ process RANDOM_FOREST {
         // One trained model, scored against every test split of this database
         // (test_balanced + test_realistic, or a single test).
         def test_splits        = meta.tests.values().join(' ')
+        // Without --allow_cpu the script exits 140 when its CUDA smoke test
+        // fails, so Nextflow retries on a healthy GPU node.
+        def allow_cpu          = params.allow_cpu_ml ? '--allow_cpu' : ''
         """
         mkdir -p ${output_model_dir}
 
@@ -30,7 +33,7 @@ process RANDOM_FOREST {
             --out_predictions_dir ${output_base} \\
             --test_splits ${test_splits} \\
             --out_model_dir ${output_model_dir} \\
-            --seed ${params.seed}
+            --seed ${params.seed} ${allow_cpu}
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":
@@ -62,7 +65,7 @@ process RANDOM_FOREST_EVALUATION {
     label 'process_long'
 
     conda "${projectDir}/environments/ml.yml"
-    container "docker://konstantinpelz/domainbenchmark-gpu:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.0"
 
     input:
         tuple val(meta), path('DDI'), path('features/*'), path('config.json'), path(prev_results)

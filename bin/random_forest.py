@@ -18,21 +18,36 @@ from machine_learning import DDIModelTrainer, load_embedding_data
 _CUDA_RETRY_EXIT_CODE = 140
 
 
-def _probe_cuda_or_retry():
+def _probe_cuda(allow_cpu: bool) -> bool:
     """Run a 1-element GPU op to surface broken CUDA init before grid search.
 
     Without this, a node-local CUDA glitch (cudaErrorOperatingSystem from
     stale --nv bind / cgroup race) makes all GridSearchCV fits fail identically
     and sklearn swallows the exception behind "All N fits failed". We catch it
     here and exit 140 so the SLURM retry policy moves us to another node.
+
+    Returns True when the GPU is usable. With `allow_cpu` (set by
+    `--allow_cpu`, i.e. `params.allow_cpu_ml`) a failed probe returns False so
+    the caller trains with scikit-learn on the CPU instead — for GPU-less
+    machines like CI runners and laptops. Without it a failed probe still exits
+    140, so a broken GPU node is retried rather than silently downgraded.
     """
     try:
         import cupy as cp
         _ = cp.asarray([1.0], dtype=cp.float32) + 1.0
         cp.cuda.runtime.deviceSynchronize()
-    except Exception as exc:  # noqa: BLE001 — any CUDA-init failure is fatal here
+        return True
+    except Exception as exc:  # noqa: BLE001 — any CUDA-init failure counts
+        reason = f"{type(exc).__name__}: {exc}"
+        if allow_cpu:
+            print(
+                f"[random_forest] CUDA smoke test failed ({reason}). "
+                "--allow_cpu is set, training with scikit-learn on the CPU.",
+                file=sys.stderr,
+            )
+            return False
         print(
-            f"[random_forest] CUDA smoke test failed ({type(exc).__name__}: {exc}). "
+            f"[random_forest] CUDA smoke test failed ({reason}). "
             "Exiting with retry code so Nextflow reschedules on a different GPU node.",
             file=sys.stderr,
         )
@@ -97,8 +112,28 @@ class RandomForestTrainer(DDIModelTrainer):
     MODEL_NAME = "RandomForest"
     MODEL_FILE = "RandomForest.pkl"
 
-    def _pre_train_hook(self):
-        _probe_cuda_or_retry()
+    # Set by _pre_train_hook; the CPU path is only ever taken with --allow_cpu.
+    _use_gpu = True
+
+    def _pre_train_hook(self, args):
+        self._use_gpu = _probe_cuda(args.allow_cpu)
+
+    def _rf_class(self):
+        """cuML's RandomForestClassifier, or scikit-learn's on the CPU path.
+
+        The grid in `assets/RandomForest.json` (n_estimators, max_depth,
+        min_samples_split, min_samples_leaf, bootstrap) is accepted by both.
+        """
+        if self._use_gpu:
+            from cuml.ensemble import RandomForestClassifier
+            return RandomForestClassifier
+        from sklearn.ensemble import RandomForestClassifier
+        return RandomForestClassifier
+
+    def _rf_extra_kwargs(self):
+        # cuML parallelises across the GPU; sklearn needs to be told to use
+        # every core, since the search itself runs with n_jobs=1.
+        return {} if self._use_gpu else {"n_jobs": -1}
 
     def _get_balance_methods(self, hyperparameters):
         return hyperparameters.get("balance_method", ["none"])
@@ -113,14 +148,17 @@ class RandomForestTrainer(DDIModelTrainer):
         return classifier.predict_proba(x.astype(np.float32))[:, 1]
 
     def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
-        from cuml.ensemble import RandomForestClassifier
+        rf_class = self._rf_class()
         x = x.astype(np.float32)
         y = y.astype(np.int32)
-        classifier = RandomForestClassifier()
+        classifier = rf_class(random_state=self._seed, **self._rf_extra_kwargs())
         # n_jobs=1: GPU handles parallelism; parallel CV jobs risk OOM
         gs = RandomizedSearchCV(
             classifier, hyperparameters, n_iter=n_iter, n_jobs=1,
             cv=cv_split, refit=False, verbose=2, scoring="average_precision",
+            # Without random_state the search samples a different subset of the
+            # grid on every run, so repeated runs pick different models.
+            random_state=self._seed,
             # Surface the real exception on the first failed fit instead of
             # letting sklearn mask all N folds behind "All N fits failed".
             error_score="raise",
@@ -129,11 +167,13 @@ class RandomForestTrainer(DDIModelTrainer):
         return gs
 
     def _refit(self, best_params, best_balance, args, config, num_features):
-        from cuml.ensemble import RandomForestClassifier
+        rf_class = self._rf_class()
         x_train, y_train = self._load_train_data(
             args, best_balance, args.seed
         )
-        classifier = RandomForestClassifier(**best_params)
+        classifier = rf_class(
+            **best_params, random_state=self._seed, **self._rf_extra_kwargs()
+        )
         print("Refitting best parameter model on training data...")
         x_f32 = x_train.astype(np.float32)
         y_i32 = y_train.astype(np.int32)

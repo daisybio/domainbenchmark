@@ -96,6 +96,13 @@
                     "default": 42,
                     "description": "Global RNG seed (numpy / torch / cuML).",
                     "fa_icon": "fas fa-dice"
+                },
+                "allow_cpu_ml": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Let GPU-only ML models fall back to a CPU implementation instead of failing.",
+                    "help_text": "RANDOM_FOREST trains with cuML and normally exits with retry code 140 when its CUDA smoke test fails, so Nextflow reschedules the task onto a healthy GPU node. Set this on GPU-less machines (CI, laptops) to train with scikit-learn on the CPU instead. Leave it off for real runs: a CPU fit of the full grid is orders of magnitude slower, and the fallback would mask a broken GPU node.",
+                    "fa_icon": "fas fa-microchip"
                 }
             }
         },

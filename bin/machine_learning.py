@@ -381,7 +381,7 @@ class DDIModelTrainer(ABC):
     def _load_model(self, model_path: Path):
         """Deserialize a trained model from disk."""
 
-    def _pre_train_hook(self):
+    def _pre_train_hook(self, args):
         """Called before training starts. Override for e.g. CUDA probe."""
         pass
 
@@ -413,6 +413,13 @@ class DDIModelTrainer(ABC):
         argparser.add_argument("--model_dir", type=Path, required=False)
         argparser.add_argument("--predict-only", action="store_true")
         argparser.add_argument("--seed", type=int, default=42)
+        argparser.add_argument(
+            "--allow_cpu", action="store_true",
+            help="Fall back to a CPU implementation when no usable GPU is found "
+                 "instead of exiting with the Nextflow retry code. For GPU-less "
+                 "machines (CI, laptops) only — a CPU fit is far slower and would "
+                 "otherwise mask a broken GPU node.",
+        )
         argparser.add_argument(
             "--id", dest="run_id", default=None,
             help="Optional run ID (logged only).",
@@ -480,8 +487,34 @@ class DDIModelTrainer(ABC):
             clear_load_cache()
             gc.collect()
 
+    # Overwritten by _seed_everything(); kept as a default so subclasses can
+    # reference it on paths that never call train() (e.g. --predict-only).
+    _seed = 42
+
+    def _seed_everything(self, seed: int):
+        """Seed every RNG the search and the estimators draw from.
+
+        `--seed` previously only reached `random.seed()` in the balance helpers,
+        so RandomizedSearchCV sampled a different set of candidates on every
+        run and the estimators themselves were unseeded — two identical runs
+        picked different hyperparameters and produced different metrics.
+        Subclasses additionally pass `self._seed` to RandomizedSearchCV and to
+        their estimator.
+        """
+        self._seed = seed
+        random.seed(seed)
+        np.random.seed(seed)
+        try:
+            import torch
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except ImportError:
+            pass
+
     def train(self, args):
-        self._pre_train_hook()
+        self._seed_everything(args.seed)
+        self._pre_train_hook(args)
 
         with Path(args.config).open("r") as config_file:
             config = json.load(config_file)
