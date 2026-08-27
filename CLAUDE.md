@@ -9,17 +9,18 @@ DomainBenchmark is a Nextflow DSL2 pipeline for benchmarking domain-domain inter
 ## Common commands
 
 ```bash
-# full run across every database in the samplesheet
-nextflow run . --input assets/samplesheet.csv -profile slurm,singularity -resume
+# full run across every database in the samplesheet (cluster: executor/queues/
+# workDir/GPU clusterOptions all come from the -c config, not from this repo)
+nextflow run . --input assets/samplesheet.csv -c daisybio.config -profile apptainer,gpu,keep_work -resume
 
 # same, straight off a domainsplit output directory
-nextflow run . --input /path/to/domainsplit/results/databases -profile slurm,singularity -resume
+nextflow run . --input /path/to/domainsplit/results/databases -c daisybio.config -profile apptainer,gpu,keep_work -resume
 
 # stub run (smoke test)
 nextflow run . -profile test,singularity -stub-run
 
 # single-database run via direct param
-nextflow run . --input assets/samplesheet.csv -profile slurm,singularity --skip kgiddi,ddiparsimony
+nextflow run . --input assets/samplesheet.csv -c daisybio.config -profile apptainer,gpu,keep_work --skip kgiddi,ddiparsimony
 
 # lint
 nf-core pipelines lint --dir .
@@ -40,7 +41,7 @@ Python deps managed via conda — `environments/general.yml` (extraction/RF/grap
 - `subworkflows/local/aggregate_eval/main.nf` — runs `COMBINE_EVAL` across per-DB reports to produce `results/evaluation/ddi_report.html`.
 - `subworkflows/local/utils_nfcore_domainbenchmark_pipeline/main.nf` — nf-core boilerplate (initialise, completion) plus `discoverSplits()` / `datasetTuple()`, which turn a database directory into `meta.splits` / `meta.tests`.
 - `nextflow.config` — single source of truth for `db_list` (legacy), `graph_models`, `machine_learning_models`, `machine_learning_features`, `large_features`, `skip`, `out_dir`, profiles.
-- `conf/{base,slurm,test,test_full,modules}.config` — layered config. `conf/base.config` carries retry strategy and per-label resources.
+- `conf/{base,test,test_full,modules}.config` — layered config. `conf/base.config` carries retry strategy and per-label resources. There is deliberately no executor profile: executor, queue, `workDir` and GPU `clusterOptions` come from the institutional config passed with `-c` (e.g. `daisybio.config`), which keys on the `process_gpu` label. `conf/base.config` therefore must never mention a queue. NN/RF memory/time are sized per task from `params.large_features` in `conf/modules.config` (`withName` beats `withLabel`), which is what replaced the old `process_gpu_small`/`process_gpu_large` labels.
 - `assets/<ModelName>.json` — per-model hyperparameter grid + search config. Filename must match `model_name` and the Python script in `bin/`.
 - `modules/local/<stage>/main.nf` — Nextflow process defs (`ddi_extraction`, `feature_extraction`, `neural_network`, `random_forest`, `graph_model`, `evaluation`).
 - `bin/` — Python entrypoints invoked by modules (`run_models.py`, `random_forest.py`, `run_graph_models.py`, `kgiddi.py`, `ddiparsimony.py`, `extract_features.py`, `eval_one.py`, `eval_multiqc.py`, `combine_eval.py`, `load_data_gm.py`). Auto on `PATH` from Nextflow.
@@ -77,9 +78,10 @@ Do not re-add entries to `tests/.nftignore` to make a snapshot pass: that hides 
 
 ### Profiles
 - `standard`: local executor, conda enabled.
-- `slurm`: slurm executor, per-label resources via `conf/slurm.config`, singularity cache at `/nfs/scratch/singularity_cache`.
+- `apptainer` / `singularity` / `docker`: container engine, with a 2 h pull timeout (the GPU image is large).
+- `gpu`: adds `--nv` / `--gpus all`; on a cluster it is also the profile the institutional config keys on to send `process_gpu` tasks to the GPU queue.
 - `test` / `test_full`: minimal SQLite triplet under `tests/data/`, single feature.
-- `daisybio`: site-specific defaults.
+- `daisybio`: site-specific defaults from nf-core/configs. `daisybio.config` sets `cleanup = true`, so pair it with `keep_work` if you want `-resume` to work.
 
 Default DB paths in `nextflow.config` point at `/nfs/data/CoBiNet_Masterpraktikum/databases/...` — override via samplesheet for local runs.
 

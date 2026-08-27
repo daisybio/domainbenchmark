@@ -77,7 +77,7 @@ flowchart LR
 
 ```bash
 nextflow run . \
-    -profile <docker/singularity/conda>,slurm \
+    -profile <docker/apptainer/singularity/conda> \
     --input assets/samplesheet.csv \
     --outdir results
 ```
@@ -101,7 +101,7 @@ what domainsplit publishes:
 
 ```bash
 nextflow run . \
-    -profile <docker/singularity/conda>,slurm \
+    -profile <docker/apptainer/singularity/conda> \
     --input /path/to/domainsplit/results/databases \
     --outdir results
 ```
@@ -113,15 +113,26 @@ databases/
 └── external_test/   train, validation, test
 ```
 
-### Cluster (Slurm + Singularity)
+### Cluster
+
+This repo carries no executor profile. The executor, queues, work directory and
+GPU `clusterOptions` come from the institutional config passed with `-c`; on
+DaiSyBio that is `daisybio.config` (also available as a `daisybio` profile from
+[nf-core/configs](https://github.com/nf-core/configs)):
 
 ```bash
 nextflow run . \
-    -profile slurm,singularity \
+    -c daisybio.config \
+    -profile apptainer,gpu,keep_work \
     --input assets/samplesheet.csv \
     --outdir /nfs/scratch/cobinet/results \
     -resume
 ```
+
+`gpu` adds `--nv` to the container runtime and is what routes `process_gpu`
+tasks (NEURAL_NETWORK, RANDOM_FOREST) to the GPU queue. `keep_work` is
+important: `daisybio.config` sets `cleanup = true`, which deletes the work
+directory on a successful run and makes a later `-resume` start from scratch.
 
 ### Skipping stages
 
@@ -131,7 +142,8 @@ two parsimony graph models:
 
 ```bash
 nextflow run . \
-    -profile slurm,singularity \
+    -c daisybio.config \
+    -profile apptainer,gpu,keep_work \
     --input assets/samplesheet.csv \
     --skip "kgiddi,ddiparsimony,prott5_protein_domain_embeddings,esm3_protein_domain_embeddings"
 ```
@@ -269,9 +281,10 @@ slow for CI), so their seeding is not covered by the snapshot.
 |---|---|
 | `standard` | Local executor + conda. Default. |
 | `docker` | Local executor + docker. |
-| `singularity` | Local executor + singularity / apptainer. |
+| `singularity` | singularity container engine. |
+| `apptainer` | apptainer container engine. |
 | `conda` | Forces conda; disables docker / singularity. |
-| `slurm` | Slurm executor with GPU labels and retry-on-OOM. Pairs with `singularity` on the cluster. |
+| `gpu` | Adds `--nv` / `--gpus all` to the container runtime. On a cluster it is also what the institutional config keys on to send `process_gpu` tasks to the GPU queue. |
 | `test` | Tiny in-repo fixture for smoke tests and `nf-test`. |
 | `test_full` | Full-data CI run (large fixtures). |
 

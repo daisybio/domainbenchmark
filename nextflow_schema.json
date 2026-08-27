@@ -76,7 +76,7 @@
                     "type": "string",
                     "default": "prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
-                    "description": "Comma-separated list of features whose embedding dim makes ML / RF tasks need the heavy GPU label (process_gpu_large).",
+                    "description": "Comma-separated list of features whose embedding dim makes feature-extraction / NN / RF tasks need the heavy memory-time envelope (160 GB, 36 h) instead of the default one (40 GB, 12 h). Applied by the withName rules in conf/modules.config.",
                     "fa_icon": "fas fa-weight-hanging"
                 },
                 "modeljson": {
