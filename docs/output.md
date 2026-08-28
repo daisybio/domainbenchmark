@@ -32,6 +32,12 @@ fitting is shared across a database's test variants, so it sits directly under
   - `<feature>__<split>.h5`: one feature encoding for one split, keyed
     `h5[domain_id][instance_key]`. The flat name carries the layout; the ML
     modules stage the whole set into `features/` and resolve it by name.
+  - Features listed in `--published_features` produce nothing here. domainsplit
+    already exported them, once per run, and `--embeddings` points at that
+    directory; `VERIFY_EMBEDDINGS` checks each file against the split databases
+    and stages it as `features/<feature>.h5` without copying it into `results/`.
+    One file serves `train`, `validation` and every `test*` split of the
+    databases the same run produced.
 - `<db_name>/nn_output/neural_network_<combo>/` and
   `<db_name>/rf_output/random_forest_<combo>/`
   - `model/`: the fitted model plus `model_parameters.json` (chosen

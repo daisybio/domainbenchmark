@@ -30,6 +30,30 @@
                     "default": "./results",
                     "fa_icon": "fas fa-folder-open"
                 },
+                "embeddings": {
+                    "type": "string",
+                    "format": "directory-path",
+                    "exists": true,
+                    "description": "domainsplit's results/embeddings/ directory, holding one <model>_domain_embeddings.h5 per embedding model.",
+                    "help_text": "Required whenever --published_features is non-empty. These files are per-RUN, not per-split: domain.id is a surrogate integer that SUBSET_SPLIT_DB copies verbatim and PRUNE_UNREPRESENTED_DDIS deletes without renumbering, so one file serves every split database of the run that produced it -- and is silently wrong for any other run. VERIFY_EMBEDDINGS checks the pairing before any model is trained.",
+                    "fa_icon": "fas fa-vector-square"
+                },
+                "domainsplit_run": {
+                    "type": "string",
+                    "description": "Expected value of the embedding files' domainsplit_run root attribute; VERIFY_EMBEDDINGS fails on a mismatch.",
+                    "help_text": "domainsplit records its own workflow.sessionId there when exporting. Left unset, the embedding files are still required to agree with each other and to resolve the databases' domain instances structurally -- this only adds an explicit declaration of which run is expected.",
+                    "fa_icon": "fas fa-fingerprint"
+                },
+                "min_embedding_coverage": {
+                    "type": "number",
+                    "default": 0.5,
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Minimum fraction of a split's domain instances a published embedding file must resolve before the pairing is accepted.",
+                    "help_text": "A same-run file resolves close to 100% (domainsplit's exporter drops a handful of instances for --max-len or an OOM at batch size 1); a file from a foreign run resolves close to 0%, because the surrogate domain ids collide only by accident. The default sits far below any legitimate loss and far above that noise floor.",
+                    "fa_icon": "fas fa-percent",
+                    "hidden": true
+                },
                 "email": {
                     "type": "string",
                     "description": "Email address for completion summary.",
@@ -67,17 +91,25 @@
                 },
                 "machine_learning_features": {
                     "type": "string",
-                    "default": "dummy,aacomp,aaencode,prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
+                    "default": "dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of feature encodings to compute and feed into the ML / RF classifiers.",
                     "fa_icon": "fas fa-vector-square"
                 },
                 "large_features": {
                     "type": "string",
-                    "default": "prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
+                    "default": "esm3_embeddings,esmc_embeddings,prott5_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of features whose embedding dim makes feature-extraction / NN / RF tasks need the heavy memory-time envelope (160 GB, 36 h) instead of the default one (40 GB, 12 h). Applied by the withName rules in conf/modules.config.",
                     "fa_icon": "fas fa-weight-hanging"
+                },
+                "published_features": {
+                    "type": "string",
+                    "default": "esm3_embeddings,esmc_embeddings,prott5_embeddings",
+                    "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
+                    "description": "Comma-separated list of features read from --embeddings instead of being extracted from the split databases.",
+                    "help_text": "domainsplit embeds the cut domain sequence once per run and publishes one mean-pooled vector per domain instance, so these features skip FEATURE_EXTRACTION entirely and one file serves every split of the run. Entries only take effect if they also appear in --machine_learning_features. Requires --embeddings.",
+                    "fa_icon": "fas fa-file-import"
                 },
                 "modeljson": {
                     "type": "string",

@@ -128,16 +128,26 @@ def load_instance_pairs(ddi_path: Path, dataset: str):
 def resolve_feature_file(features_path: Path, feature: str, dataset: str) -> Path:
     """Locate one feature's h5 file for `dataset`.
 
-    Two layouts are accepted. Nextflow stages the extraction outputs flat, one
-    file per (feature, split), named `<feature>__<split>.h5` -- there is no
-    process in between reshaping them into per-feature directories any more. A
-    hand-built or pre-existing `<feature>/<split>.h5` tree still works, and is
-    tried first so an explicit directory layout always wins.
+    Two layouts, both flat in `features/` -- Nextflow stages every feature file
+    into one directory and the filename carries the layout.
+
+    `<feature>__<split>.h5` is what FEATURE_EXTRACTION writes: one file per
+    (feature, split), extracted from that split's own database.
+
+    `<feature>.h5` is a *per-run* file published by domainsplit and staged under
+    its feature name by VERIFY_EMBEDDINGS. One file serves every split of the
+    run, because `domain.id` is a surrogate integer that SUBSET_SPLIT_DB copies
+    verbatim into each split database. It is tried second so a split-specific
+    extraction always wins over the shared file.
+
+    (A `<feature>/<split>.h5` directory tree used to be accepted as well. The
+    STAGE_FEATURE_DIR process that built it is gone and nothing else ever wrote
+    one, so the branch only added a stat call per lookup.)
     """
-    nested = features_path / feature / f"{dataset}.h5"
-    if nested.exists():
-        return nested
-    return features_path / f"{feature}__{dataset}.h5"
+    per_split = features_path / f"{feature}__{dataset}.h5"
+    if per_split.exists():
+        return per_split
+    return features_path / f"{feature}.h5"
 
 
 def load_embedding_data(
@@ -231,27 +241,49 @@ def load_embedding_data(
     # Load embeddings and instantiate the domain pairs
     with ExitStack() as stack:
         domain_encoding_files = []
+        domain_encoding_names = []
         interaction_encoding_files = []
+        interaction_encoding_names = []
         for feature in features:
             embeddings_file = resolve_feature_file(features_path, feature, dataset)
             print(f"Loading feature file: {embeddings_file}")
             embeddings_file = stack.enter_context(h5py.File(embeddings_file, "r"))
             if feature in interaction_encodings:
                 interaction_encoding_files.append(embeddings_file)
+                interaction_encoding_names.append(feature)
             else:
                 domain_encoding_files.append(embeddings_file)
+                domain_encoding_names.append(feature)
+
+        # How much of the requested data each feature file actually carries.
+        #
+        # The loop below *skips* every pair and every instance combination it
+        # cannot resolve, and a published embedding file is keyed by
+        # `domain.id` -- a surrogate integer that means something different in
+        # every domainsplit run. A file from the wrong run therefore raises
+        # nothing at all: it resolves no key, every pair is skipped, and the
+        # result is an empty training set indistinguishable from a database
+        # that genuinely holds no data. Count what resolves so the failure can
+        # name the feature responsible instead of reporting "no data found".
+        pair_hits = {name: 0 for name in domain_encoding_names + interaction_encoding_names}
+        candidates_seen = 0
+        candidates_resolved = 0
 
         for domain_a, domain_b, interaction in labeled_domain_pairs:
             pair_found = True
             combined_domain_id = f"{domain_a}_{domain_b}"
-            for f in domain_encoding_files:
-                if domain_a not in f or domain_b not in f:
+            # No `break`: every file is probed even once the pair is known to be
+            # unusable, because the per-feature tally is the diagnostic.
+            for name, f in zip(domain_encoding_names, domain_encoding_files):
+                if domain_a in f and domain_b in f:
+                    pair_hits[name] += 1
+                else:
                     pair_found = False
-                    break
-            for f in interaction_encoding_files:
-                if combined_domain_id not in f:
+            for name, f in zip(interaction_encoding_names, interaction_encoding_files):
+                if combined_domain_id in f:
+                    pair_hits[name] += 1
+                else:
                     pair_found = False
-                    break
             if not pair_found:
                 # print(f"Skipping pair ({domain_a}, {domain_b}) as one of the domains is missing in embeddings.")
                 continue
@@ -291,6 +323,8 @@ def load_embedding_data(
             instance_combinations = sorted(
                 combo for combo in candidate_combinations if combination_available(combo)
             )
+            candidates_seen += len(candidate_combinations)
+            candidates_resolved += len(instance_combinations)
             if not instance_combinations:
                 continue
             proteins_a, proteins_b = zip(*instance_combinations)
@@ -351,9 +385,40 @@ def load_embedding_data(
             result_protein_pairs.extend(
                 np.array(instance_combinations)[nan_filter].tolist()
             )
+        # Assert the join resolved rather than assuming it. A feature that
+        # matched no domain pair at all is not "sparse coverage" -- it is a file
+        # keyed by something other than these databases' domain ids.
+        dead_features = sorted(name for name, hits in pair_hits.items() if hits == 0)
+        if dead_features and labeled_domain_pairs:
+            tally = ", ".join(
+                f"{name}: {pair_hits[name]}/{len(labeled_domain_pairs)}"
+                for name in sorted(pair_hits)
+            )
+            raise ValueError(
+                f"{dataset}: feature file(s) {', '.join(dead_features)} resolve "
+                f"none of the {len(labeled_domain_pairs)} labelled domain pairs "
+                f"({tally}). `domain.id` is a surrogate integer, so an embedding "
+                "file published by a different domainsplit run resolves nothing "
+                "while raising no error of its own. Check that --embeddings "
+                "points at the run that produced these databases."
+            )
+
+        if candidates_seen and not candidates_resolved:
+            raise ValueError(
+                f"{dataset}: every domain pair was found, but none of the "
+                f"{candidates_seen} candidate instance pairs resolved in the "
+                "feature files. The domain ids line up and the instance keys do "
+                "not -- the feature files and "
+                f"{dataset}_instances.csv disagree on "
+                "COALESCE(instance_id, 'r' || rowid)."
+            )
+
     if len(x) == 0:
         raise ValueError(
-            "No data found. Please check if the embeddings and DDI files are correct."
+            f"{dataset}: no usable rows. {candidates_resolved} instance pairs "
+            f"resolved out of {candidates_seen} candidates across "
+            f"{len(labeled_domain_pairs)} labelled domain pairs -- check the "
+            "DDI CSVs and the feature files."
         )
     x = np.concatenate(x).astype(np.float32)
     y = np.array(y).astype(np.float32)

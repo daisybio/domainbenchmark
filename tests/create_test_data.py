@@ -8,7 +8,12 @@ in seconds:
     <out>/external_test/  train, validation, test
 
 so `-profile test` exercises both the two-variant path (one training run
-scored against two test sets) and the single-test path.
+scored against two test sets) and the single-test path. Alongside it, the
+per-run embedding files domainsplit publishes:
+
+    <embeddings-out>/esm3_domain_embeddings.h5
+    <embeddings-out>/esmc_domain_embeddings.h5
+    <embeddings-out>/prott5_domain_embeddings.h5
 
 Everything is synthesised — no real database is needed, and the generator is
 deterministic (fixed seed), so re-running it produces byte-identical content
@@ -23,8 +28,15 @@ Deliberate properties the pipeline depends on:
   instance-level keys;
 * `ddi_split_membership` names the exact instance pairs of each split, which is
   what the ML loader instantiates;
-* embedding columns hold pickled numpy arrays in the shapes the encoders
-  expect: 2-D `(residues, dim)` per-residue, 1-D `(dim,)` per-domain.
+* the databases carry **no embedding BLOBs at all**. domainsplit embeds the
+  cut domain sequence outside the database now, so `protein.*_per_residue` and
+  `domain_protein_map.*_per_domain` are gone from the schema and the encoders
+  that read them are gone from `bin/features/`;
+* `domain.id` is 1..N in *every* split while `instance_id` is unique across
+  them -- exactly the shape that makes one published embedding file valid
+  across every split of a run and silently wrong across runs. The embedding
+  files are therefore written once, over the union of all splits, and carry the
+  `domainsplit_run` root attribute VERIFY_EMBEDDINGS checks.
 
 Usage:
 
@@ -32,16 +44,25 @@ Usage:
 """
 
 import argparse
-import pickle
+import hashlib
 import random
 import sqlite3
 from pathlib import Path
 
+import h5py
 import numpy as np
 
 AA = "ACDEFGHIKLMNPQRSTVWY"
 EMBED_DIM = 8
 SEED = 42
+
+# What domainsplit publishes under `results/embeddings/`, and the feature names
+# the benchmark maps them onto (`params.published_features`).
+EMBEDDING_MODELS = ["esm3", "esmc", "prott5"]
+# Stands in for domainsplit's `workflow.sessionId`. `-profile test` declares the
+# same value as `--domainsplit_run`, so the fixture covers both the structural
+# check and the declared-id check.
+FIXTURE_RUN_ID = "fixture-run-0001"
 
 # Per split: how many domain families, proteins, and DDI pairs to synthesise.
 N_DOMAINS = 12
@@ -68,9 +89,6 @@ CREATE TABLE protein (
     id INTEGER PRIMARY KEY,
     uniprot_id,
     sequence,
-    prott5_per_residue,
-    esm3_per_residue,
-    esmc_per_residue,
     UNIQUE(uniprot_id)
 );
 CREATE TABLE protein_go_terms(
@@ -87,7 +105,6 @@ CREATE TABLE domain_protein_map (
     domain_id REFERENCES domain ON DELETE CASCADE,
     protein_id REFERENCES protein ON DELETE CASCADE,
     domain_sequence, start_pos, end_pos,
-    esm3_per_domain, esmc_per_domain,
     instance_id, clan, taxon_id,
     UNIQUE(domain_id, protein_id, start_pos, end_pos)
 );
@@ -111,11 +128,6 @@ CREATE INDEX idx_ddi_split_membership_ddi_id ON ddi_split_membership (ddi_id);
 """
 
 
-def blob(rng, shape):
-    """Pickled numpy array, matching what the embedding encoders unpickle."""
-    return pickle.dumps(rng.standard_normal(shape).astype(np.float32))
-
-
 def sequence(rng, length):
     return "".join(rng.choice(list(AA), size=length))
 
@@ -136,11 +148,16 @@ def ddi_source(idx: int, negative: int):
     return pool[(idx // 2) % len(pool)]
 
 
-def build_split(path: Path, method: str, split: str, offset: int) -> None:
-    """Write one split database.
+def build_split(path: Path, method: str, split: str, offset: int) -> list:
+    """Write one split database; return its `[(domain_id, instance_key)]`.
 
     `offset` shifts the synthetic namespace so different splits describe
-    disjoint domain families and proteins — which is what a split is.
+    disjoint domain families and proteins — which is what a split is. Note what
+    it does *not* shift: `domain.id` is 1..N in every split, because it is a
+    surrogate integer domainsplit assigns per run and copies verbatim into each
+    subset. Only `instance_id` is globally unique. That is precisely why one
+    published embedding file serves every split of a run and resolves nothing
+    from another.
     """
     rng = np.random.default_rng(SEED + offset)
     pyrng = random.Random(SEED + offset)
@@ -162,17 +179,8 @@ def build_split(path: Path, method: str, split: str, offset: int) -> None:
     proteins = []
     for i in range(N_PROTEINS):
         seq = sequence(rng, 60)
-        proteins.append(
-            (
-                i + 1,
-                f"P{offset + i:05d}",
-                seq,
-                blob(rng, (len(seq), EMBED_DIM)),  # prott5_per_residue
-                blob(rng, (len(seq), EMBED_DIM)),  # esm3_per_residue
-                blob(rng, (len(seq), EMBED_DIM)),  # esmc_per_residue
-            )
-        )
-    conn.executemany("INSERT INTO protein VALUES (?, ?, ?, ?, ?, ?)", proteins)
+        proteins.append((i + 1, f"P{offset + i:05d}", seq))
+    conn.executemany("INSERT INTO protein VALUES (?, ?, ?)", proteins)
     conn.executemany(
         "INSERT INTO protein_go_terms VALUES (?, ?)",
         [(p[0], f"GO:{offset + p[0] + 500:07d}") for p in proteins],
@@ -215,8 +223,6 @@ def build_split(path: Path, method: str, split: str, offset: int) -> None:
                     protein_seq[start:end],
                     start,
                     end,
-                    blob(rng, (EMBED_DIM,)),  # esm3_per_domain
-                    blob(rng, (EMBED_DIM,)),  # esmc_per_domain
                     instance_id,
                     f"CL{domain_id:04d}",
                     "9606",
@@ -225,7 +231,7 @@ def build_split(path: Path, method: str, split: str, offset: int) -> None:
         instances_by_domain[domain_id] = instance_ids
 
     conn.executemany(
-        "INSERT INTO domain_protein_map VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", dpm_rows
+        "INSERT INTO domain_protein_map VALUES (?, ?, ?, ?, ?, ?, ?, ?)", dpm_rows
     )
 
     # ---- DDIs + split membership ----------------------------------------
@@ -271,6 +277,9 @@ def build_split(path: Path, method: str, split: str, offset: int) -> None:
         f"{len(dpm_rows)} instances, {len(ddi_rows)} DDIs, "
         f"{len(membership_rows)} membership rows"
     )
+    # `COALESCE(instance_id, 'r' || rowid)` -- every fixture row has an
+    # instance_id, so the key is the instance_id itself.
+    return [(str(row[0]), str(row[5])) for row in dpm_rows]
 
 
 # dataset -> its splits. `random` has an internal test set and therefore two
@@ -281,6 +290,48 @@ DATASETS = {
 }
 
 
+def write_embedding_file(path: Path, model: str, instances) -> None:
+    """One `<model>_domain_embeddings.h5`, in domainsplit's published layout.
+
+    `h5[str(domain_id)][instance_key]` -> one mean-pooled fp16 vector, plus the
+    root attributes a consumer needs to tell which run the surrogate domain ids
+    belong to. Written over the union of every split, because the real export
+    runs once per run against the pruned master database.
+
+    Vectors are drawn from an RNG seeded on `(model, domain_id, instance_key)`
+    so the file is byte-identical however the fixture is generated, and so two
+    models never agree by accident. The key is digested with sha256 rather than
+    `hash()`: str hashing is salted per interpreter, so `hash()` would make the
+    fixture differ between generator runs.
+    """
+    if path.exists():
+        path.unlink()
+
+    domains = set()
+    with h5py.File(path, "w") as out_h5:
+        for domain_id, instance_key in sorted(set(instances)):
+            digest = hashlib.sha256(
+                f"{model}/{domain_id}/{instance_key}".encode()
+            ).digest()
+            rng = np.random.default_rng(SEED + int.from_bytes(digest[:8], "big"))
+            vector = rng.standard_normal(EMBED_DIM).astype(np.float16)
+            out_h5.create_dataset(f"{domain_id}/{instance_key}", data=vector)
+            domains.add(domain_id)
+
+        out_h5.attrs["model"] = model
+        out_h5.attrs["pooling"] = "mean"
+        out_h5.attrs["dim"] = EMBED_DIM
+        out_h5.attrs["dtype"] = "float16"
+        out_h5.attrs["key_layout"] = "{domain_id}/{instance_id}"
+        out_h5.attrs["n_domains"] = len(domains)
+        out_h5.attrs["n_instances"] = len(set(instances))
+        out_h5.attrs["domainsplit_run"] = FIXTURE_RUN_ID
+
+    print(
+        f"  {path.name}: {len(set(instances))} instances under {len(domains)} domains"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -289,11 +340,17 @@ def main():
         "--out", default="tests/data/databases",
         help="Output directory for the databases/ tree (default: tests/data/databases)",
     )
+    parser.add_argument(
+        "--embeddings-out", default=None,
+        help="Output directory for the published embedding files "
+             "(default: an `embeddings` directory beside --out)",
+    )
     args = parser.parse_args()
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    instances = []
     offset = 0
     for dataset, splits in DATASETS.items():
         print(f"\n[{dataset}]")
@@ -301,9 +358,19 @@ def main():
         dataset_dir.mkdir(parents=True, exist_ok=True)
         for split in splits:
             offset += 100
-            build_split(dataset_dir / f"{split}.sqlite3", dataset, split, offset)
+            instances += build_split(
+                dataset_dir / f"{split}.sqlite3", dataset, split, offset
+            )
 
-    print(f"\nWrote fixture to {out}")
+    embeddings_out = Path(args.embeddings_out) if args.embeddings_out else out.parent / "embeddings"
+    embeddings_out.mkdir(parents=True, exist_ok=True)
+    print("\n[embeddings]")
+    for model in EMBEDDING_MODELS:
+        write_embedding_file(
+            embeddings_out / f"{model}_domain_embeddings.h5", model, instances
+        )
+
+    print(f"\nWrote fixture to {out} and {embeddings_out}")
 
 
 if __name__ == "__main__":

@@ -35,8 +35,8 @@ test split is then reported as its own dataset — `random_balanced`,
 The pipeline runs the following stages:
 
 1. **DDI extraction** from the database split (`DDI_EXTRACTION`).
-2. **Feature extraction** for every requested encoding (`aacomp`,
-   `aaencode`, ProtT5 / ESM-3 / ESM-C protein and domain embeddings) —
+2. **Feature extraction** for every requested encoding computed here
+   (`aacomp`, `aaencode`, `dummy`) —
    parallelized per `(feature × split)`.
 3. **ML classifiers** trained on each feature individually plus one
    all-feature concatenation run (gated by `--machine_learning_models`):
@@ -52,6 +52,7 @@ flowchart LR
     subgraph "per database"
         ddi[DDI_EXTRACTION]
         feat[FEATURE_EXTRACTION]
+        ver[VERIFY_EMBEDDINGS]
         nn[NEURAL_NETWORK]
         rf[RANDOM_FOREST]
         gm[GRAPH_MODEL]
@@ -60,6 +61,8 @@ flowchart LR
     end
     db[(db_list)] --> ddi
     db --> feat --> nn & rf
+    db --> ver --> nn & rf
+    emb[(embeddings/)] --> ver
     db --> gm
     ddi --> nn & rf
     nn & rf & gm --> eo --> ev
@@ -108,10 +111,52 @@ nextflow run . \
 
 ```
 databases/
-├── random/          train, validation, test_balanced, test_realistic
-├── minimal_leakage/ train, validation, test_balanced, test_realistic
-└── external_test/   train, validation, test
+├── random/                    train, validation, test_balanced, test_realistic
+├── random_hcni/               same positives, high-confidence negatives
+├── minimal_leakage/           train, validation, test_balanced, test_realistic
+├── minimal_leakage_hcni/
+├── external_test/             train, validation, test
+└── external_test_hcni/
 ```
+
+A `<method>` / `<method>_hcni` pair is the same positive split with the
+negatives redrawn from a high-confidence candidate network, so the two runs are
+a controlled comparison in which only the negatives differ. Each is reported as
+its own dataset.
+
+### Embeddings
+
+domainsplit embeds the cut domain sequence once per run and publishes one
+mean-pooled vector per domain instance:
+
+```
+embeddings/
+├── esm3_domain_embeddings.h5
+├── esmc_domain_embeddings.h5
+└── prott5_domain_embeddings.h5
+```
+
+The `esm3_embeddings`, `esmc_embeddings` and `prott5_embeddings` features read
+those files instead of extracting anything, so `--embeddings` is required
+whenever they are enabled:
+
+```bash
+nextflow run . \
+    --input  /path/to/domainsplit/results/databases \
+    --embeddings /path/to/domainsplit/results/embeddings \
+    --outdir results
+```
+
+These files are per **run**, not per split. One file serves `train`,
+`validation` and every `test*` split of the databases the same run produced —
+and is silently wrong for any other run, because `domain.id` is a surrogate
+integer that domainsplit copies verbatim into each split and never renumbers.
+Nothing downstream would notice on its own: the loader skips instance pairs it
+cannot resolve, so a mismatched file yields zero training rows rather than an
+error. `VERIFY_EMBEDDINGS` therefore checks each file against the databases
+before any model is trained — structurally (the domain instances must actually
+resolve) and, if you pass `--domainsplit_run`, against the run id recorded in
+the file's root attributes.
 
 ### Cluster
 
@@ -145,7 +190,7 @@ nextflow run . \
     -c daisybio.config \
     -profile apptainer,gpu,keep_work \
     --input assets/samplesheet.csv \
-    --skip "kgiddi,ddiparsimony,prott5_protein_domain_embeddings,esm3_protein_domain_embeddings"
+    --skip "kgiddi,ddiparsimony,esm3_embeddings,esmc_embeddings,prott5_embeddings"
 ```
 
 ### Test profile (in-repo fixture)
@@ -154,9 +199,11 @@ nextflow run . \
 nextflow run . -profile test,singularity --outdir results-test
 ```
 
-The `test` profile points at a tiny in-repo SQLite triple under
-`tests/data/` and disables every heavy feature except `aacomp`. Used by
-CI and by `nf-test`.
+The `test` profile points at the tiny in-repo fixture under `tests/data/` --
+databases plus the published embedding files that go with them -- and runs one
+extracted feature (`aacomp`) and one published one (`esm3_embeddings`).
+Regenerate it with `python tests/create_test_data.py --out tests/data/databases`.
+Used by CI and by `nf-test`.
 
 ## Pipeline parameters
 
@@ -167,8 +214,11 @@ CI and by `nf-test`.
 | `--modeljson` | `${projectDir}/assets` | Directory of model hyperparameter JSONs. |
 | `--skip` | `''` | Comma-separated feature/model names to skip. |
 | `--graph_models` | `kgiddi,ddiparsimony,kgiddi_random` | Graph models to run. |
-| `--machine_learning_features` | `aacomp,aaencode,prott5_*,esm3_*,esmc_*` | Feature encodings to compute. |
-| `--large_features` | `prott5_*,esm3_*,esmc_*` | Features routed to `process_gpu_large`. |
+| `--machine_learning_features` | `dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings` | Feature encodings fed to the classifiers. |
+| `--published_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings` | Of those, the ones read from `--embeddings` instead of extracted from the databases. |
+| `--embeddings` | `null` | domainsplit's `results/embeddings/` directory. **Required** when `--published_features` is non-empty. |
+| `--domainsplit_run` | `null` | Expected `domainsplit_run` attribute of those files; `VERIFY_EMBEDDINGS` fails on a mismatch. |
+| `--large_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings` | Features routed to the heavy memory-time envelope. |
 | `--machine_learning_models` | `neural_network,random_forest` | ML models to run. |
 | `--seed` | `42` | Master RNG seed. Reaches every randomised step, including workers in a process pool -- see [Reproducibility](#reproducibility). |
 | `--allow_cpu_ml` | `false` | Let `RANDOM_FOREST` train with scikit-learn when no GPU is usable, instead of exiting 140 for a retry on another GPU node. For GPU-less machines (CI, laptops); the `test` profile sets it. |
@@ -300,6 +350,14 @@ Copy the template and implement your feature computation:
 4. If it needs GPU or large memory, also add it to `params.large_features`
 
 See `bin/features/new_feature.py` for the full contract and examples.
+
+For a feature that is *not* computed here — one domainsplit already published
+under `--embeddings` — there is no Python file to write. Add the name to both
+`params.machine_learning_features` and `params.published_features`, and put the
+HDF5 in the embeddings directory as either `<your_feature>.h5` or
+`<model>_domain_embeddings.h5`. It skips `FEATURE_EXTRACTION` entirely: the file
+is per *run*, not per split, so one copy serves `train`, `validation` and every
+`test*` split of the databases that run produced.
 
 ### New ML model
 

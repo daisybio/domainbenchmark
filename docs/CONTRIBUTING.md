@@ -153,6 +153,7 @@ Values assigned within these labels can be dynamically passed to a tool using th
 The pipeline provides copy-and-customize templates for the two most common extension points:
 
 - **Feature encodings:** `bin/features/new_feature.py` — implements the `extract_features(conn, out_file)` contract. Copy it, implement your computation, and add the feature name to `params.machine_learning_features` in `nextflow.config`. Add to `params.large_features` if it needs GPU/large memory.
+- **Published features:** a feature domainsplit already exported (the `*_embeddings` ones) has no Python file at all. Add the name to `params.machine_learning_features` *and* `params.published_features`, and put a `<feature>.h5` (or `<model>_domain_embeddings.h5`) under `--embeddings`. It skips `FEATURE_EXTRACTION`; `VERIFY_EMBEDDINGS` checks it against the databases first.
 - **ML models:** `bin/new_model.py` — subclasses `DDIModelTrainer` with hooks for grid search, refit, save/load. Copy it, implement the methods, create the matching `assets/<Model>.json`, and add a Nextflow process + subworkflow wiring.
 
 Both templates include step-by-step instructions in their docstrings.

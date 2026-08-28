@@ -17,7 +17,14 @@ Database schema (domain_protein_map table):
     start_pos       INT     -- domain start position in protein sequence
     end_pos         INT     -- domain end position in protein sequence
     instance_id     TEXT    -- domainsplit's domain-instance id (opaque, may be NULL)
-    (+ embedding columns like esm3_per_domain, esmc_per_residue, etc.)
+    clan            TEXT
+    taxon_id        TEXT
+
+There are no embedding BLOBs in the database. domainsplit embeds the cut domain
+sequence outside SQLite now and publishes the vectors as HDF5, so an
+embedding-backed feature is not written here at all -- it goes in
+`params.published_features` and is read straight from `--embeddings`. This
+template is for something you compute from the columns above.
 
 HDF5 output structure (required by downstream ML models):
     /<domain_id>/<instance_key> = numpy array of shape (feature_dim,)
