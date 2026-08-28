@@ -138,7 +138,11 @@ def evaluate_reliability_test(
 
 
 def preprocessing(
-    db_path: Path, output_dir: Path, threads: int = 1, seed: int = 42
+    db_path: Path,
+    output_dir: Path,
+    threads: int = 1,
+    seed: int = 42,
+    ppi_score_cutoff: int = 900,
 ) -> Tuple[
     List[Tuple[str, str]],
     np.ndarray,
@@ -152,9 +156,28 @@ def preprocessing(
     pd_df = load_pd_mapping(db_path)
     ppi_df = load_ppi(db_path)
 
-    # Reduce ppi_df to interactions with score > 900
-    logging.info("Filtering PPI data for high-confidence interactions...")
-    ppi_df = ppi_df[ppi_df["score"] > 900].reset_index(drop=True)
+    # Reduce ppi_df to high-confidence interactions
+    logging.info(
+        f"Filtering PPI data for high-confidence interactions (score >= {ppi_score_cutoff})..."
+    )
+    n_ppi_raw = len(ppi_df)
+    # Inclusive: STRING's "highest confidence" band is score >= 900, and the
+    # split databases store the band edge itself (every row is exactly 900),
+    # so a strict > silently emptied the whole interactome.
+    ppi_df = ppi_df[ppi_df["score"] >= ppi_score_cutoff].reset_index(drop=True)
+    # Same hazard as in kgiddi: an empty interactome does not raise here, it
+    # produces an all-negative prediction set that only fails downstream in
+    # EVAL_ONE (single-class y_true). Fail where the cause is visible.
+    if ppi_df.empty:
+        raise ValueError(
+            f"{db_path}: no PPIs left after the confidence filter "
+            f"(ppi_score_cutoff={ppi_score_cutoff}, {n_ppi_raw} PPI rows in the "
+            "database). Either this split database ships no "
+            "protein_protein_interaction rows, or its score column is on a "
+            "different scale than the cutoff assumes -- check "
+            "`SELECT count(*), min(score), max(score) FROM "
+            "protein_protein_interaction`."
+        )
 
     # Reduce ddi_df and pd_df based on proteins in ppi_df
     logging.info("Filtering DDI and PD mapping data based on PPI proteins...")
@@ -296,6 +319,9 @@ def run_ddiparsimony(
         pw_score_thresholds = params_json.get("parameter_list", {}).get(
             "pw_score_threshold", [0.7, 0.8, 0.9]
         )
+        ppi_score_cutoff = params_json.get("parameter_list", {}).get(
+            "ppi_score_cutoff", 900
+        )
 
     opt_param = params_json.get("optimized", {})
 
@@ -323,7 +349,7 @@ def run_ddiparsimony(
             protein_domains,
             ppi_list,
             ddi_score,
-        ) = preprocessing(db_train, Path(out_dir), threads, seed)
+        ) = preprocessing(db_train, Path(out_dir), threads, seed, ppi_score_cutoff)
         import gc
 
         domain_pair_to_idx = {pair: idx for idx, pair in enumerate(domain_pairs)}
@@ -439,6 +465,7 @@ def run_ddiparsimony(
             out_dir,
             threads,
             seed,
+            ppi_score_cutoff,
         )
 
 
@@ -452,11 +479,12 @@ def score_test_split(
     out_dir,
     threads,
     seed=42,
+    ppi_score_cutoff=900,
 ):
     """Score one test split with the reliability/cutoff chosen on the train split."""
     # Preprocessing on test data
     domain_pairs, random_x_matrix, ddi_dict, protein_domains, ppi_list, ddi_score = (
-        preprocessing(db_test, Path(out_dir), threads, seed)
+        preprocessing(db_test, Path(out_dir), threads, seed, ppi_score_cutoff)
     )
     import gc
 

@@ -159,6 +159,18 @@ def _read_predictions(path: str) -> pd.DataFrame:
         df = pd.read_parquet(path)
     else:
         df = pd.read_csv(path)
+    # A model that scored nothing writes a frame with no columns at all, and
+    # the bare KeyError that follows names the column rather than the file --
+    # useless when a dozen scatter tasks fail at once. Say which prediction
+    # file is malformed and how.
+    required = ("true_interaction", "predicted_interaction", "predicted_probability")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{path}: predictions are missing {missing} (columns present: "
+            f"{list(df.columns)}, {len(df)} rows). An empty frame here means the "
+            "model scored no domain pairs at all -- check that upstream task's log."
+        )
     df["true_interaction"] = df["true_interaction"].astype(np.int8)
     df["predicted_interaction"] = df["predicted_interaction"].astype(np.int8)
     df["predicted_probability"] = df["predicted_probability"].astype(np.float32)

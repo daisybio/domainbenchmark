@@ -18,7 +18,8 @@
             0.7,
             0.8,
             0.9
-        ]
+        ],
+        "ppi_score_cutoff": 900
     },
     "optimized": {
         "reliability_rate": 0.5,

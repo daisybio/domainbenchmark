@@ -357,6 +357,7 @@ def preprocessing(
     out_dir,
     permutation=False,
     seed=42,
+    ppi_score_cutoff=900,
 ):
 
     logging.info(f"Starting preprocessing, loading data from {db_path}")
@@ -365,9 +366,16 @@ def preprocessing(
     pd_df = load_pd_mapping(db_path)
     ppi_df = load_ppi(db_path)
     pgo_df = load_pgo(db_path)
+    pgo_df_raw = pgo_df
 
-    logging.info("Filtering PPI data for high-confidence interactions...")
-    ppi_df = ppi_df[ppi_df["score"] > 900].reset_index(drop=True)
+    logging.info(
+        f"Filtering PPI data for high-confidence interactions (score >= {ppi_score_cutoff})..."
+    )
+    n_ppi_raw = len(ppi_df)
+    # Inclusive: STRING's "highest confidence" band is score >= 900, and the
+    # split databases store the band edge itself (every row is exactly 900),
+    # so a strict > silently emptied the whole interactome.
+    ppi_df = ppi_df[ppi_df["score"] >= ppi_score_cutoff].reset_index(drop=True)
 
     # Reduce ddi_df and pd_df based on proteins in ppi_df
     logging.info("Filtering DDI and PD mapping data based on PPI proteins...")
@@ -403,6 +411,21 @@ def preprocessing(
     logging.info(
         f"After limiting: {len(ppi_df)} PPIs, {len(pd_df)} PD mappings, {len(pgo_df)} PGO mappings, {len(ddi_df)} DDIs"
     )
+    # An empty interactome is never a legitimate input: every downstream stage
+    # (union-find clustering, chi2, GO-guided expansion) degenerates silently
+    # and the crash only surfaces further down as `max() iterable argument is
+    # empty`. Name the split and the counts that produced it instead.
+    if len(ppi_df) == 0:
+        raise ValueError(
+            f"{db_path}: no PPIs left after the confidence filter "
+            f"(ppi_score_cutoff={ppi_score_cutoff}, {n_ppi_raw} PPI rows in the "
+            f"database, {len(proteins_in_ppi)} proteins survived, "
+            f"{len(pgo_filtered_df)} of {len(pgo_df_raw)} PGO rows matched). "
+            "Either this split database ships no protein_protein_interaction "
+            "rows, or its score column is on a different scale than the cutoff "
+            "assumes -- check `SELECT count(*), min(score), max(score) FROM "
+            "protein_protein_interaction`."
+        )
 
     pd_mapping = pd_df.groupby("uniprot_id")["pfam_id"].apply(set).to_dict()
 
@@ -631,6 +654,12 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold):
     logging.info(
         f"Number of functionally similar PPI clusters (Union-Find) for threshold {threshold}: {len(clusters)}"
     )
+    if not clusters:
+        raise ValueError(
+            f"build_ddi_network: the PPI network is empty (0 clusters) at "
+            f"threshold {threshold}, so there is nothing to score. This means "
+            "preprocessing returned no usable interactome for this split."
+        )
     logging.info(
         f"Biggest cluster has size: {max(len(c['members']) for c in clusters)}"
     )
@@ -680,6 +709,7 @@ def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1, seed
     chi_square_cutoffs = params_json["parameter_list"]["chi_square_cutoff"]
     bicluster_cutoffs = params_json["parameter_list"]["bicluster_cutoff"]
     threshold = params_json["parameter_list"]["threshold"]
+    ppi_score_cutoff = params_json["parameter_list"].get("ppi_score_cutoff", 900)
     permutation = params_json.get("permutation", False)
 
     logging.info(f"Data to load: {data_to_load}")
@@ -718,6 +748,7 @@ def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1, seed
             out_dir,
             permutation=permutation,
             seed=seed,
+            ppi_score_cutoff=ppi_score_cutoff,
         )
 
         # Precompute parameter-independent structures
@@ -791,6 +822,7 @@ def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1, seed
             permutation,
             threads,
             seed,
+            ppi_score_cutoff,
         )
 
 
@@ -808,6 +840,7 @@ def score_test_split(
     permutation,
     threads,
     seed=42,
+    ppi_score_cutoff=900,
 ):
     """Score one test split with parameters already chosen on the train split."""
     # Run preprocessing for test data
@@ -825,6 +858,7 @@ def score_test_split(
         out_dir,
         permutation=permutation,
         seed=seed,
+        ppi_score_cutoff=ppi_score_cutoff,
     )
     gc.collect()
     log_resource_usage("After preprocessing test data")
