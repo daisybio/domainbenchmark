@@ -24,7 +24,7 @@ from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
 from typing import List
 
 
-interaction_encodings = ["protdcal"]
+interaction_encodings = ["protdcal", "aacomp_interface", "bsa_residue", "sasa_structure", "adjacency_matrix", "clash_heavy_atoms", "clash_backbone_atoms", "k_closest_distance", "struct2graph"]
 
 # B3 / A2: bounded cache (was unbounded dict — held every (features, dataset,
 # samples_per_ddi, balance) variant of train/opt/test simultaneously, which on
@@ -183,7 +183,7 @@ def load_embedding_data(
                     pair_found = False
                     break
             if not pair_found:
-                # print(f"Skipping pair ({domain_a}, {domain_b}) as one of the domains is missing in embeddings.")
+                print(f"Skipping pair ({domain_a}, {domain_b}) as one of the domains is missing in embeddings.")
                 continue
 
             # get common proteins for both domains
@@ -207,6 +207,8 @@ def load_embedding_data(
                 possible_protein_combinations = get_domain_protein_combinations(
                     domain_encoding_files[0]
                 )
+            print(f"Initial possible protein combinations for ({domain_a}, {domain_b}): {len(possible_protein_combinations)}")
+
 
             # filter combinations to only those present in all files
             for f in interaction_encoding_files:
@@ -217,6 +219,8 @@ def load_embedding_data(
                 possible_protein_combinations.intersection_update(
                     get_domain_protein_combinations(f)
                 )
+
+            print(f"Filtered possible protein combinations for ({domain_a}, {domain_b}): {len(possible_protein_combinations)}")
 
             # Sample protein combinations without replacement; cap at min(K, available).
             sorted_combos = sorted(possible_protein_combinations)
@@ -236,6 +240,7 @@ def load_embedding_data(
             embeddings_a = []
             embeddings_b = []
             interaction_embeddings = []
+
 
             for emb in proteins_a:
                 embeddings_a.append(
@@ -257,6 +262,7 @@ def load_embedding_data(
                         + [np.empty(0)]
                     )
                 )
+            
             for emb in interactions:
                 interaction_embeddings.append(
                     np.concatenate(
@@ -267,7 +273,7 @@ def load_embedding_data(
                         + [np.empty(0)]
                     )
                 )
-
+            print(f"Embeddings shapes for ({domain_a}, {domain_b}): A={np.array(embeddings_a).shape}, B={np.array(embeddings_b).shape}, Interaction={np.array(interaction_embeddings).shape}")
             joined_embeddings = np.concatenate(
                 [embeddings_a, embeddings_b, interaction_embeddings], axis=1
             )

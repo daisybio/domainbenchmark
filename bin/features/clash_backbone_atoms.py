@@ -32,15 +32,34 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
-import Bio
+from Bio.PDB.NeighborSearch import NeighborSearch
 
 from .structure_utils import bytes_to_pdb_structure
-from Bio.PDB.SASA import ShrakeRupley
 
-def calculate_sasa_structure_level(domain):
-    sr = ShrakeRupley()
-    sr.compute(domain, level="C")  # Compute SASA at the structure level
-    return sum(atom.sasa for residue in domain for atom in residue)
+vdw_radii = {'C': 1.70, 'N': 1.55, 'O': 1.52}
+
+backbone_atoms = {'N', 'CA', 'C', 'O'}
+
+
+def calculate_clash_backbone_atoms(structure, overlap_tolerance = 0.4):
+    
+    chain_a_atoms = [a for a in structure[0]['A'].get_atoms() if a.element.strip() in backbone_atoms]
+    chain_b_atoms = [a for a in structure[0]['B'].get_atoms() if a.element.strip() in backbone_atoms]
+
+    ns = NeighborSearch(chain_b_atoms)
+
+    clashes = 0
+        
+    for atom_a in chain_a_atoms:
+        r_a = vdw_radii.get(atom_a.element.strip(), 1.7)
+        close_atoms = ns.search(atom_a.coord, r_a + max(vdw_radii.values()) - overlap_tolerance)
+        for atom_b in close_atoms:
+            r_b = vdw_radii.get(atom_b.element.strip(), 1.7)
+            dist = atom_a - atom_b
+            if dist < (r_a + r_b - overlap_tolerance):
+                clashes += 1
+
+    return clashes
 
 
 
@@ -55,23 +74,20 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     """
     domain_structure = pd.read_sql(
             """
-            SELECT id, domain1 as domain_id_a, domain2 as domain_id_b, protein1 as protein_id_a, protein2 as protein_id_b, source, pdb_gz
+            SELECT domain_id_a, domain_id_b, protein_id_a, protein_id_b, source, pdb_gz
             FROM domain_structure;
             """,
             conn,
         )
-
-    if domain_structure.empty:
-        print("Warning: No entries found in domain_structure table. Skipping feature extraction.")
-        return
     
+
     domain_structure["domain_id_a"] = domain_structure["domain_id_a"].astype(str)
     domain_structure["domain_id_b"] = domain_structure["domain_id_b"].astype(str)
     domain_structure["protein_id_a"] = domain_structure["protein_id_a"].astype(str)
     domain_structure["protein_id_b"] = domain_structure["protein_id_b"].astype(str)
 
 
-    for id, domain_id_a, domain_id_b, protein_id_a, protein_id_b, source, pdb_gz in domain_structure.itertuples(index=False):
+    for domain_id_a, domain_id_b, protein_id_a, protein_id_b, source, pdb_gz in domain_structure.itertuples(index=False):
         # Initialize feature vector with shape 1,
         feature_vector = np.zeros(1, dtype=np.float32)
         
@@ -80,11 +96,11 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
             print(f"Warning: Missing PDB file for ddi {domain_id_a}_{domain_id_b} in ppi {protein_id_a}_{protein_id_b}. Skipping.")
             continue
         
-        structure = bytes_to_pdb_structure(pdb_gz, f"ds_{id}")
+        structure = bytes_to_pdb_structure(pdb_gz)
 
-        sasa_structure = calculate_sasa_structure_level(structure)
+        clashes = calculate_clash_backbone_atoms(structure, 0.5)
 
-        feature_vector = np.array([sasa_structure], dtype=np.float32)
+        feature_vector = np.array([clashes], dtype=np.float32)
 
         def write_to_h5(domain_key, protein_key):
             # create a group for each pfam_id and put uniprot_id as a subgroup
@@ -102,4 +118,4 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
         write_to_h5(f"{domain_id_a}_{domain_id_b}", f"{protein_id_a}_{protein_id_b}")
         write_to_h5(f"{domain_id_b}_{domain_id_a}", f"{protein_id_b}_{protein_id_a}")
         
-    print(f"sasa_structure: wrote {len(domain_structure)} entries")
+    print(f"clash_backbone_atoms: wrote {len(domain_structure)} entries")

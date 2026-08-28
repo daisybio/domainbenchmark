@@ -105,6 +105,11 @@
                     "default": 42,
                     "description": "Global RNG seed (numpy / torch / cuML).",
                     "fa_icon": "fas fa-dice"
+                },
+                "feature_registry": {
+                    "type": "object",
+                    "description": "List containing additional params for each feature encoding. Schema: feature: [variants: [suffix : suffix_value, params: [param1 : value1, param2 : value2, ...]]]",
+                    "fa_icon": "fa fa-list"                
                 }
             }
         },

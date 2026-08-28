@@ -98,7 +98,7 @@ workflow PER_DB_BENCHMARK {
 
         def ml_config = file(params.modeljson) / 'NeuralNetwork.json'
         def rf_config = file(params.modeljson) / 'RandomForest.json'
-        def svm_config = file(params.modeljson) / 'SVM_full.json'
+        def svm_config = file(params.modeljson) / 'SVM.json'
 
         // ---------------------------------------------------------------
         // DDI + Feature extraction (per-DB)

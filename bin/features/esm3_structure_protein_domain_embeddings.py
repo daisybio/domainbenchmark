@@ -9,7 +9,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     # export domain embeddings as hdf using h5py
     embeddings_chunks = pd.read_sql(
         """
-               SELECT domain_id, protein_id, start_pos, end_pos, esm3_structure_per_residue as embedding
+               SELECT domain_id, protein_id, start_pos, end_pos, esm3_per_residue_structure as embedding
                FROM domain_protein_map, protein
                WHERE protein_id = protein.id AND
                    embedding IS NOT NULL;

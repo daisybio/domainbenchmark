@@ -173,11 +173,16 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     """
     domain_structure = pd.read_sql(
         """
-        SELECT domain_id_a, domain_id_b, protein_id_a, protein_id_b, pdb_gz, source
+        SELECT id, domain_id_a, domain_id_b, protein_id_a, protein_id_b, pdb_gz, source
         FROM domain_structure;
         """,
         conn,
     )
+
+    if domain_structure.empty:
+            print("Warning: No entries found in domain_structure table. Skipping feature extraction.")
+            return
+    
 
 
     domain_structure["domain_id_a"] = domain_structure["domain_id_a"].astype(str)
@@ -188,10 +193,10 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
 
     encoding_prep = {}
 
-    for domain_id_a, domain_id_b, protein_id_a, protein_id_b, pdb_gz, source in domain_structure.itertuples(index=False):
+    for id, domain_id_a, domain_id_b, protein_id_a, protein_id_b, pdb_gz, source in domain_structure.itertuples(index=False):
         # Initialize feature vector with shape 20,
         
-        structure = bytes_to_pdb_structure(pdb_gz)
+        structure = bytes_to_pdb_structure(pdb_gz, f"ds_{id}")
 
         structA = structure[0]["A"]  # type: ignore[reportGeneralTypeIssues]
         structB = structure[0]["B"]  # type: ignore[reportGeneralTypeIssues]

@@ -147,11 +147,16 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     """
     domain_structure = pd.read_sql(
         """
-        SELECT domain_id_a, domain_id_b, protein_id_a, protein_id_b, source, pdb_gz
+        SELECT id, domain1 as domain_id_a, domain2 as domain_id_b, protein1 as protein_id_a, protein2 as protein_id_b, source, pdb_gz
         FROM domain_structure;
         """,
         conn,
     )
+
+    if domain_structure.empty:
+            print("Warning: No entries found in domain_structure table. Skipping feature extraction.")
+            return
+    
 
 
     domain_structure["domain_id_a"] = domain_structure["domain_id_a"].astype(str)
@@ -160,11 +165,11 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     domain_structure["protein_id_b"] = domain_structure["protein_id_b"].astype(str)
 
 
-    for domain_id_a, domain_id_b, protein_id_a, protein_id_b, source, pdb_gz in domain_structure.itertuples(index=False):
+    for id, domain_id_a, domain_id_b, protein_id_a, protein_id_b, source, pdb_gz in domain_structure.itertuples(index=False):
 
         feature_vector = np.zeros(20, dtype=np.float32)  # 20 amino acids
 
-        structure = bytes_to_pdb_structure(pdb_gz)
+        structure = bytes_to_pdb_structure(pdb_gz, f"ds_{id}")
 
         aacomp_interface = get_area_based_aa_composition(structure, *identifiy_interface_residues(structure))
         feature_vector = np.array([aacomp_interface[aa] for aa in "ACDEFGHIKLMNPQRSTVWY"], dtype=np.float32)        

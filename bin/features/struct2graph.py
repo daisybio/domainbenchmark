@@ -35,7 +35,10 @@ import pandas as pd
 import sqlite3
 from collections import defaultdict
 
-from structure_utils import bytes_to_pdb_structure, embed_fingerprints
+import torch
+
+
+from .structure_utils import ProteinProteinInteractionPrediction, bytes_to_pdb_structure
 
 AMINO_ACIDS = ['ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE','LEU','LYS','MET','PHE','PRO','PYL','SER','SEC','THR','TRP','TYR','VAL','ASX','GLX','XAA','XLE']
 AA = ['A','R','N','D','C','Q','E','G','H','I','L','K','M','F','P','O','S','U','T','W','Y','V']
@@ -43,19 +46,21 @@ AA3_1_DICT = {aa3: aa1 for aa3, aa1 in zip(AMINO_ACIDS, AA)}
 FINGERPRINT_DICT = defaultdict(lambda: len(FINGERPRINT_DICT))
 MAX_RESIDUES = 2000
 
+device = torch.device('cpu')
 
-def get_data_from_structure(structure):
+
+
+
+def get_data_from_chain(structure_chainlevel):
     amino = []
     group = []
     coords = []
     
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                if residue.get_resname() in AMINO_ACIDS or residue.get_resname() == 'FME':
-                    amino.append(residue.get_resname())
-                    group.append(residue.id[1])
-                    coords.append(residue['CA'].get_coord())
+    for residue in structure_chainlevel:
+        if residue.get_resname() in AMINO_ACIDS or residue.get_resname() == 'FME':
+            amino.append(residue.get_resname())
+            group.append(residue.id[1])
+            coords.append(residue['CA'].get_coord())
     
     return amino, group, coords
 
@@ -99,6 +104,29 @@ def create_amino_acids(acids):
     retval = np.array(retval)
     
     return(np.array(retval))
+
+
+
+def embed_fingerprints(fingerprint1, fingerprint2, adjacency1, adjacency2, model):
+    """
+    fingerprint: array-like of atom/residue indices, shape (n_nodes,)
+    adjacency:   array-like adjacency matrix, shape (n_nodes, n_nodes)
+    n_fingerprint: size of the fingerprint vocabulary (needed to size the
+                   embedding table consistently across calls)
+
+    Returns: numpy array, shape (dim,)
+    """
+    
+    protein1 = torch.LongTensor(fingerprint1)
+    adjacency1 = torch.FloatTensor(adjacency1)
+    protein2 = torch.LongTensor(fingerprint2)
+    adjacency2 = torch.FloatTensor(adjacency2)
+
+    inputs = (protein1.to(device), adjacency1.to(device), protein2.to(device), adjacency2.to(device))
+    y, att1, att2 = model.forward(inputs)
+
+    return y.detach().cpu().numpy()
+
 
 
 
@@ -150,8 +178,7 @@ def get_graph_from_struct(group_coords, group_amino):
 
 
 
-
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File, source: str) -> None:
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File) -> None:
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
@@ -162,12 +189,10 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, source: str)
     """
     domain_structure = pd.read_sql(
         """
-        SELECT domain_id_a, domain_id_b, protein_id_a, protein_id_b, pdb_gz
+        SELECT id, domain1 as domain_id_a, domain2 as domain_id_b, protein1 as protein_id_a, protein2 as protein_id_b, pdb_gz
         FROM domain_structure
-        WHERE source = ?;
         """,
-        conn,
-        params=(source,)
+        conn
     )
 
 
@@ -176,27 +201,25 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, source: str)
     domain_structure["protein_id_a"] = domain_structure["protein_id_a"].astype(str)
     domain_structure["protein_id_b"] = domain_structure["protein_id_b"].astype(str)
 
+    results = defaultdict(list)
 
-    for domain_id_a, domain_id_b, protein_id_a, protein_id_b, pdb_gz in domain_structure.itertuples(index=False):
+    for id, domain_id_a, domain_id_b, protein_id_a, protein_id_b, pdb_gz in domain_structure.itertuples(index=False):
         # Initialize feature vector with shape 20,
         feature_vector = np.zeros(20, dtype=np.float32)
         
-        structure = bytes_to_pdb_structure(pdb_gz)
+        structure = bytes_to_pdb_structure(pdb_gz, f"ds_{id}")
 
-        structA = structure[0]["A"]
-        structB = structure[0]["B"]
-
-        
-        results = {}
+        structA = structure[0]["A"]  # type: ignore[reportGeneralTypeIssues]
+        structB = structure[0]["B"]  # type: ignore[reportGeneralTypeIssues]
 
 
         for struct in [structA, structB]:
 
-            amino, group, coords = get_data_from_structure(structure)
+            amino, group, coords = get_data_from_chain(struct)
             group_coords, group_amino = group_by_coords(group, amino, coords)
             struct2graph, adjacency = get_graph_from_struct(group_coords, group_amino)
 
-            fingerprints = create_fingerprints(group_amino, struct2graph, radius=1)
+            fingerprints = create_fingerprints(np.array(group_amino), struct2graph, radius=1)
 
             results[(domain_id_a, domain_id_b, protein_id_a, protein_id_b)].append((fingerprints, adjacency))
 
@@ -204,12 +227,16 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, source: str)
     fingerprint_dict_length = len(FINGERPRINT_DICT)
     n_fingerprint = fingerprint_dict_length + 100
 
+    model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
+    model.eval()
+
     for key, value in results.items():
         domain_id_a, domain_id_b, protein_id_a, protein_id_b = key
-        fingerpint_a, adjacency_a, fp_dict_a = value[0]
-        fingerpint_b, adjacency_b, fp_dict_b = value[1]
+        # print(value)
+        fingerpint_a, adjacency_a = value[0]
+        fingerpint_b, adjacency_b = value[1]
         
-        feature_vector = embed_fingerprints(fingerpint_a, fingerpint_b, adjacency_a, adjacency_b, n_fingerprint)
+        feature_vector = embed_fingerprints(fingerpint_a, fingerpint_b, adjacency_a, adjacency_b, model)
 
 
         def write_to_h5(domain_key, protein_key):

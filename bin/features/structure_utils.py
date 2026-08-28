@@ -1,9 +1,14 @@
+import os
+import tempfile
+
 import numpy as np
 from collections import defaultdict
 import gzip
 
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.SASA import ShrakeRupley
+
+
 
 
 def calculate_sasa_residue_level(domain):
@@ -203,62 +208,21 @@ def encode_weighted_graph(adjacency_matrix, node_features=None, radius=1, normal
 
 
 
-def bytes_to_pdb_structure(blob: bytes) -> object:
+def bytes_to_pdb_structure(blob: bytes, name) -> object:
     """
     Decompress gzip-compressed and load into PDB structure object without writing to disk.
     """
 
     pdb_text = gzip.decompress(blob).decode("utf-8")
-    structure = read_pdb(pdb_text)
-    
-    
+    fd, path = tempfile.mkstemp(suffix=".pdb")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(pdb_text)
+    structure = PDBParser(QUIET=True).get_structure(f"{name}", path)
+    os.unlink(path)  # Delete the temporary file
+
     return structure
 
 
-
-"""
-Minimal single-protein embedding function (untrained weights,
-random projection). Import and call embed_fingerprints() directly
-from another script.
-"""
-
-import torch
-import torch.nn as nn
-
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
-
-
-
-
-# class _SingleProteinEncoder(nn.Module):
-#     def __init__(self, n_fingerprint, dim=DIM, layer_gnn=LAYER_GNN):
-#         super(_SingleProteinEncoder, self).__init__()
-#         self.layer_gnn = layer_gnn
-#         self.embed_fingerprint = nn.Embedding(n_fingerprint, dim)
-#         self.W_gnn = nn.ModuleList([nn.Linear(dim, dim) for _ in range(layer_gnn)])
-#         self.W_attention = nn.Linear(dim, dim)
-#         self.context = nn.Parameter(torch.zeros(dim, 1))
-
-#     def gnn(self, xs, A):
-#         for i in range(self.layer_gnn):
-#             hs = torch.relu(self.W_gnn[i](xs))
-#             xs = torch.matmul(A, hs)
-#         return xs
-
-#     def self_attention(self, h):
-#         u = torch.tanh(self.W_attention(h))
-#         scores = torch.matmul(u, self.context).view(-1)
-#         alpha = torch.softmax(scores, dim=0)
-#         s = torch.matmul(torch.t(h), alpha).view(1, -1)
-#         return s
-
-#     def forward(self, fingerprint, adjacency):
-#         x = self.embed_fingerprint(fingerprint)
-#         x = self.gnn(x, adjacency)
-#         return self.self_attention(x)
 
 
 MODEL_DEFAULTS = {
@@ -273,6 +237,12 @@ MODEL_DEFAULTS = {
 }
 
 
+
+
+# device = torch.device('cpu')
+
+import torch
+import torch.nn as nn
 class ProteinProteinInteractionPrediction(nn.Module):
     def __init__(self, n_fingerprint):
         super(ProteinProteinInteractionPrediction, self).__init__()
@@ -338,68 +308,70 @@ class ProteinProteinInteractionPrediction(nn.Module):
 
 
 
-# Single shared (untrained) encoder instance, reused across calls so
-# repeated calls in a loop don't reinitialize random weights each time.
-_encoder_cache = {}
-
-DIM = 20
-LAYER_GNN = 2
-
-def embed_fingerprints_single(fingerprint, adjacency, n_fingerprint, dim=DIM, layer_gnn=LAYER_GNN):
-    """
-    fingerprint: array-like of atom/residue indices, shape (n_nodes,)
-    adjacency:   array-like adjacency matrix, shape (n_nodes, n_nodes)
-    n_fingerprint: size of the fingerprint vocabulary (needed to size the
-                   embedding table consistently across calls)
-
-    Returns: numpy array, shape (dim,)
-    """
-    key = (n_fingerprint, dim, layer_gnn)
-    if key not in _encoder_cache:
-        model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
-        model.eval()
-        _encoder_cache[key] = model
-    model = _encoder_cache[key]
-
-    # Self-pairing: treat the same fingerprint and adjacency as both inputs to the model.
-    protein1 = torch.LongTensor(fingerprint)
-    adjacency1 = torch.FloatTensor(adjacency)
-    protein2 = torch.LongTensor(fingerprint)
-    adjacency2 = torch.FloatTensor(adjacency)
-
-    inputs = (protein1.to(device), adjacency1.to(device), protein2.to(device), adjacency2.to(device))
-    y, att1, att2 = model.forward(inputs)
-
-    return y.detach().cpu().numpy()
+# # Single shared (untrained) encoder instance, reused across calls so
+# # repeated calls in a loop don't reinitialize random weights each time.
+# 
 
 
 
-def embed_fingerprints(fingerprint1, fingerprint2, adjacency1, adjacency2, n_fingerprint, dim=DIM, layer_gnn=LAYER_GNN):
-    """
-    fingerprint: array-like of atom/residue indices, shape (n_nodes,)
-    adjacency:   array-like adjacency matrix, shape (n_nodes, n_nodes)
-    n_fingerprint: size of the fingerprint vocabulary (needed to size the
-                   embedding table consistently across calls)
+# def embed_fingerprints_single(fingerprint, adjacency, n_fingerprint, dim=DIM, layer_gnn=LAYER_GNN):
+#     """
+#     fingerprint: array-like of atom/residue indices, shape (n_nodes,)
+#     adjacency:   array-like adjacency matrix, shape (n_nodes, n_nodes)
+#     n_fingerprint: size of the fingerprint vocabulary (needed to size the
+#                    embedding table consistently across calls)
 
-    Returns: numpy array, shape (dim,)
-    """
-    key = (n_fingerprint, dim, layer_gnn)
+#     Returns: numpy array, shape (dim,)
+#     """
+#     key = (n_fingerprint, dim, layer_gnn)
+#     if key not in _encoder_cache:
+#         model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
+#         model.eval()
+#         _encoder_cache[key] = model
+#     model = _encoder_cache[key]
+
+#     # Self-pairing: treat the same fingerprint and adjacency as both inputs to the model.
+#     protein1 = torch.LongTensor(fingerprint)
+#     adjacency1 = torch.FloatTensor(adjacency)
+#     protein2 = torch.LongTensor(fingerprint)
+#     adjacency2 = torch.FloatTensor(adjacency)
+
+#     inputs = (protein1.to(device), adjacency1.to(device), protein2.to(device), adjacency2.to(device))
+#     y, att1, att2 = model.forward(inputs)
+
+#     return y.detach().cpu().numpy()
+
+
+
+# DIM = 20
+# LAYER_GNN = 2
+
+# def embed_fingerprints(fingerprint1, fingerprint2, adjacency1, adjacency2, n_fingerprint, dim=DIM, layer_gnn=LAYER_GNN):
+#     """
+#     fingerprint: array-like of atom/residue indices, shape (n_nodes,)
+#     adjacency:   array-like adjacency matrix, shape (n_nodes, n_nodes)
+#     n_fingerprint: size of the fingerprint vocabulary (needed to size the
+#                    embedding table consistently across calls)
+
+#     Returns: numpy array, shape (dim,)
+#     """
+#     key = (n_fingerprint, dim, layer_gnn)
     
-    if key not in _encoder_cache:
-        model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
-        model.eval()
-        _encoder_cache[key] = model
-    model = _encoder_cache[key]
+#     if key not in _encoder_cache:
+#         model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
+#         model.eval()
+#         _encoder_cache[key] = model
+#     model = _encoder_cache[key]
 
-    protein1 = torch.LongTensor(fingerprint1)
-    adjacency1 = torch.FloatTensor(adjacency1)
-    protein2 = torch.LongTensor(fingerprint2)
-    adjacency2 = torch.FloatTensor(adjacency2)
+#     protein1 = torch.LongTensor(fingerprint1)
+#     adjacency1 = torch.FloatTensor(adjacency1)
+#     protein2 = torch.LongTensor(fingerprint2)
+#     adjacency2 = torch.FloatTensor(adjacency2)
 
-    inputs = (protein1.to(device), adjacency1.to(device), protein2.to(device), adjacency2.to(device))
-    y, att1, att2 = model.forward(inputs)
+#     inputs = (protein1.to(device), adjacency1.to(device), protein2.to(device), adjacency2.to(device))
+#     y, att1, att2 = model.forward(inputs)
 
-    return y.detach().cpu().numpy()
+#     return y.detach().cpu().numpy()
 
 
 
