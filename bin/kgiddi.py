@@ -568,7 +568,7 @@ def preprocessing(
     return ddi_df, protein_distances, ppi_list, pd_df, shared_go_domains
 
 
-def build_ddi_network(protein_distances, ppi_list, pd_df, threshold):
+def build_ddi_network(protein_distances, ppi_list, pd_df, threshold, context=""):
 
     # Prepare list of all PPIs as sorted tuples, ordered by degree (number of interactions) descending
     # Ordering allows to cluster high-degree PPIs first, improving efficiency
@@ -663,6 +663,23 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold):
     logging.info(
         f"Biggest cluster has size: {max(len(c['members']) for c in clusters)}"
     )
+    # chi2 contrasts each cluster against everything outside it. With a single
+    # cluster the union-find partition swallows the whole interactome, so
+    # B (outside-with-DDI) and D (outside-without-DDI) are both 0, the
+    # contingency denominator (A+C)*(B+D)*(A+B)*(C+D) is 0, and
+    # compute_group_ddi_chi2 returns 0 for *every* DDI. Nothing is rankable and
+    # the failure only surfaces later as a ZeroDivisionError while normalising
+    # the scores. Name the degenerate partition here instead.
+    if len(clusters) == 1:
+        raise ValueError(
+            f"build_ddi_network{f' ({context})' if context else ''}: union-find "
+            f"collapsed all {len(ppi_list)} PPIs into a single cluster at "
+            f"GO-similarity threshold {threshold}. chi2 has no outside stratum "
+            "to contrast against, so every DDI would score 0 and KGIDDI can "
+            "rank nothing. The interactome is too small or too GO-uniform for "
+            "this method -- check the PPI count above and the number of "
+            "distinct protein_go_terms in this split."
+        )
     # PPI interactions as set of tuples
     ppi_interactions = set(ppi_list)
     # Protein to domain mapping as dict of sets
@@ -753,7 +770,7 @@ def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1, seed
 
         # Precompute parameter-independent structures
         connected_components, group_ddi_chi2 = build_ddi_network(
-            protein_distances, ppi_list, pd_df, threshold
+            protein_distances, ppi_list, pd_df, threshold, context=f"{database_path} train"
         )
 
         known_ddis = set(
@@ -880,7 +897,8 @@ def score_test_split(
     logging.info("----- I: Build DDI network -----")
     # Precompute parameter-independent structures for test data
     connected_components_test, group_ddi_chi2_test = build_ddi_network(
-        protein_distances_test, ppi_list_test, pd_df_test, threshold
+        protein_distances_test, ppi_list_test, pd_df_test, threshold,
+        context=f"{db_test} test_{variant}",
     )
 
     # For the selected chi_square_cutoff, get DDI edges
@@ -957,7 +975,22 @@ def score_test_split(
     }
     output_rows = []
     # Normalize chi2 scores for later roc curve plotting, using max chi2 score in test data
-    max_chi2 = max(chi2_scores.values()) if chi2_scores else 1
+    # A single DDI can legitimately score 0 (its contingency row or column is
+    # empty), but an all-zero set means the chi2 stratification degenerated and
+    # there is no scale to normalise against -- dividing by it raised
+    # ZeroDivisionError here. The single-cluster case is caught upstream in
+    # build_ddi_network; this guard names anything else that gets here.
+    max_chi2 = max(chi2_scores.values(), default=0.0)
+    if chi2_scores and max_chi2 <= 0:
+        raise ValueError(
+            f"{db_test} test_{variant}: all {len(chi2_scores)} selected DDIs "
+            "have chi2 == 0, so the scores cannot be normalised and every "
+            "predicted_probability would be identical. The chi2 contingency "
+            "tables degenerated -- check the cluster count logged by "
+            "build_ddi_network for this split."
+        )
+    if not chi2_scores:
+        max_chi2 = 1.0
     chi2_scores = {k: v / max_chi2 for k, v in chi2_scores.items()}
 
     multiplier = sys.float_info.epsilon * 1000
