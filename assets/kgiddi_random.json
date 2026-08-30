@@ -22,8 +22,7 @@
             0.8
         ],
         "threshold": 3,
-        "go_graph": "/nfs/data/CoBiNet_Masterpraktikum/go-basic.obo",
-        "ppi_score_cutoff": 900
+        "go_graph": "/nfs/data/CoBiNet_Masterpraktikum/go-basic.obo"
     },
     "permutation": true,
     "optimized": {

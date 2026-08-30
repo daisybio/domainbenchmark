@@ -53,6 +53,13 @@ if __name__ == "__main__":
         help="Number of worker threads/processes (from task.cpus).",
     )
     parser.add_argument(
+        "--ppi_score_cutoff", type=int, default=None,
+        help="Minimum STRING combined_score a PPI must reach to enter the "
+             "interactome, shared by every graph model so they all score the "
+             "same network. Overrides the model JSON's own value; when omitted "
+             "the JSON decides, and failing that DEFAULT_PPI_SCORE_CUTOFF.",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Master RNG seed. Every randomised step derives a child seed from "
              "it and its own stable identity (split name, iteration index), so "
@@ -91,6 +98,7 @@ if __name__ == "__main__":
     runner(
         args.database, json_file, args.out_dir, test_splits,
         threads=args.threads, seed=args.seed,
+        ppi_score_cutoff=args.ppi_score_cutoff,
     )
 
     with open(f"{args.out_dir}/model.txt", "w") as f:

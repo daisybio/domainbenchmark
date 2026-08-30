@@ -28,6 +28,7 @@ process GRAPH_MODEL {
             --out_predictions_dir ${meta.model} \\
             --test_splits ${test_splits} \\
             --threads ${task.cpus} \\
+            --ppi_score_cutoff ${params.ppi_score_cutoff} \\
             --seed ${params.seed}
         """
 

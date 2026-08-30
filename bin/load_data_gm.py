@@ -6,6 +6,16 @@ from pathlib import Path
 import os
 import sys
 
+# STRING's "medium confidence" band, which is also STRING's own default. Used
+# only when neither the pipeline (`params.ppi_score_cutoff`) nor a model JSON
+# names a value -- both graph models share it so a standalone invocation can
+# never silently score a different interactome than a pipeline run.
+#
+# Not 900 ("highest confidence"): a split database carries only its own
+# proteins' interactome, so that band can be a few percent of it. See the note
+# in kgiddi.py's preprocessing for the counts that forced this.
+DEFAULT_PPI_SCORE_CUTOFF = 400
+
 
 def check_file_existence(file):
     if not os.path.exists(file):

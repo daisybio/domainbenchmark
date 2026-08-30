@@ -89,6 +89,7 @@ from kgiddi_functions import (
     load_go_graph,
 )
 from load_data_gm import (
+    DEFAULT_PPI_SCORE_CUTOFF,
     load_ddi,
     load_pd_mapping,
     load_ppi,
@@ -357,7 +358,7 @@ def preprocessing(
     out_dir,
     permutation=False,
     seed=42,
-    ppi_score_cutoff=900,
+    ppi_score_cutoff=DEFAULT_PPI_SCORE_CUTOFF,
 ):
 
     logging.info(f"Starting preprocessing, loading data from {db_path}")
@@ -369,12 +370,21 @@ def preprocessing(
     pgo_df_raw = pgo_df
 
     logging.info(
-        f"Filtering PPI data for high-confidence interactions (score >= {ppi_score_cutoff})..."
+        f"Filtering PPI data by STRING confidence (score >= {ppi_score_cutoff})..."
     )
     n_ppi_raw = len(ppi_df)
-    # Inclusive: STRING's "highest confidence" band is score >= 900, and the
-    # split databases store the band edge itself (every row is exactly 900),
-    # so a strict > silently emptied the whole interactome.
+    # Inclusive because STRING's confidence bands are closed at their lower
+    # edge (>= 900 highest, >= 700 high, >= 400 medium), so a strict > drops
+    # every row sitting exactly on the boundary.
+    #
+    # The cutoff is a real knob, not a formality: a split database carries only
+    # the interactome of its own proteins, so the highest-confidence band can be
+    # a few percent of it. minimal_leakage/test_balanced holds 254 PPI rows, of
+    # which 8 clear 900 and 2 survive the GO filter below -- too few for
+    # build_ddi_network to find more than one union-find cluster, which makes
+    # chi2 undefined. Hence ppi_score_cutoff = 400 (STRING "medium confidence",
+    # its own default) in assets/kgiddi*.json. Re-probe cluster counts before
+    # raising it again.
     ppi_df = ppi_df[ppi_df["score"] >= ppi_score_cutoff].reset_index(drop=True)
 
     # Reduce ddi_df and pd_df based on proteins in ppi_df
@@ -698,13 +708,23 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold, context="")
     return connected_components, group_ddi_chi2
 
 
-def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1, seed=42):
+def run_kgiddi(
+    database_path, params_file, out_dir, test_splits,
+    threads=1, seed=42, ppi_score_cutoff=None,
+):
     """Train once, score every test split.
 
     `test_splits` maps variant -> output predictions path, e.g.
     {"balanced": ".../predictions_balanced.parquet"}. A database shipping both
     `test_balanced` and `test_realistic` shares one training phase -- the
     expensive part -- and only the scoring phase runs per variant.
+
+    `ppi_score_cutoff` is the pipeline-level `params.ppi_score_cutoff`
+    (`--ppi_score_cutoff` on the command line). When it is None the model JSON's
+    own `parameter_list.ppi_score_cutoff` is used, and failing that the STRING
+    "medium confidence" default of 400 -- so a hand-written JSON still works
+    standalone, but a pipeline run always drives every graph model from one
+    value.
     """
 
     db_train = Path(os.path.join(database_path, "train.sqlite3"))
@@ -726,7 +746,10 @@ def run_kgiddi(database_path, params_file, out_dir, test_splits, threads=1, seed
     chi_square_cutoffs = params_json["parameter_list"]["chi_square_cutoff"]
     bicluster_cutoffs = params_json["parameter_list"]["bicluster_cutoff"]
     threshold = params_json["parameter_list"]["threshold"]
-    ppi_score_cutoff = params_json["parameter_list"].get("ppi_score_cutoff", 900)
+    if ppi_score_cutoff is None:
+        ppi_score_cutoff = params_json["parameter_list"].get(
+            "ppi_score_cutoff", DEFAULT_PPI_SCORE_CUTOFF
+        )
     permutation = params_json.get("permutation", False)
 
     logging.info(f"Data to load: {data_to_load}")
@@ -857,7 +880,7 @@ def score_test_split(
     permutation,
     threads,
     seed=42,
-    ppi_score_cutoff=900,
+    ppi_score_cutoff=DEFAULT_PPI_SCORE_CUTOFF,
 ):
     """Score one test split with parameters already chosen on the train split."""
     # Run preprocessing for test data

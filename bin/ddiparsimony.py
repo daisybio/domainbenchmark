@@ -23,7 +23,13 @@ from ddiparsimony_functions import (
     compute_fp_rate,
     compute_random_x_matrix_parallel,
 )
-from load_data_gm import load_ppi, load_pd_mapping, load_ddi, check_file_existence
+from load_data_gm import (
+    DEFAULT_PPI_SCORE_CUTOFF,
+    check_file_existence,
+    load_ddi,
+    load_pd_mapping,
+    load_ppi,
+)
 
 
 # --- Training: grid search for best reliability and cutoff ---
@@ -142,7 +148,7 @@ def preprocessing(
     output_dir: Path,
     threads: int = 1,
     seed: int = 42,
-    ppi_score_cutoff: int = 900,
+    ppi_score_cutoff: int = DEFAULT_PPI_SCORE_CUTOFF,
 ) -> Tuple[
     List[Tuple[str, str]],
     np.ndarray,
@@ -156,14 +162,15 @@ def preprocessing(
     pd_df = load_pd_mapping(db_path)
     ppi_df = load_ppi(db_path)
 
-    # Reduce ppi_df to high-confidence interactions
     logging.info(
-        f"Filtering PPI data for high-confidence interactions (score >= {ppi_score_cutoff})..."
+        f"Filtering PPI data by STRING confidence (score >= {ppi_score_cutoff})..."
     )
     n_ppi_raw = len(ppi_df)
-    # Inclusive: STRING's "highest confidence" band is score >= 900, and the
-    # split databases store the band edge itself (every row is exactly 900),
-    # so a strict > silently emptied the whole interactome.
+    # Inclusive because STRING's confidence bands are closed at their lower
+    # edge (>= 900 highest, >= 700 high, >= 400 medium), so a strict > drops
+    # every row sitting exactly on the boundary. Kept identical to kgiddi's
+    # cutoff so both graph models score the same interactome -- see the longer
+    # note in bin/kgiddi.py for why 900 is too strict for a split database.
     ppi_df = ppi_df[ppi_df["score"] >= ppi_score_cutoff].reset_index(drop=True)
     # Same hazard as in kgiddi: an empty interactome does not raise here, it
     # produces an all-negative prediction set that only fails downstream in
@@ -292,12 +299,19 @@ def run_ddiparsimony(
     test_splits: dict,
     threads: int = 1,
     seed: int = 42,
+    ppi_score_cutoff: int | None = None,
 ):
     """Train once, score every test split.
 
     `test_splits` maps variant -> (split name, output predictions path). The
     reliability rate and pw-score cutoff are optimised on the train split once
     and reused for each test set.
+
+    `ppi_score_cutoff` is the pipeline-level `params.ppi_score_cutoff`
+    (`--ppi_score_cutoff` on the command line). When it is None the model JSON's
+    own `parameter_list.ppi_score_cutoff` is used, and failing that
+    DEFAULT_PPI_SCORE_CUTOFF -- KGIDDI resolves it identically, so both graph
+    models always score the same interactome.
     """
     db_train = Path(os.path.join(database, "train.sqlite3"))
     check_file_existence(db_train)
@@ -319,9 +333,10 @@ def run_ddiparsimony(
         pw_score_thresholds = params_json.get("parameter_list", {}).get(
             "pw_score_threshold", [0.7, 0.8, 0.9]
         )
-        ppi_score_cutoff = params_json.get("parameter_list", {}).get(
-            "ppi_score_cutoff", 900
-        )
+        if ppi_score_cutoff is None:
+            ppi_score_cutoff = params_json.get("parameter_list", {}).get(
+                "ppi_score_cutoff", DEFAULT_PPI_SCORE_CUTOFF
+            )
 
     opt_param = params_json.get("optimized", {})
 
@@ -479,7 +494,7 @@ def score_test_split(
     out_dir,
     threads,
     seed=42,
-    ppi_score_cutoff=900,
+    ppi_score_cutoff=DEFAULT_PPI_SCORE_CUTOFF,
 ):
     """Score one test split with the reliability/cutoff chosen on the train split."""
     # Preprocessing on test data
