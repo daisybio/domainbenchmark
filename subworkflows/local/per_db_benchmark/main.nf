@@ -36,8 +36,55 @@ def csvToList(s) {
     items*.trim().findAll { it && it.toLowerCase() != 'none' }
 }
 
-def publishedEmbeddingFile(feature) {
-    // Locate the file backing a published feature under `--embeddings`.
+def embeddingsDir(features) {
+    // The directory holding the published embedding files.
+    //
+    // `--embeddings` names it outright. Left unset it is derived, because
+    // domainsplit publishes both under one results directory:
+    //
+    //     <run>/results/databases/<db>/{train,validation,test*}.sqlite3
+    //     <run>/results/embeddings/<model>_domain_embeddings.h5
+    //
+    // so `--input <run>/results/databases` already says where the embeddings
+    // are. Only a directory input can be resolved this way: a samplesheet's
+    // `db_path` rows may point anywhere, including at several runs, and guessing
+    // from one of them would silently pair a database with a foreign run's
+    // embeddings -- exactly the failure VERIFY_EMBEDDINGS exists to catch.
+    if (params.embeddings) {
+        return file(params.embeddings, checkIfExists: true)
+    }
+
+    def named = features.join(', ')
+    def explain =
+        "Feature(s) ${named} are published by domainsplit rather than extracted " +
+        "from the split databases, so the pipeline needs its embeddings directory."
+    def remedy =
+        "Set --embeddings to domainsplit's results/embeddings/, or drop the " +
+        "feature(s) with --skip ${features.join(',')}."
+
+    def input_path = params.input ? file(params.input) : null
+    if (!input_path || !input_path.isDirectory()) {
+        error(
+            "${explain} --embeddings is not set, and it can only be derived from " +
+            "a directory --input (a samplesheet's rows can point at several " +
+            "runs). ${remedy}"
+        )
+    }
+
+    // Sibling of the databases/ directory, i.e. one level up from --input.
+    def candidate = input_path.getParent() / 'embeddings'
+    if (!candidate.exists() || !candidate.isDirectory()) {
+        error(
+            "${explain} --embeddings is not set and no 'embeddings' directory " +
+            "exists next to --input (looked for ${candidate}). ${remedy}"
+        )
+    }
+    log.info("[embeddings] --embeddings not set; using ${candidate} (sibling of --input)")
+    return candidate
+}
+
+def publishedEmbeddingFile(dir, feature) {
+    // Locate the file backing a published feature under the embeddings dir.
     //
     // Two names are accepted. `<feature>.h5` is the direct one. domainsplit
     // currently publishes `<model>_domain_embeddings.h5` while the feature is
@@ -45,15 +92,6 @@ def publishedEmbeddingFile(feature) {
     // "domain" in the middle is redundant now that the protein-level encoders
     // are gone, and this pipeline should not have to be re-released the day
     // domainsplit drops it.
-    if (!params.embeddings) {
-        error(
-            "Feature '${feature}' is published by domainsplit rather than " +
-            "extracted from the split databases, but --embeddings is not set. " +
-            "Point it at domainsplit's results/embeddings/ directory, or drop " +
-            "the feature with --skip ${feature}."
-        )
-    }
-    def dir = file(params.embeddings, checkIfExists: true)
     def candidates = [
         dir / "${feature}.h5",
         dir / "${feature - '_embeddings'}_domain_embeddings.h5",
@@ -62,7 +100,7 @@ def publishedEmbeddingFile(feature) {
     if (!found) {
         error(
             "No published embedding file for feature '${feature}' under " +
-            "${params.embeddings}. Looked for: " +
+            "${dir}. Looked for: " +
             candidates.collect { it.getName() }.join(', ') + '.'
         )
     }
@@ -96,18 +134,21 @@ workflow PER_DB_BENCHMARK {
         //
         // A *published* feature is not extracted from the split databases at
         // all: domainsplit embeds the cut domain sequence once per run and
-        // publishes one mean-pooled vector per domain instance. That file is
-        // per-RUN, not per-split -- `domain.id` is a surrogate integer that
-        // SUBSET_SPLIT_DB copies verbatim and PRUNE_UNREPRESENTED_DDIS never
-        // renumbers -- so one file serves train, validation and every test
-        // split of the databases that run produced. Fanning it out over
-        // (db x split) would schedule jobs to duplicate multi-gigabyte files
-        // that are byte-identical, which is what STAGE_FEATURE_DIR used to do
-        // and was deleted for.
+        // publishes one mean-pooled vector per domain instance, keyed
+        // `h5[pfam_id][instance_id]`. That file is per-RUN, not per-split -- it
+        // holds every domain the run saw and each split database is a subset of
+        // that -- so one file serves train, validation and every test split of
+        // the databases that run produced. Fanning it out over (db x split)
+        // would schedule jobs to duplicate multi-gigabyte files that are
+        // byte-identical, which is what STAGE_FEATURE_DIR used to do and was
+        // deleted for.
         def all_published        = csvToList(params.published_features)
         def published_features   = ml_features.findAll { all_published.contains(it) }
         def extracted_features   = ml_features.findAll { !all_published.contains(it) }
-        def published_files      = published_features.collect { publishedEmbeddingFile(it) }
+        def embeddings_dir       = published_features ? embeddingsDir(published_features) : null
+        def published_files      = published_features.collect {
+            publishedEmbeddingFile(embeddings_dir, it)
+        }
 
         def all_graph_models     = csvToList(params.graph_models)
         def graph_model_names    = all_graph_models.findAll { !skip_features.contains(it) }

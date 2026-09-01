@@ -23,6 +23,9 @@ from eval_multiqc_functions import (
     analyse_database,
     aggregate_per_model_metrics,
     paired_bootstrap_diff,
+    parse_dataset_order,
+    sort_by_dataset,
+    is_retired_block,
 )
 import logging
 
@@ -78,6 +81,16 @@ def parse_arguments():
         help="Path to previous MultiQC report to merge data from.",
     )
     p.add_argument(
+        "--mqc_order",
+        default=None,
+        help="Comma-separated dataset (run label) order for the report, e.g. "
+             "'random_balanced,minimal_leakage_hcni_realistic,external_test'. "
+             "Sections that exist once per dataset follow it. Not strict here: "
+             "one report only holds its own dataset plus whatever it merged from "
+             "--report, so a name that does not appear is not an error at this "
+             "stage -- combine_eval.py does enforce it.",
+    )
+    p.add_argument(
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only).",
     )
@@ -108,8 +121,14 @@ def copy_old_report_blocks(old_report_dir, out_dir):
     # @out_dir: directory to copy old report blocks into
     # Copies db JSON blocks from old report to new output directory
     for fn in os.listdir(old_report_dir):
-        if fn.endswith("_db_mqc.json"):  # only copy database analysis blocks
-            shutil.copy2(os.path.join(old_report_dir, fn), out_dir)
+        if not fn.endswith("_db_mqc.json"):  # only copy database analysis blocks
+            continue
+        # An older report still carries the retired distribution blocks, and
+        # MultiQC renders every block it finds regardless of the config order.
+        if is_retired_block(fn):
+            logging.info(f"[INFO] Skipping retired block from old report: {fn}")
+            continue
+        shutil.copy2(os.path.join(old_report_dir, fn), out_dir)
 
 
 def to_pairs(x, y) -> list[list[float]]:
@@ -135,29 +154,6 @@ def merge_data(old, new):
         if sample in new:
             merged[sample].update(new[sample])
     return merged
-
-
-def _write_distribution_block(data, metric, label, interaction_type, db_name, outdir):
-    block_id = f"{DB_PREFIX}{interaction_type}_{metric}_distribution"
-    block = {
-        "id": block_id,
-        "section_name": f"{interaction_type.upper()} {label} Distribution",
-        "plot_type": "box",
-        "pconfig": {
-            "id": block_id,
-            "title": f"{interaction_type.upper()} {label} Distribution",
-            "xlab": "Database",
-            "ylab": label,
-        },
-        "data": data,
-        "raw_data": data,
-    }
-    block = add_db_name_to_block(block, db_name)
-    with open(
-        os.path.join(outdir, f"{interaction_type}_{metric}_distribution_{db_name}_db_mqc.json"),
-        "w",
-    ) as f:
-        json.dump(block, f, indent=2)
 
 
 def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
@@ -205,42 +201,10 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
     ) as f:
         json.dump(db_block, f, indent=2)
 
-    # Create violin plots for network distributions
-    # Separate DDI and PPI for databases, each violinplot contains the three databases (train/validation/test), if available
-    degree_distributions = {}
-    betweenness_distributions = {}
-    clustering_distributions = {}
-
-    for network_type in ["ppi", "ddi"]:
-        # Initialize dicts
-        degree_distributions[network_type] = {}
-        betweenness_distributions[network_type] = {}
-        clustering_distributions[network_type] = {}
-        for db_type in db_analysis:  # db_type: train/validation/test
-            db_data = db_analysis[db_type]
-            degree_distributions[network_type][db_type] = db_data[
-                f"{network_type}_network_data"
-            ]["degree_distribution"]
-            betweenness_distributions[network_type][db_type] = db_data[
-                f"{network_type}_network_data"
-            ]["betweenness_centrality"]
-            clustering_distributions[network_type][db_type] = db_data[
-                f"{network_type}_network_data"
-            ]["clustering_coefficient"]
-
-    for interaction_type in ["ppi", "ddi"]:
-        _write_distribution_block(
-            degree_distributions[interaction_type], "degree", "Degree",
-            interaction_type, db_name, outdir,
-        )
-        _write_distribution_block(
-            betweenness_distributions[interaction_type], "betweenness", "Betweenness Centrality",
-            interaction_type, db_name, outdir,
-        )
-        _write_distribution_block(
-            clustering_distributions[interaction_type], "clustering", "Clustering Coefficient",
-            interaction_type, db_name, outdir,
-        )
+    # The degree / betweenness / clustering box-plot blocks that used to be
+    # written here are gone: two of the three were hardcoded placeholders and
+    # the third asked a question `database_analysis` above already answers.
+    # See `analyse_interaction_network` in eval_multiqc_functions.py.
 
 
 def load_old_json_block(old_report_dir, file_name_suffix, block_id):
@@ -510,13 +474,14 @@ def get_old_dbnames(old_report_path) -> list[str]:
 
 
 def write_multiqc_config(
-    outdir, old_report_path=None, db_name=None, same_db=False
+    outdir, old_report_path=None, db_name=None, same_db=False, dataset_order=None
 ) -> str:
     # Write MultiQC config file to specify module order
     # @outdir: output directory where MultiQC JSON files are located
     # @old_report_path: path to old MultiQC report (for merging)
     # @db_name: name of the database (used for block IDs)
     # @same_db: whether the database analysis is the same as in the old report
+    # @dataset_order: --mqc_order, applied to the per-dataset blocks
     # Returns path to written multiqc_config.yaml
     json_ids = []
     for fn in os.listdir(outdir):
@@ -565,9 +530,23 @@ def write_multiqc_config(
     pairwise_blocks = pick(r"_pairwise_significance$")
 
     db_blocks = pick(r"database_analysis")
-    degree_blocks = pick(r"_degree_distribution")
-    betweenness_blocks = pick(r"_betweenness_distribution")
-    clustering_blocks = pick(r"_clustering_distribution")
+
+    # Blocks that exist once per dataset carry the run label as an id suffix, so
+    # `--mqc_order` decides the order they are listed in. Everything else keeps
+    # the alphabetical order `all_ids` already has -- it is a function of the
+    # file names only, which is what keeps the report bytes reproducible.
+    #
+    # Not strict at this stage: one of these reports covers a single dataset
+    # (plus whatever it merged from --report), so most of the requested names
+    # legitimately do not appear. combine_eval.py sees them all and enforces it.
+    if dataset_order:
+        order = dataset_order
+        metric_blocks = sort_by_dataset(metric_blocks, order)
+        auc_ap_tbl = sort_by_dataset(auc_ap_tbl, order)
+        pairwise_blocks = sort_by_dataset(pairwise_blocks, order)
+        roc_blocks = sort_by_dataset(roc_blocks, order)
+        pr_blocks = sort_by_dataset(pr_blocks, order)
+        db_blocks = sort_by_dataset(db_blocks, order)
 
     ordered = (
         white_tbl
@@ -577,9 +556,6 @@ def write_multiqc_config(
         + roc_blocks
         + pr_blocks
         + db_blocks
-        + degree_blocks
-        + betweenness_blocks
-        + clustering_blocks
     )
 
     # Now add old report blocks that are not already present
@@ -862,7 +838,10 @@ def main():
         )
 
     # Part5: Config + run MultiQC
-    cfg_path = write_multiqc_config(args.out_dir, args.report, db_name, same_db=same_db)
+    cfg_path = write_multiqc_config(
+        args.out_dir, args.report, db_name, same_db=same_db,
+        dataset_order=parse_dataset_order(args.mqc_order),
+    )
     final_report = run_multiqc(args.out_dir, args.out_dir, cfg_path)
     fix_trailing_punctuation_in_report(final_report)
 

@@ -59,6 +59,10 @@ process EVALUATION {
         def jsons_list     = (per_model_jsons instanceof java.util.List ? per_model_jsons : [per_model_jsons])
             .collect { it.toString() }.toSorted().join(' ')
         def old_report_arg = old_report ? "--report ${old_report}" : ''
+        // Not strict at this stage -- see write_multiqc_config() in
+        // bin/eval_multiqc.py. Passed anyway so a merged --report keeps the same
+        // dataset order the combined report will use.
+        def mqc_order_arg  = params.mqc_order ? "--mqc_order '${params.mqc_order}'" : ''
         // One report per (database, test variant): the train and validation
         // splits are shared, only the test set differs.
         def test_split     = meta.split ?: 'test'
@@ -71,6 +75,7 @@ process EVALUATION {
             --db_name ${meta.run_label ?: meta.id} \\
             --test_split ${test_split} \\
             --out_dir evaluation/ \\
+            ${mqc_order_arg} \\
             ${old_report_arg}
         """
 
@@ -106,6 +111,10 @@ process COMBINE_EVAL {
     script:
         def ids_list = ids instanceof java.util.List ? ids : [ids]
         def ids_bash = ids_list.collect { "'${it}'" }.join(' ')
+        // This is the only stage that sees every dataset, so it is where
+        // --mqc_order is enforced: a name that matches nothing is a hard failure
+        // here, and a dataset the list forgot warns and lands alphabetically.
+        def mqc_order_arg = params.mqc_order ? "--mqc_order '${params.mqc_order}'" : ''
         """
         mkdir -p reports
         ids=(${ids_bash})
@@ -120,6 +129,7 @@ process COMBINE_EVAL {
 
         combine_eval.py \\
             --reports reports/*/evaluation \\
+            ${mqc_order_arg} \\
             --out_dir evaluation
         """
 

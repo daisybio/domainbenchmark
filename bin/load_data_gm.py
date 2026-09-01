@@ -17,6 +17,22 @@ import sys
 DEFAULT_PPI_SCORE_CUTOFF = 400
 
 
+def canonical_pair(domain_a, domain_b):
+    """`(lo, hi)` for a domain pair, so `domain_a` is always the smaller id.
+
+    A DDI is undirected, so the two orientations name the same thing and the
+    published `predictions_*.parquet` should not depend on which one a model's
+    internal iteration happened to produce. Every writer canonicalises here.
+
+    Plain string comparison is the right order for a Pfam accession: they are
+    `PF` plus a zero-padded five-digit number, so lexicographic and numeric order
+    coincide (`PF00099` < `PF00100`). It would not hold for a bare integer id --
+    another reason the surrogate `domain.id` is not what anything is keyed on.
+    """
+    a, b = str(domain_a), str(domain_b)
+    return (a, b) if a <= b else (b, a)
+
+
 def check_file_existence(file):
     if not os.path.exists(file):
         print(f"File {file} does not exist.")

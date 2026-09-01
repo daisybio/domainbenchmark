@@ -26,6 +26,7 @@ from ddiparsimony_functions import (
 from load_data_gm import (
     DEFAULT_PPI_SCORE_CUTOFF,
     check_file_existence,
+    canonical_pair,
     load_ddi,
     load_pd_mapping,
     load_ppi,
@@ -562,10 +563,13 @@ def score_test_split(
             predicted = int(pw_scores.get(pair, 0) <= best_cutoff)
         else:
             predicted = 0  # or handle as appropriate for your use case
+        # `pair` keys every lookup above; only the emitted orientation is
+        # canonicalised, so every predictions file in the run agrees.
+        out_a, out_b = canonical_pair(d1, d2)
         output_rows.append(
             {
-                "domain_a": d1,
-                "domain_b": d2,
+                "domain_a": out_a,
+                "domain_b": out_b,
                 "true_interaction": observed,
                 "predicted_interaction": predicted,
                 "predicted_probability": 1 - pw_scores.get(pair, 0),

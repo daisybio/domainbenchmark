@@ -23,6 +23,9 @@ fitting is shared across a database's test variants, so it sits directly under
 
 - `<db_name>/ddi/DDI/`
   - `<split>.csv`: `(domain_1, domain_2, interaction)` rows for one split.
+    `domain_1`/`domain_2` are **Pfam accessions**, not `domain.id`: that is a
+    per-run surrogate integer, so a report keyed on it could not be compared
+    between domainsplit runs. Everything downstream uses the same key.
   - `<split>_sources.csv`: the same rows plus each DDI's comma-joined
     provenance list, which drives the per-source accuracy section of the report.
   - `<split>_instances.csv`: the domain-instance pairs `ddi_split_membership`
@@ -30,7 +33,7 @@ fitting is shared across a database's test variants, so it sits directly under
     cross-product over every instance of each family.
 - `<db_name>/data/`
   - `<feature>__<split>.h5`: one feature encoding for one split, keyed
-    `h5[domain_id][instance_key]`. The flat name carries the layout; the ML
+    `h5[pfam_id][instance_key]`. The flat name carries the layout; the ML
     modules stage the whole set into `features/` and resolve it by name.
   - Features listed in `--published_features` produce nothing here. domainsplit
     already exported them, once per run, and `--embeddings` points at that
@@ -44,10 +47,14 @@ fitting is shared across a database's test variants, so it sits directly under
     hyperparameters, balance method, tuned decision threshold).
   - `predictions_<variant>.parquet`: one file per test split, scored by the one
     trained model. `<combo>` is a single feature name, or `all` for the
-    all-feature concatenation run.
+    all-feature concatenation run. One row per DDI, with `domain_a <= domain_b`:
+    the loader instantiates each pair in both orientations (the feature vector is
+    `concat(emb_a, emb_b)`, so the model needs both to stay symmetric) and the
+    two are averaged back into a single row here.
 - `<db_name>/graph_models/<model>/`
   - `model/`: graph-topology exports and the run record.
-  - `predictions_<variant>.parquet`: one file per test split.
+  - `predictions_<variant>.parquet`: one file per test split, same
+    `domain_a <= domain_b` convention as the ML ones.
 - `<db_name>/evaluation/<variant>/`
   - The per-(database, test variant) MultiQC report: `ddi_report.html`, its
     `ddi_report_data/`, and the JSON inputs under `multiqc_json/`.

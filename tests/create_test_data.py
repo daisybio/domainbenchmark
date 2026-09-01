@@ -24,7 +24,7 @@ Deliberate properties the pipeline depends on:
 * the schema is domainsplit's own (see its `INIT_DOMAINSPLIT_DB` module),
   including `domain_protein_map.instance_id` and `ddi_split_membership`;
 * one protein carries **two instances of the same domain family**, which
-  collide under the old `h5[domain_id][protein_id]` layout and only work with
+  collide under a `h5[domain][protein_id]` layout and only work with
   instance-level keys;
 * `ddi_split_membership` names the exact instance pairs of each split, which is
   what the ML loader instantiates;
@@ -32,11 +32,13 @@ Deliberate properties the pipeline depends on:
   cut domain sequence outside the database now, so `protein.*_per_residue` and
   `domain_protein_map.*_per_domain` are gone from the schema and the encoders
   that read them are gone from `bin/features/`;
-* `domain.id` is 1..N in *every* split while `instance_id` is unique across
-  them -- exactly the shape that makes one published embedding file valid
-  across every split of a run and silently wrong across runs. The embedding
-  files are therefore written once, over the union of all splits, and carry the
-  `domainsplit_run` root attribute VERIFY_EMBEDDINGS checks.
+* `domain.id` is 1..N in *every* split -- a per-run surrogate integer, which is
+  why nothing the pipeline writes is keyed on it. The published embedding files
+  are keyed `h5[pfam_id][instance_id]` like everything else and written once over
+  the union of all splits. Pfam accessions are offset-shifted per split, so the
+  splits stay disjoint in the key space too; `instance_id` is globally unique.
+  The `domainsplit_run` root attribute is written because the real exporter
+  writes it, not because anything reads it -- the pipeline stopped checking it.
 
 Usage:
 
@@ -149,15 +151,14 @@ def ddi_source(idx: int, negative: int):
 
 
 def build_split(path: Path, method: str, split: str, offset: int) -> list:
-    """Write one split database; return its `[(domain_id, instance_key)]`.
+    """Write one split database; return its `[(pfam_id, instance_key)]`.
 
     `offset` shifts the synthetic namespace so different splits describe
     disjoint domain families and proteins — which is what a split is. Note what
     it does *not* shift: `domain.id` is 1..N in every split, because it is a
     surrogate integer domainsplit assigns per run and copies verbatim into each
-    subset. Only `instance_id` is globally unique. That is precisely why one
-    published embedding file serves every split of a run and resolves nothing
-    from another.
+    subset. Which is why the returned key is the Pfam accession, not the id: it
+    is what the feature files, the DDI CSVs and the predictions are all keyed on.
     """
     rng = np.random.default_rng(SEED + offset)
     pyrng = random.Random(SEED + offset)
@@ -277,9 +278,10 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
         f"{len(dpm_rows)} instances, {len(ddi_rows)} DDIs, "
         f"{len(membership_rows)} membership rows"
     )
-    # `COALESCE(instance_id, 'r' || rowid)` -- every fixture row has an
-    # instance_id, so the key is the instance_id itself.
-    return [(str(row[0]), str(row[5])) for row in dpm_rows]
+    # `(domain.pfam_id, COALESCE(instance_id, 'r' || rowid))` -- every fixture
+    # row has an instance_id, so the second half is the instance_id itself.
+    pfam_by_id = {d[0]: d[1] for d in domains}
+    return [(str(pfam_by_id[row[0]]), str(row[5])) for row in dpm_rows]
 
 
 # dataset -> its splits. `random` has an internal test set and therefore two
@@ -293,12 +295,13 @@ DATASETS = {
 def write_embedding_file(path: Path, model: str, instances) -> None:
     """One `<model>_domain_embeddings.h5`, in domainsplit's published layout.
 
-    `h5[str(domain_id)][instance_key]` -> one mean-pooled fp16 vector, plus the
-    root attributes a consumer needs to tell which run the surrogate domain ids
-    belong to. Written over the union of every split, because the real export
-    runs once per run against the pruned master database.
+    `h5[pfam_id][instance_key]` -> one mean-pooled fp16 vector, plus the root
+    attributes the real exporter writes. Only `key_layout` is checked;
+    `domainsplit_run` is carried for fidelity with domainsplit's own output.
+    Written over the union of every split, because the real export runs once per
+    run against the pruned master database.
 
-    Vectors are drawn from an RNG seeded on `(model, domain_id, instance_key)`
+    Vectors are drawn from an RNG seeded on `(model, pfam_id, instance_key)`
     so the file is byte-identical however the fixture is generated, and so two
     models never agree by accident. The key is digested with sha256 rather than
     `hash()`: str hashing is salted per interpreter, so `hash()` would make the
@@ -309,20 +312,20 @@ def write_embedding_file(path: Path, model: str, instances) -> None:
 
     domains = set()
     with h5py.File(path, "w") as out_h5:
-        for domain_id, instance_key in sorted(set(instances)):
+        for pfam_id, instance_key in sorted(set(instances)):
             digest = hashlib.sha256(
-                f"{model}/{domain_id}/{instance_key}".encode()
+                f"{model}/{pfam_id}/{instance_key}".encode()
             ).digest()
             rng = np.random.default_rng(SEED + int.from_bytes(digest[:8], "big"))
             vector = rng.standard_normal(EMBED_DIM).astype(np.float16)
-            out_h5.create_dataset(f"{domain_id}/{instance_key}", data=vector)
-            domains.add(domain_id)
+            out_h5.create_dataset(f"{pfam_id}/{instance_key}", data=vector)
+            domains.add(pfam_id)
 
         out_h5.attrs["model"] = model
         out_h5.attrs["pooling"] = "mean"
         out_h5.attrs["dim"] = EMBED_DIM
         out_h5.attrs["dtype"] = "float16"
-        out_h5.attrs["key_layout"] = "{domain_id}/{instance_id}"
+        out_h5.attrs["key_layout"] = "{pfam_id}/{instance_id}"
         out_h5.attrs["n_domains"] = len(domains)
         out_h5.attrs["n_instances"] = len(set(instances))
         out_h5.attrs["domainsplit_run"] = FIXTURE_RUN_ID

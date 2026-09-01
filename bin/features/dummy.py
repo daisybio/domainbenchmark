@@ -23,19 +23,20 @@ DUMMY_DIM = 512
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     domain_protein_df = pd.read_sql(
         f"""
-        SELECT domain_id, {embeddings.INSTANCE_KEY_SQL}
-        FROM domain_protein_map;
+        SELECT {embeddings.DOMAIN_KEY_SQL}, {embeddings.INSTANCE_KEY_SQL}
+        FROM domain_protein_map
+        {embeddings.DOMAIN_JOIN_SQL};
         """,
         conn,
     )
 
-    domain_protein_df["domain_id"] = domain_protein_df["domain_id"].astype(str)
+    domain_protein_df["domain_key"] = domain_protein_df["domain_key"].astype(str)
     domain_protein_df["instance_key"] = domain_protein_df["instance_key"].astype(str)
 
-    for domain_id, instance_key in domain_protein_df.itertuples(index=False):
+    for domain_key, instance_key in domain_protein_df.itertuples(index=False):
         embeddings.write_instance(
             out_file,
-            domain_id,
+            domain_key,
             instance_key,
             # The module-global numpy RNG, seeded by extract_features.py from
             # --seed. A private default_rng() with no seed made every run of

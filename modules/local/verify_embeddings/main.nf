@@ -3,14 +3,20 @@
 //
 // Two jobs in one process, deliberately:
 //
-//  1. Verification. `domain.id` is a surrogate integer that domainsplit copies
-//     verbatim into every split database and never renumbers, so one published
-//     `<model>_domain_embeddings.h5` is valid across every split of the run that
-//     produced it and silently wrong across runs. Nothing downstream would
-//     raise: `load_embedding_data` skips instance pairs it cannot resolve, so a
-//     foreign file yields zero training rows rather than an error. Running the
-//     check as a process makes the failure structural -- NN/RF consume this
-//     output, so they cannot start on unverified files.
+//  1. Verification. A published `<model>_domain_embeddings.h5` is keyed
+//     `h5[pfam_id][instance_id]`: one file covers every split database of the
+//     run that produced it, because it holds every domain the run saw. Nothing
+//     downstream would raise if it did not fit -- `load_embedding_data` skips
+//     the (pfam_id, instance_id) pairs it cannot resolve, so an ill-fitting file
+//     yields zero training rows rather than an error. Running the check as a
+//     process makes the failure structural: NN/RF consume this output, so they
+//     cannot start on unverified files.
+//
+//     What it cannot catch is a foreign *run*: Pfam accessions are stable across
+//     runs, so an export made by another run over the same domains resolves like
+//     a native one. Pairing the right export with the right databases is the
+//     caller's job -- and with `--embeddings` unset the pipeline derives it from
+//     `--input`'s own directory, which gets it right by construction.
 //
 //  2. Renaming. domainsplit publishes `esm3_domain_embeddings.h5`; the feature
 //     is called `esm3_embeddings`. `path('features/*')` stages a file under its
@@ -47,12 +53,11 @@ process VERIFY_EMBEDDINGS {
             .transpose()
             .collect { feature, f -> "ln -s ../${f} verified/${feature}.h5" }
             .join('\n        ')
-        def expect_run = params.domainsplit_run ? "--expect-run '${params.domainsplit_run}'" : ''
         """
         verify_embeddings.py \\
             --db-dir ${database_dir} \\
             ${pairs} \\
-            --min-coverage ${params.min_embedding_coverage} ${expect_run}
+            --min-coverage ${params.min_embedding_coverage}
 
         mkdir -p verified
         ${links}

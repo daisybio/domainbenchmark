@@ -147,16 +147,28 @@ nextflow run . \
     --outdir results
 ```
 
-These files are per **run**, not per split. One file serves `train`,
-`validation` and every `test*` split of the databases the same run produced —
-and is silently wrong for any other run, because `domain.id` is a surrogate
-integer that domainsplit copies verbatim into each split and never renumbers.
-Nothing downstream would notice on its own: the loader skips instance pairs it
-cannot resolve, so a mismatched file yields zero training rows rather than an
-error. `VERIFY_EMBEDDINGS` therefore checks each file against the databases
-before any model is trained — structurally (the domain instances must actually
-resolve) and, if you pass `--domainsplit_run`, against the run id recorded in
-the file's root attributes.
+`--embeddings` may be left off when `--input` is a directory: domainsplit
+publishes `embeddings/` as a sibling of `databases/`, so the pipeline looks one
+level up from `--input` and errors only if no such directory is there. A
+samplesheet input still needs it explicitly, because its rows can point at
+several runs.
+
+These files are keyed `h5[pfam_id][instance_id]` and are per **run**, not per
+split: one file holds every domain the run saw, and each split database is a
+subset of that, so it serves `train`, `validation` and every `test*` split of
+the databases the same run produced.
+
+Nothing downstream notices when a file does not fit: the loader skips the
+`(pfam_id, instance_id)` pairs it cannot resolve, so an ill-fitting file yields
+zero training rows rather than an error. `VERIFY_EMBEDDINGS` therefore checks
+each file against the databases before any model is trained — the domain
+instances must actually resolve.
+
+That check cannot tell one *run* from another: Pfam accessions are stable, so an
+export made by a different run over the same domains resolves like a native one.
+Nothing guards against that, deliberately — with `--embeddings` derived from
+`--input` the pairing is right by construction, and if you set `--embeddings`
+yourself, or use a samplesheet, pointing it at the matching run is on you.
 
 ### Cluster
 
@@ -216,16 +228,32 @@ Used by CI and by `nf-test`.
 | `--graph_models` | `kgiddi,ddiparsimony,kgiddi_random` | Graph models to run. |
 | `--machine_learning_features` | `dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings` | Feature encodings fed to the classifiers. |
 | `--published_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings` | Of those, the ones read from `--embeddings` instead of extracted from the databases. |
-| `--embeddings` | `null` | domainsplit's `results/embeddings/` directory. **Required** when `--published_features` is non-empty. |
-| `--domainsplit_run` | `null` | Expected `domainsplit_run` attribute of those files; `VERIFY_EMBEDDINGS` fails on a mismatch. |
+| `--embeddings` | `null` | domainsplit's `results/embeddings/` directory. Needed when `--published_features` is non-empty, but derived from `--input` when that is a directory (one level up, `embeddings/`). |
 | `--large_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings` | Features routed to the heavy memory-time envelope. |
 | `--machine_learning_models` | `neural_network,random_forest` | ML models to run. |
 | `--seed` | `42` | Master RNG seed. Reaches every randomised step, including workers in a process pool -- see [Reproducibility](#reproducibility). |
 | `--allow_cpu_ml` | `false` | Let `RANDOM_FOREST` train with scikit-learn when no GPU is usable, instead of exiting 140 for a retry on another GPU node. For GPU-less machines (CI, laptops); the `test` profile sets it. |
+| `--ppi_score_cutoff` | `400` | Minimum STRING `combined_score` a PPI must reach to enter the interactome every graph model builds on. |
+| `--mqc_order` | `null` | Comma-separated dataset order for the MultiQC reports, e.g. `random_balanced,minimal_leakage_hcni_realistic,external_test`. Orders the per-dataset sections, the dataset tabs inside the combined plots, and the heatmap columns. A name that matches no dataset is a hard failure; a dataset missing from the list warns and is appended alphabetically. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
 
 Full schema with defaults, types, and descriptions: `nextflow_schema.json`.
 Run `nextflow run . --help` for a CLI summary.
+
+### Overriding numeric parameters
+
+`--seed`, `--ppi_score_cutoff` and `--min_embedding_coverage` are declared with
+their types in the `params { }` block at the top of `main.nf`, so
+`--seed 7 --ppi_score_cutoff 900 --min_embedding_coverage 0.8` works on the
+command line.
+
+That block is load-bearing. Nextflow's v2 (strict) parser, the default since
+26.x, no longer infers types for command-line parameters: `--seed 7` arrives as
+the string `"7"` and parameter validation rejects it with
+`Value is [string] but should be [integer]`. **A new numeric or boolean
+parameter has to be declared there too, or it cannot be set from the CLI.**
+A `-params-file` (YAML/JSON) preserves types on its own and needs no
+declaration.
 
 ## Pipeline output
 

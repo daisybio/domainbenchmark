@@ -12,7 +12,13 @@ import argparse
 from pathlib import Path
 import json
 
-# from eval_multiqc_functions import *
+from eval_multiqc_functions import (
+    is_retired_block,
+    order_dataset_keys,
+    parse_dataset_order,
+    resolve_dataset_order,
+    sort_by_dataset,
+)
 import logging
 
 import matplotlib.pyplot as plt
@@ -50,16 +56,27 @@ def parse_arguments():
         "--out_dir", required=True, help="Output directory to store evaluation results."
     )
     p.add_argument(
+        "--mqc_order",
+        default=None,
+        help="Comma-separated dataset (run label) order, e.g. "
+             "'random_balanced,minimal_leakage_hcni_realistic,external_test'. "
+             "Drives the section order of the per-dataset blocks, the tab order "
+             "inside the combined ROC/PR and by-source plots, and the column "
+             "order of the AUC/AP heatmaps. A name that does not exist in the "
+             "data is a hard failure; a dataset missing from the list warns and "
+             "is appended alphabetically.",
+    )
+    p.add_argument(
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only).",
     )
     return p.parse_args()
 
 
-def write_multiqc_config(outdir) -> str:
+def write_multiqc_config(outdir, dataset_order=None) -> str:
     # Write MultiQC config file to specify module order
     # @outdir: output directory where MultiQC JSON files are located
-    # @old_report_path: path to old MultiQC report (for merging)
+    # @dataset_order: resolved --mqc_order, applied to the per-dataset blocks
 
     # Returns path to written multiqc_config.yaml
     json_ids = []
@@ -102,19 +119,21 @@ def write_multiqc_config(outdir) -> str:
     source_block = pick(r"source_accuracy_by_ddi_source")
 
     db_blocks = pick(r"database_analysis")
-    degree_blocks = pick(r"_degree_distribution")
-    betweenness_blocks = pick(r"_betweenness_distribution")
-    clustering_blocks = pick(r"_clustering_distribution")
 
     # db_header = pick(r"db_header$")
     # models_header = pick(r"models_header$")
 
+    # `db_database_analysis_<dataset>` and `model_eval_metrics_<dataset>` exist
+    # once per dataset. `all_ids` is alphabetical, which puts them in an order
+    # nobody chose -- `--mqc_order` replaces it. Everything else stays a pure
+    # function of the file names, which is what keeps the report reproducible.
+    if dataset_order:
+        db_blocks = sort_by_dataset(db_blocks, dataset_order)
+        metric_blocks = sort_by_dataset(metric_blocks, dataset_order)
+
     ordered = (
         white_tbl
         + db_blocks
-        + degree_blocks
-        + betweenness_blocks
-        + clustering_blocks
         + metric_blocks
         + roc_heatmap_block
         + roc_heatmap_ci
@@ -415,7 +434,7 @@ def _coverage_notes(sidecars):
     )
 
 
-def source_accuracy_bargraph(sidecars, outdir):
+def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
     """One tabbed bar graph: bars = models, groups = sources, tabs = datasets.
 
     A table would have been the natural shape here, but MultiQC 1.32 renders only
@@ -429,7 +448,11 @@ def source_accuracy_bargraph(sidecars, outdir):
         print("[INFO] No per-source sidecars found; skipping the by-source section.")
         return
 
-    sidecars = sorted(sidecars, key=lambda sc: sc.get("db_name", ""))
+    # Tabs are datasets, so `--mqc_order` is the tab order. `Combined` is
+    # appended after, never ordered: it is a pooled summary of the others.
+    sidecars = sort_by_dataset(
+        sidecars, dataset_order, key=lambda sc: sc.get("db_name", "")
+    )
     if len(sidecars) > 1:
         sidecars = sidecars + [_combine_datasets(sidecars)]
 
@@ -506,7 +529,7 @@ def source_accuracy_bargraph(sidecars, outdir):
     )
 
 
-def cross_db_comparison(all_blocks, outdir):
+def cross_db_comparison(all_blocks, outdir, dataset_order=None):
 
     performance_data = {
         block["id"]: block
@@ -526,26 +549,30 @@ def cross_db_comparison(all_blocks, outdir):
     # model_eval_data = {block["id"]: block for block in all_blocks if block["id"].startswith("model_eval_metrics_")}
 
     # combined_metrics_heatmap(model_eval_data, outdir)
-    combined_roc_curves(roc_data, outdir)
-    combined_pr_curves(pr_data, outdir)
-    model_performance_heatmap(performance_data, outdir)
-    combine_db_analysis(
-        [block for block in all_blocks if block["id"].startswith("db_")], outdir
+    combined_roc_curves(roc_data, outdir, dataset_order)
+    combined_pr_curves(pr_data, outdir, dataset_order)
+    model_performance_heatmap(performance_data, outdir, dataset_order)
+    combine_curves_db_level(
+        roc_data, outdir, "roc", "False Positive Rate", "True Positive Rate",
+        dataset_order,
     )
     combine_curves_db_level(
-        roc_data, outdir, "roc", "False Positive Rate", "True Positive Rate"
+        pr_data, outdir, "pr", "Recall", "Precision", dataset_order
     )
-    combine_curves_db_level(pr_data, outdir, "pr", "Recall", "Precision")
 
 
-def combine_curves_db_level(curve_data, outdir, curve_type, xlabel, ylabel):
-    data = []
-    data_labels = []
+def combine_curves_db_level(
+    curve_data, outdir, curve_type, xlabel, ylabel, dataset_order=None
+):
+    # One tab per dataset, so `--mqc_order` is the tab order.
+    pairs = []
     for block_id, block in curve_data.items():
         db_name = block_id.replace(f"combined_{curve_type}_", "")
-        curve_data = block.get("data", {})
-        data.append(curve_data)
-        data_labels.append({"name": db_name, "title": db_name})
+        pairs.append((db_name, block.get("data", {})))
+    pairs = sort_by_dataset(pairs, dataset_order, key=lambda pair: pair[0])
+
+    data = [points for _, points in pairs]
+    data_labels = [{"name": db, "title": db} for db, _ in pairs]
 
     combined_block = {
         "id": f"combined_{curve_type}_curves_db_level",
@@ -567,7 +594,7 @@ def combine_curves_db_level(curve_data, outdir, curve_type, xlabel, ylabel):
         json.dump(combined_block, f, indent=2)
 
 
-def combined_roc_curves(roc_data, outdir):
+def combined_roc_curves(roc_data, outdir, dataset_order=None):
 
     data_tmp = []
     data_labels = []
@@ -586,7 +613,9 @@ def combined_roc_curves(roc_data, outdir):
         tmp = {}
         for curve in model_curves:
             tmp[curve["db"]] = curve["points"]
-        data.append(tmp)
+        # One series per dataset inside each model's plot -- `--mqc_order` sets
+        # the series (and therefore legend) order.
+        data.append(order_dataset_keys(tmp, dataset_order))
         data_labels.append({"name": model, "title": model})
 
     # Order data by model_name
@@ -612,7 +641,7 @@ def combined_roc_curves(roc_data, outdir):
         json.dump(roc_block, f, indent=2)
 
 
-def combined_pr_curves(pr_data, outdir):
+def combined_pr_curves(pr_data, outdir, dataset_order=None):
 
     data = []
     data_tmp = []
@@ -631,7 +660,8 @@ def combined_pr_curves(pr_data, outdir):
         for curve in model_curves:
             # x : y for each curve, where x is fpr and y is tpr, and the key is the database name
             tmp[curve["db"]] = curve["points"]
-        data.append(tmp)
+        # Series order inside each model's plot; see combined_roc_curves.
+        data.append(order_dataset_keys(tmp, dataset_order))
         data_labels.append({"name": model, "title": model})
 
     # Order data by model_name
@@ -656,7 +686,7 @@ def combined_pr_curves(pr_data, outdir):
         json.dump(pr_block, f, indent=2)
 
 
-def model_performance_heatmap(combined_metrics, outdir):
+def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
     # Heatmap colour + clustering use the numeric mean (float). The
     # bootstrap CI lives in a sibling "<...> CI" string column emitted by
     # eval_multiqc.py and is rendered as a companion label-table next to the
@@ -694,11 +724,16 @@ def model_performance_heatmap(combined_metrics, outdir):
                 f"{pv:.3f} {pc}".strip() if pv is not None else (pc or "")
             )
 
-    # Sort rows
-    roc_mean = {m: roc_mean[m] for m in sorted(roc_mean)}
-    pr_mean = {m: pr_mean[m] for m in sorted(pr_mean)}
-    roc_ci = {m: roc_ci[m] for m in sorted(roc_ci)}
-    pr_ci = {m: pr_ci[m] for m in sorted(pr_ci)}
+    # Sort rows (models) alphabetically, columns (datasets) by --mqc_order.
+    def _rows(table):
+        return {
+            m: order_dataset_keys(table[m], dataset_order) for m in sorted(table)
+        }
+
+    roc_mean = _rows(roc_mean)
+    pr_mean = _rows(pr_mean)
+    roc_ci = _rows(roc_ci)
+    pr_ci = _rows(pr_ci)
 
     def _write_heatmap(block_id, title, data, fname):
         block = {
@@ -724,7 +759,9 @@ def model_performance_heatmap(combined_metrics, outdir):
     def _write_ci_table(block_id, title, data, fname):
         # Table sharing the same model/db grid; cells = "mean [lo, hi]" strings.
         # Acts as the CI label panel rendered directly below the heatmap.
-        db_cols = sorted({db for row in data.values() for db in row})
+        db_cols = sort_by_dataset(
+            {db for row in data.values() for db in row}, dataset_order
+        )
         headers = {
             db: {"title": db, "scale": False, "description": f"{title} ({db})"}
             for db in db_cols
@@ -773,95 +810,11 @@ def model_performance_heatmap(combined_metrics, outdir):
     )
 
 
-def combine_db_analysis(db_blocks, outdir):
-
-    # combine for ppi & ddi the degree distribution, betweenness distribution, and clustering distribution blocks into one block each, where the data is merged and relabeled by db_name
-
-    def combine_blocks(blocks, block_id, section_name, metric, name_suffix):
-        data = []
-        data_labels = []
-        for block in blocks:
-            db_name = block["id"].replace(
-                f"db_{block_id.replace('combined_', '').replace('_db', '')}_", ""
-            )
-            block_data = block.get("data", {})
-            # y must be a list of lists, order matches group_labels
-            # y = [block_data.get(group, []) for group in group_labels]
-            data.append(block_data)
-            data_labels.append({"name": db_name, "title": db_name})
-
-        combined_block = {
-            "id": block_id,
-            "section_name": section_name,
-            "plot_type": "box",
-            "pconfig": {
-                "id": block_id,
-                "title": section_name,
-                "xlab": "Database",
-                "ylab": metric,
-                "data_labels": data_labels,
-            },
-            "data": data,
-        }
-        with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
-            json.dump(combined_block, f, indent=2)
-
-    ddi_degree_blocks = [b for b in db_blocks if "ddi_degree_distribution" in b["id"]]
-    ppi_degree_blocks = [b for b in db_blocks if "ppi_degree_distribution" in b["id"]]
-    combine_blocks(
-        ddi_degree_blocks,
-        "combined_ddi_degree_distribution_db",
-        "Combined DDI Degree Distribution",
-        "Degree Distribution",
-        "ddi",
-    )
-    combine_blocks(
-        ppi_degree_blocks,
-        "combined_ppi_degree_distribution_db",
-        "Combined PPI Degree Distribution",
-        "Degree Distribution",
-        "ppi",
-    )
-    ddi_clustering_blocks = [
-        b for b in db_blocks if "ddi_clustering_distribution" in b["id"]
-    ]
-    ppi_clustering_blocks = [
-        b for b in db_blocks if "ppi_clustering_distribution" in b["id"]
-    ]
-    combine_blocks(
-        ddi_clustering_blocks,
-        "combined_ddi_clustering_distribution_db",
-        "Combined DDI Clustering Distribution",
-        "Clustering Coefficient",
-        "ddi",
-    )
-    combine_blocks(
-        ppi_clustering_blocks,
-        "combined_ppi_clustering_distribution_db",
-        "Combined PPI Clustering Distribution",
-        "Clustering Coefficient",
-        "ppi",
-    )
-    ddi_betweenness_blocks = [
-        b for b in db_blocks if "ddi_betweenness_distribution" in b["id"]
-    ]
-    ppi_betweenness_blocks = [
-        b for b in db_blocks if "ppi_betweenness_distribution" in b["id"]
-    ]
-    combine_blocks(
-        ddi_betweenness_blocks,
-        "combined_ddi_betweenness_distribution_db",
-        "Combined DDI Betweenness Distribution",
-        "Betweenness Centrality",
-        "ddi",
-    )
-    combine_blocks(
-        ppi_betweenness_blocks,
-        "combined_ppi_betweenness_distribution_db",
-        "Combined PPI Betweenness Distribution",
-        "Betweenness Centrality",
-        "ppi",
-    )
+# `combine_db_analysis()` lived here. It merged the per-dataset degree,
+# betweenness and clustering box plots into one tabbed block each. All three
+# series are gone (two were hardcoded [1..10] placeholders, the third duplicated
+# what `database_analysis` already reports), so there is nothing left to merge --
+# see `analyse_interaction_network` in eval_multiqc_functions.py.
 
 
 def main():
@@ -910,6 +863,13 @@ def main():
 
         for fn in os.listdir(report_dir):
             if fn.endswith("_mqc.json"):
+                # A report written by an earlier version still carries the
+                # retired degree / betweenness / clustering blocks, and MultiQC
+                # renders every block it finds whether the config lists it or
+                # not. Drop them rather than let them reappear.
+                if is_retired_block(fn):
+                    print(f"[INFO] Skipping retired block: {fn}")
+                    continue
                 src = os.path.join(report_dir, fn)
                 with open(src, "r", encoding="utf-8") as f:
                     block = json.load(f)
@@ -919,16 +879,12 @@ def main():
                 fn_name = os.path.splitext(fn)[0]
                 fn_name = re.sub(r"_mqc$", "", fn_name)  # remove old suffix
                 out_fn = f"{fn_name}_{db_name}_mqc.json"
-                # If the block is a db block for the metrics, so all the distribution blocks, we don't need to copy them, because we will combine them later, so we skip them here
-                degree_names = [
-                    "degree_distribution",
-                    "betweenness_distribution",
-                    "clustering_distribution",
-                ]
+                # ROC/PR curve blocks and the per-dataset metrics tables are
+                # not copied through: cross_db_comparison() rebuilds them below
+                # as single cross-dataset blocks. (The degree / betweenness /
+                # clustering box plots used to be skipped here for the same
+                # reason; they no longer exist at all.)
                 if not (
-                    any(name in block["id"] for name in degree_names)
-                    and "db" in block["id"]
-                ) and not (
                     "roc" in block["id"]
                     or "pr" in block["id"]
                     or "combined_metrics_table_" in block["id"]
@@ -939,15 +895,27 @@ def main():
                         json.dump(block, out_f, indent=2)
                 all_blocks.append(block)
 
+    # Dataset ordering. This is the only stage that sees every dataset, so it
+    # is the one that can tell a typo in --mqc_order from a name that simply
+    # does not appear in this particular report -- hence strict here and lenient
+    # in eval_multiqc.py.
+    dataset_order = resolve_dataset_order(
+        parse_dataset_order(args.mqc_order),
+        db_names,
+        strict=True,
+        context="combined report",
+    )
+    print(f"[INFO] Dataset order: {', '.join(dataset_order) or '(none)'}")
+
     # Cross-database comparison
-    cross_db_comparison(all_blocks, outdir_json)
-    source_accuracy_bargraph(source_sidecars, outdir_json)
+    cross_db_comparison(all_blocks, outdir_json, dataset_order)
+    source_accuracy_bargraph(source_sidecars, outdir_json, dataset_order)
 
     # create_section_header("models_header", "Models Results", outdir_json)
     # create_section_header("db_header", "Database Results", outdir_json)
 
     # Write MultiQC config and run MultiQC as before
-    cfg_path = write_multiqc_config(outdir_json)
+    cfg_path = write_multiqc_config(outdir_json, dataset_order)
     final_report = run_multiqc(outdir_json, outdir, cfg_path)
     fix_trailing_punctuation_in_report(final_report)
 

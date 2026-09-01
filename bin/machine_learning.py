@@ -57,13 +57,39 @@ def _aggregate_to_ddi_level(ddi_pairs, y_true, y_score):
     """Collapse per-protein-pair predictions to one row per DDI pair.
 
     Aggregation: mean predicted probability over all protein instantiations of
-    each (domain_a, domain_b) pair; true label is constant per pair so 'first'
-    is exact.
+    each domain pair; the true label is constant per pair, so 'first' is exact.
+
+    **The pair is canonicalised first**, so `domain_a` is always the smaller
+    accession and each DDI produces exactly one row. `load_embedding_data` adds
+    both `(A, B)` and `(B, A)` to `labeled_domain_pairs` -- a deliberate
+    augmentation, because the feature vector is `concat(emb_a, emb_b)` and the
+    model would otherwise learn an order-dependent function of an undirected
+    relation. Grouping on the raw orientation carried that augmentation into the
+    output: two rows per DDI, so every metric counted each one twice and the
+    per-source denominators were doubled. Merging them turns the augmentation
+    into what it was meant to be -- the mean of the two orientations, i.e. a
+    symmetric prediction -- and leaves one row per DDI.
+
+    Plain string comparison is the right order here: `domain_a`/`domain_b` are
+    Pfam accessions (`PF` + a zero-padded five-digit number), so lexicographic
+    and numeric order coincide. They are Pfam and not `domain.id` because
+    `eval_one.py` joins these predictions against `<split>_sources.csv` on the
+    domain pair, and the graph models -- which read the database directly -- have
+    always reported Pfam. `bin/load_data_gm.canonical_pair` is the same rule on
+    the graph side.
     """
     df = pd.DataFrame(ddi_pairs, columns=["domain_a", "domain_b"])
+    a = df["domain_a"].astype(str)
+    b = df["domain_b"].astype(str)
+    lo = a <= b
+    df["domain_a"] = a.where(lo, b)
+    df["domain_b"] = b.where(lo, a)
     df["true_interaction"] = np.asarray(y_true).astype(np.int8)
     df["predicted_probability"] = np.asarray(y_score).astype(np.float32)
     return (
+        # sort=False: row order is first-appearance order over the *sorted*
+        # `labeled_domain_pairs`, so it is a function of the data and not of
+        # dict iteration -- see the note on set ordering in load_embedding_data.
         df.groupby(["domain_a", "domain_b"], sort=False)
         .agg(true_interaction=("true_interaction", "first"),
              predicted_probability=("predicted_probability", "mean"))
@@ -136,9 +162,9 @@ def resolve_feature_file(features_path: Path, feature: str, dataset: str) -> Pat
 
     `<feature>.h5` is a *per-run* file published by domainsplit and staged under
     its feature name by VERIFY_EMBEDDINGS. One file serves every split of the
-    run, because `domain.id` is a surrogate integer that SUBSET_SPLIT_DB copies
-    verbatim into each split database. It is tried second so a split-specific
-    extraction always wins over the shared file.
+    run: it holds every domain the run saw and each split database is a subset
+    of that. It is tried second so a split-specific extraction always wins over
+    the shared file.
 
     (A `<feature>/<split>.h5` directory tree used to be accepted as well. The
     STAGE_FEATURE_DIR process that built it is gone and nothing else ever wrote
@@ -258,13 +284,15 @@ def load_embedding_data(
         # How much of the requested data each feature file actually carries.
         #
         # The loop below *skips* every pair and every instance combination it
-        # cannot resolve, and a published embedding file is keyed by
-        # `domain.id` -- a surrogate integer that means something different in
-        # every domainsplit run. A file from the wrong run therefore raises
-        # nothing at all: it resolves no key, every pair is skipped, and the
-        # result is an empty training set indistinguishable from a database
-        # that genuinely holds no data. Count what resolves so the failure can
-        # name the feature responsible instead of reporting "no data found".
+        # cannot resolve. Both halves of the key can drift: the group name is
+        # the Pfam accession (stable across runs, so a mismatch means the wrong
+        # dataset or a stale export) and the dataset name is domainsplit's
+        # run-local instance id (so a foreign-run export misses even when the
+        # Pfam groups line up). Either way nothing raises on its own: no key
+        # resolves, every pair is skipped, and the result is an empty training
+        # set indistinguishable from a database that genuinely holds no data.
+        # Count what resolves so the failure can name the feature responsible
+        # instead of reporting "no data found".
         pair_hits = {name: 0 for name in domain_encoding_names + interaction_encoding_names}
         candidates_seen = 0
         candidates_resolved = 0
@@ -397,20 +425,24 @@ def load_embedding_data(
             raise ValueError(
                 f"{dataset}: feature file(s) {', '.join(dead_features)} resolve "
                 f"none of the {len(labeled_domain_pairs)} labelled domain pairs "
-                f"({tally}). `domain.id` is a surrogate integer, so an embedding "
-                "file published by a different domainsplit run resolves nothing "
-                "while raising no error of its own. Check that --embeddings "
-                "points at the run that produced these databases."
+                f"({tally}). The h5 groups and the DDI CSVs must both be keyed "
+                "by Pfam accession -- a file still keyed by the old `domain.id` "
+                "surrogate, or exported over a different domain universe, "
+                "resolves nothing while raising no error of its own. Check that "
+                "--embeddings points at the run that produced these databases."
             )
 
         if candidates_seen and not candidates_resolved:
             raise ValueError(
                 f"{dataset}: every domain pair was found, but none of the "
                 f"{candidates_seen} candidate instance pairs resolved in the "
-                "feature files. The domain ids line up and the instance keys do "
-                "not -- the feature files and "
+                "feature files. The Pfam accessions line up and the instance "
+                "keys do not -- the feature files and "
                 f"{dataset}_instances.csv disagree on "
-                "COALESCE(instance_id, 'r' || rowid)."
+                "COALESCE(instance_id, 'r' || rowid). For a published embedding "
+                "file that is the signature of a foreign domainsplit run: "
+                "instance ids are run-local even though Pfam accessions are "
+                "not."
             )
 
     if len(x) == 0:

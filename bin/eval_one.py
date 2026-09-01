@@ -31,10 +31,23 @@ from eval_multiqc_functions import bootstrap_metric
 #: Row label for the whole test set, used as the per-source table's baseline.
 ALL_SOURCES = "ALL"
 
-#: Row label for DDIs whose `source` is NULL/empty, plus any scored pair the
-#: split's `domain_domain_interaction` does not list at all. Only emitted when
-#: it actually collects rows.
+#: Row label for DDIs whose `source` column is NULL/empty in the split database.
+#: That is real data -- a pair with no recorded provenance -- and is emitted only
+#: when it actually collects rows.
+#:
+#: It used to double as the bucket for scored pairs the split's
+#: `domain_domain_interaction` does not list at all. Those two are not the same
+#: thing: an unmatched pair is a *join failure*, and it is now fatal (see
+#: `_per_source_metrics`), so a surviving `unknown` row can only mean NULL
+#: provenance.
 UNKNOWN_SOURCE = "unknown"
+
+#: Internal sentinel for a scored pair with no row in `<split>_sources.csv`.
+#: Never reaches the report -- `_per_source_metrics` fails on it.
+UNMATCHED = "\x00unmatched"
+
+#: How many unmatched pairs the failure message names.
+UNMATCHED_EXAMPLES = 10
 
 
 def _pair_keys(domain_a, domain_b) -> np.ndarray:
@@ -101,6 +114,10 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
     reported next to the split's ground-truth `n` so partial coverage (a model
     that could not score every DDI) is visible instead of silently inflating or
     deflating the row.
+
+    Raises SystemExit when any scored pair has no row in the source table: that
+    is a key-space mismatch between the predictions and the CSVs, and a report
+    built on it is meaningless rather than merely incomplete.
     """
     if not sources_path or not os.path.isfile(sources_path):
         print(f"[eval_one] no source table at {sources_path}; skipping per-source metrics")
@@ -119,7 +136,36 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
     )
 
     merged = preds.merge(exploded, on="pair", how="left")
-    merged["source"] = merged["source"].fillna(UNKNOWN_SOURCE)
+    merged["source"] = merged["source"].fillna(UNMATCHED)
+
+    # A scored pair with no row in `<split>_sources.csv` is never data: both
+    # sides are built from the same split database's
+    # `domain_domain_interaction`, and `_pair_keys` canonicalises the
+    # orientation, so a miss means the two sides do not agree on what a domain
+    # is called. That was the standing state of the pipeline until
+    # DDI_EXTRACTION started reporting `pfam_id`: the graph models read the
+    # database directly through `bin/load_data_gm.py` and have always emitted
+    # Pfam accessions, while the CSVs carried `domain.id` surrogates, so *every*
+    # graph-model pair missed and the report showed one quiet `unknown` row
+    # holding the entire test set.
+    unmatched = merged.loc[merged["source"] == UNMATCHED, "pair"]
+    if len(unmatched):
+        n_unmatched = int(unmatched.nunique())
+        n_total = int(preds["pair"].nunique())
+        examples = ", ".join(
+            p.replace("\t", " <-> ") for p in sorted(unmatched.unique())[:UNMATCHED_EXAMPLES]
+        )
+        raise SystemExit(
+            f"[eval_one] {n_unmatched}/{n_total} scored domain pairs "
+            f"({n_unmatched / n_total:.1%}) have no row in {sources_path}.\n"
+            f"    e.g. {examples}\n"
+            "    Both sides come from the same split database's "
+            "domain_domain_interaction and the pair orientation is "
+            "canonicalised, so this is a key-space mismatch, not missing data. "
+            "Check that the predictions and DDI_EXTRACTION's CSVs are both keyed "
+            "by Pfam accession (`domain.pfam_id`) and not by the per-run "
+            "`domain.id` surrogate."
+        )
 
     per_source = {}
     for source, grp in merged.groupby("source", sort=True):
@@ -147,7 +193,8 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
         "accuracy": float(correct_all) / n_all if n_all else float("nan"),
     }
 
-    # `unknown` is a real bucket only when something landed in it.
+    # `unknown` (NULL provenance) is a real bucket only when something landed
+    # in it. Unmatched pairs never get this far -- they raise above.
     if per_source.get(UNKNOWN_SOURCE, {}).get("n_scored", 0) == 0:
         per_source.pop(UNKNOWN_SOURCE, None)
 

@@ -20,23 +20,25 @@ def get_aa_comp(seq: str) -> list[float]:
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
     domain_sequence_df = pd.read_sql(
         f"""
-                SELECT domain_id, {embeddings.INSTANCE_KEY_SQL},
+                SELECT {embeddings.DOMAIN_KEY_SQL},
+                       {embeddings.INSTANCE_KEY_SQL},
                        UPPER(domain_sequence) AS sequence
-                FROM domain_protein_map;
+                FROM domain_protein_map
+                {embeddings.DOMAIN_JOIN_SQL};
             """,
         conn,
     )
 
     domain_sequence_df["aacomp"] = domain_sequence_df["sequence"].apply(get_aa_comp)
-    domain_sequence_df["domain_id"] = domain_sequence_df["domain_id"].astype(str)
+    domain_sequence_df["domain_key"] = domain_sequence_df["domain_key"].astype(str)
     domain_sequence_df["instance_key"] = domain_sequence_df["instance_key"].astype(str)
 
     for (
-        domain_id,
+        domain_key,
         instance_key,
         domain_sequence,
         aacomp,
     ) in domain_sequence_df.itertuples(index=False):
-        embeddings.write_instance(out_file, domain_id, instance_key, aacomp)
+        embeddings.write_instance(out_file, domain_key, instance_key, aacomp)
 
     print(domain_sequence_df.head())

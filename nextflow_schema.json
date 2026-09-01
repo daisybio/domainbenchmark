@@ -35,22 +35,16 @@
                     "format": "directory-path",
                     "exists": true,
                     "description": "domainsplit's results/embeddings/ directory, holding one <model>_domain_embeddings.h5 per embedding model.",
-                    "help_text": "Required whenever --published_features is non-empty. These files are per-RUN, not per-split: domain.id is a surrogate integer that SUBSET_SPLIT_DB copies verbatim and PRUNE_UNREPRESENTED_DDIS deletes without renumbering, so one file serves every split database of the run that produced it -- and is silently wrong for any other run. VERIFY_EMBEDDINGS checks the pairing before any model is trained.",
+                    "help_text": "Required only when --published_features is non-empty, and even then it can usually be left unset: domainsplit publishes embeddings/ as a sibling of the databases/ directory, so with --input <run>/results/databases the pipeline derives <run>/results/embeddings and fails only if that does not exist. A samplesheet input still needs it explicitly, because its rows can point anywhere. The files are keyed h5[pfam_id][instance_id] and are per-RUN, not per-split: one file holds every domain the run saw and each split database is a subset of it. VERIFY_EMBEDDINGS checks the pairing before any model trains.",
                     "fa_icon": "fas fa-vector-square"
-                },
-                "domainsplit_run": {
-                    "type": "string",
-                    "description": "Expected value of the embedding files' domainsplit_run root attribute; VERIFY_EMBEDDINGS fails on a mismatch.",
-                    "help_text": "domainsplit records its own workflow.sessionId there when exporting. Left unset, the embedding files are still required to agree with each other and to resolve the databases' domain instances structurally -- this only adds an explicit declaration of which run is expected.",
-                    "fa_icon": "fas fa-fingerprint"
                 },
                 "min_embedding_coverage": {
                     "type": "number",
                     "default": 0.5,
                     "minimum": 0,
                     "maximum": 1,
-                    "description": "Minimum fraction of a split's domain instances a published embedding file must resolve before the pairing is accepted.",
-                    "help_text": "A same-run file resolves close to 100% (domainsplit's exporter drops a handful of instances for --max-len or an OOM at batch size 1); a file from a foreign run resolves close to 0%, because the surrogate domain ids collide only by accident. The default sits far below any legitimate loss and far above that noise floor.",
+                    "description": "Minimum fraction of a split's (pfam_id, instance_id) pairs a published embedding file must resolve before the pairing is accepted.",
+                    "help_text": "A same-run file resolves close to 100% (domainsplit's exporter drops a handful of instances for --max-len or an OOM at batch size 1). This catches an export that does not cover these databases at all -- the wrong dataset, or one made before domains were added. It cannot catch an export from a different run over the same domain universe: Pfam accessions are stable across runs. Pairing the right export with the right databases is the caller's job, which the derived --embeddings default does by construction.",
                     "fa_icon": "fas fa-percent",
                     "hidden": true
                 },
@@ -133,6 +127,12 @@
                     "default": "evaluation",
                     "description": "Path to a prior evaluation/ directory used as a baseline for the MultiQC report.",
                     "fa_icon": "fas fa-history"
+                },
+                "mqc_order": {
+                    "type": "string",
+                    "description": "Comma-separated dataset (run label) order for the MultiQC reports, e.g. random_balanced,minimal_leakage_hcni_realistic,external_test.",
+                    "help_text": "A dataset is one (database, test variant) run label. Several report sections exist once per dataset and several more carry every dataset inside one block (the tabs of the combined ROC/PR and by-source plots, the columns of the AUC/AP heatmaps); left unset all of them come out alphabetically. A name that does not exist in the data is a hard failure. A dataset present in the data but missing from the list warns and is appended alphabetically after the ordered ones.",
+                    "fa_icon": "fas fa-sort-amount-down"
                 },
                 "seed": {
                     "type": "integer",

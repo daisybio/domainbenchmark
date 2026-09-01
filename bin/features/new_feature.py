@@ -27,11 +27,16 @@ embedding-backed feature is not written here at all -- it goes in
 template is for something you compute from the columns above.
 
 HDF5 output structure (required by downstream ML models):
-    /<domain_id>/<instance_key> = numpy array of shape (feature_dim,)
+    /<pfam_id>/<instance_key> = numpy array of shape (feature_dim,)
 
-The key is the *instance*, not the protein: domain_protein_map is unique on
-(domain_id, protein_id, start_pos, end_pos), so a protein carrying two copies
-of one family has two rows that would collide on protein_id. Use
+The group name is the domain's **Pfam accession**, not `domain.id`: that is a
+per-run surrogate integer, so a report or model keyed on it cannot be compared
+between domainsplit runs. Use `embeddings.DOMAIN_KEY_SQL` +
+`embeddings.DOMAIN_JOIN_SQL` in the SELECT to get it.
+
+The dataset name is the *instance*, not the protein: domain_protein_map is
+unique on (domain_id, protein_id, start_pos, end_pos), so a protein carrying two
+copies of one family has two rows that would collide on protein_id. Use
 `embeddings.INSTANCE_KEY_SQL` in the SELECT and `embeddings.write_instance()`
 to write, as every shipped encoder does. Never parse an instance key apart.
 
@@ -53,25 +58,26 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
         conn: SQLite connection to one of train.sqlite3 / validation.sqlite3 /
               test*.sqlite3. Read-only — do not write.
         out_file: Writable HDF5 file. Write one dataset per (domain, instance)
-                  pair, grouped by domain_id.
+                  pair, grouped by Pfam accession.
     """
     domain_protein_df = pd.read_sql(
         f"""
-        SELECT domain_id, {embeddings.INSTANCE_KEY_SQL},
+        SELECT {embeddings.DOMAIN_KEY_SQL}, {embeddings.INSTANCE_KEY_SQL},
                UPPER(domain_sequence) AS sequence
-        FROM domain_protein_map;
+        FROM domain_protein_map
+        {embeddings.DOMAIN_JOIN_SQL};
         """,
         conn,
     )
 
-    domain_protein_df["domain_id"] = domain_protein_df["domain_id"].astype(str)
+    domain_protein_df["domain_key"] = domain_protein_df["domain_key"].astype(str)
     domain_protein_df["instance_key"] = domain_protein_df["instance_key"].astype(str)
 
-    for domain_id, instance_key, sequence in domain_protein_df.itertuples(index=False):
+    for domain_key, instance_key, sequence in domain_protein_df.itertuples(index=False):
         # --- Replace this block with your feature computation ---
         feature_vector = np.zeros(128, dtype=np.float32)  # placeholder
         # --------------------------------------------------------
 
-        embeddings.write_instance(out_file, domain_id, instance_key, feature_vector)
+        embeddings.write_instance(out_file, domain_key, instance_key, feature_vector)
 
     print(f"new_feature: wrote {len(domain_protein_df)} entries")

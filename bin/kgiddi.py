@@ -90,6 +90,7 @@ from kgiddi_functions import (
 )
 from load_data_gm import (
     DEFAULT_PPI_SCORE_CUTOFF,
+    canonical_pair,
     load_ddi,
     load_pd_mapping,
     load_ppi,
@@ -1030,10 +1031,13 @@ def score_test_split(
         score = chi2_scores.get((d1, d2), chi2_scores.get((d2, d1), 0))
         score += random_jitter[i]
         score = max(0, min(1, score))
+        # Both lookups above are order-independent, so the emitted orientation is
+        # free -- pin it so every predictions file in the run agrees.
+        out_a, out_b = canonical_pair(d1, d2)
         output_rows.append(
             {
-                "domain_a": d1,
-                "domain_b": d2,
+                "domain_a": out_a,
+                "domain_b": out_b,
                 "true_interaction": int(actual),
                 "predicted_interaction": int(predicted),
                 "predicted_probability": float(score),

@@ -89,6 +89,129 @@ def paired_bootstrap_diff(samples_a, samples_b) -> float:
     return float(min(1.0, 2.0 * min(p_pos, p_neg)))
 
 
+### Retired report blocks ###
+
+#: Blocks this pipeline used to write and no longer does. They are filtered out
+#: wherever an *older* report is read back in -- `--report` in eval_multiqc.py
+#: and the per-dataset report dirs in combine_eval.py -- because MultiQC renders
+#: every custom-content block it finds, whether or not the config's `order` lists
+#: it. Without this, resuming onto a results directory written by an earlier
+#: version would resurrect the sections as zombies at the end of the report.
+RETIRED_BLOCK_MARKERS = (
+    "degree_distribution",
+    "betweenness_distribution",
+    "clustering_distribution",
+)
+
+
+def is_retired_block(name) -> bool:
+    """True for a block id or filename belonging to a retired section."""
+    return any(marker in str(name) for marker in RETIRED_BLOCK_MARKERS)
+
+
+### Dataset ordering (params.mqc_order) ###
+#
+# A "dataset" is one (database, test variant) run label -- `random_balanced`,
+# `minimal_leakage_hcni_realistic`, `external_test`. Several report sections
+# exist once per dataset (`db_database_analysis_<ds>`, `model_eval_metrics_<ds>`)
+# and several more carry every dataset inside one block (the tabs of the
+# combined ROC/PR line graphs and the by-source bar graph, the columns of the
+# AUC/AP heatmaps). Left alone all of those come out alphabetically, which is an
+# accident of naming rather than the order anyone wants to read them in.
+#
+# `--mqc_order` fixes that order once and every consumer below follows it.
+
+
+def parse_dataset_order(raw):
+    """`--mqc_order` -> list of dataset names, or None when unset."""
+    if not raw:
+        return None
+    if isinstance(raw, (list, tuple)):
+        parts = list(raw)
+    else:
+        parts = str(raw).split(",")
+    items = [p.strip() for p in parts if str(p).strip()]
+    return items or None
+
+
+def resolve_dataset_order(requested, observed, strict=True, context="report"):
+    """Complete ordering over `observed`, driven by `requested`.
+
+    A requested dataset that does not exist in the data is a hard failure: it
+    means the caller is ordering by a label that never appears, so the report
+    they get is not the one they asked for. `strict=False` is for a per-dataset
+    report, which by construction only sees one of the names.
+
+    A dataset present in the data but missing from `requested` warns and lands
+    alphabetically after everything ordered explicitly -- dropping it silently
+    would hide a whole database from the report.
+    """
+    observed = list(dict.fromkeys(observed))
+    if not requested:
+        return sorted(observed)
+
+    if strict:
+        missing = [d for d in requested if d not in observed]
+        if missing:
+            raise SystemExit(
+                f"[mqc_order] {context}: dataset(s) {', '.join(missing)} were "
+                "requested but do not exist in the data. Present: "
+                f"{', '.join(sorted(observed)) or '(none)'}. Fix --mqc_order, or "
+                "drop the name."
+            )
+
+    ordered = [d for d in requested if d in observed]
+    extra = sorted(d for d in observed if d not in requested)
+    if extra:
+        print(
+            f"[mqc_order][WARN] {context}: dataset(s) {', '.join(extra)} are in "
+            "the data but not in --mqc_order; appending them alphabetically "
+            "after the ordered ones."
+        )
+    return ordered + extra
+
+
+def dataset_of(name, order):
+    """The dataset in `order` that `name` names, or None.
+
+    Block ids are `<base>_<dataset>`, and one dataset name can be a suffix of
+    another (`random` vs `random_balanced`), so the longest match wins.
+    """
+    best = None
+    for dataset in order:
+        if name == dataset or name.endswith(f"_{dataset}"):
+            if best is None or len(dataset) > len(best):
+                best = dataset
+    return best
+
+
+def dataset_rank(name, order):
+    """Sort key: (position in `order`, name). Unknown datasets sort last."""
+    dataset = dataset_of(name, order)
+    if dataset is None:
+        return (len(order), str(name))
+    return (order.index(dataset), str(name))
+
+
+def sort_by_dataset(values, order, key=None):
+    """Sort `values` by the dataset each one belongs to.
+
+    With no order given, falls back to alphabetical rather than input order:
+    every consumer of this feeds the result into the report, and the report has
+    to be a function of the names alone to stay reproducible.
+    """
+    name_of = key or (lambda v: v)
+    if not order:
+        return sorted(values, key=lambda v: str(name_of(v)))
+    return sorted(values, key=lambda v: dataset_rank(name_of(v), order))
+
+
+def order_dataset_keys(mapping, order):
+    """Re-insert a `{dataset: value}` dict in `order` (heatmap columns, plot
+    series). Alphabetical when no order is given."""
+    return {k: mapping[k] for k in sort_by_dataset(list(mapping), order)}
+
+
 ### Functions to load data from the database ###
 
 
@@ -140,53 +263,21 @@ def load_ppi(path_to_database: Path) -> pd.DataFrame:
 
 
 def analyse_interaction_network(graph: nx.Graph) -> dict[str, object]:
-    network_data = {}
-    network_data["num_nodes"] = graph.number_of_nodes()
-    network_data["num_edges"] = graph.number_of_edges()
+    """Size of one interaction network. Node and edge counts only.
 
-    # convert all values to float for json serialization
-    degrees = [int(d) for n, d in graph.degree]  # type: ignore
-    network_data["degree_distribution"] = degrees
-    betweenness = [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-    ]  # [float(b) for b in nx.betweenness_centrality(graph).values()]
-    network_data["betweenness_centrality"] = betweenness
-    clustering_coeffs = [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-    ]  # [float(c) for c in nx.clustering(graph).values()]  # type: ignore
-    network_data["clustering_coefficient"] = clustering_coeffs
-
-    # Calculate average shortest path lengths if the graph is connected
-    #if nx.is_connected(graph):
-    #    path_lengths = dict(nx.all_pairs_shortest_path_length(graph))
-    #    lengths = []
-    #    for source in path_lengths:
-    #        for target in path_lengths[source]:
-    #            if source != target:
-    #                lengths.append(path_lengths[source][target])
-    #    network_data["shortest_path_lengths"] = float(np.mean(lengths))
-    #else:
-    #    network_data["shortest_path_lengths"] = []
-    network_data["shortest_path_lengths"] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    return network_data
+    The degree, betweenness and clustering-coefficient distributions that used
+    to be returned here are gone, along with the box-plot sections that rendered
+    them: betweenness and clustering were never actually computed (both returned
+    a hardcoded [1..10] placeholder, the real nx calls commented out because they
+    do not finish on a PPI graph of this size), and the degree distribution --
+    the one real series -- answered a question about the input databases that the
+    node/edge counts in `database_analysis` already cover. `shortest_path_lengths`
+    went with them: same placeholder, and nothing ever read it.
+    """
+    return {
+        "num_nodes": graph.number_of_nodes(),
+        "num_edges": graph.number_of_edges(),
+    }
 
 
 def get_interaction_counts(interaction_df: pd.DataFrame) -> dict[str, int]:
