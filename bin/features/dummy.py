@@ -15,12 +15,13 @@ import h5py
 import numpy as np
 import pandas as pd
 import sqlite3
+from determinism import derive_seed
 from features import embeddings
 
 DUMMY_DIM = 512
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
     domain_protein_df = pd.read_sql(
         f"""
         SELECT {embeddings.DOMAIN_KEY_SQL}, {embeddings.INSTANCE_KEY_SQL}
@@ -38,11 +39,17 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
             out_file,
             domain_key,
             instance_key,
-            # The module-global numpy RNG, seeded by extract_features.py from
-            # --seed. A private default_rng() with no seed made every run of
-            # this encoder emit a different h5, and every model trained on it
-            # irreproducible.
-            np.random.standard_normal(DUMMY_DIM).astype(np.float32),
+            # A per-instance RNG derived from --seed, not the module-global one.
+            # The global RNG is seeded (extract_features.py calls
+            # seed_everything), but drawing from it in a loop makes each
+            # vector's value depend on the *position* of its row, and the query
+            # above has no ORDER BY -- so a row-order change would silently
+            # reassign every dummy vector. derive_seed keys on the (domain,
+            # instance) pair instead: each pair gets the same vector regardless
+            # of the order the rows arrive in, or of how many rows precede it.
+            np.random.default_rng(derive_seed(seed, "dummy", domain_key, instance_key))
+            .standard_normal(DUMMY_DIM)
+            .astype(np.float32),
         )
 
     print(

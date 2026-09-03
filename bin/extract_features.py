@@ -21,9 +21,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--seed", type=int, default=42,
-        help="Master RNG seed. Only the `dummy` encoder draws from it today, "
-             "but an encoder that samples must be reproducible like everything "
-             "else downstream of it.",
+        help="Master RNG seed, passed to every encoder as its third argument. "
+             "Only the `dummy` encoder draws from it today, but an encoder that "
+             "samples must be reproducible like everything else downstream of "
+             "it -- and must derive per-item child seeds rather than draw from "
+             "the global RNG in row order.",
     )
     args = parser.parse_args()
     if args.run_id:
@@ -38,4 +40,6 @@ if __name__ == "__main__":
     ):
         print(f"Extracting feature '{args.feature}'...")
         feature_module = importlib.import_module(f"features.{args.feature}")
-        feature_module.extract_features(connection, output_file)
+        # Every encoder takes the seed, whether or not it draws from it today:
+        # an encoder that samples must not be able to reach the global RNG.
+        feature_module.extract_features(connection, output_file, args.seed)

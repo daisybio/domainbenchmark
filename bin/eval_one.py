@@ -292,7 +292,10 @@ def main():
     p.add_argument("--max_curve_points", type=int, default=600)
     p.add_argument("--bootstrap_n", type=int, default=1000,
                    help="Bootstrap resamples for ROC_AUC / PR_AP confidence intervals.")
-    p.add_argument("--bootstrap_seed", type=int, default=42)
+    # `--seed`, not `--bootstrap_seed`: the pipeline has exactly one RNG
+    # parameter (`params.seed`), and every entrypoint spells it the same way.
+    p.add_argument("--seed", type=int, default=42,
+                   help="Master RNG seed. Seeds the bootstrap resampling below.")
     p.add_argument(
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only)."
@@ -320,11 +323,11 @@ def main():
     # in the overview table.
     _, roc_lo, roc_hi, roc_samples = bootstrap_metric(
         y_true_clean, y_score_clean, roc_auc_score,
-        n_resamples=args.bootstrap_n, seed=args.bootstrap_seed,
+        n_resamples=args.bootstrap_n, seed=args.seed,
     )
     _, pr_lo, pr_hi, pr_samples = bootstrap_metric(
         y_true_clean, y_score_clean, average_precision_score,
-        n_resamples=args.bootstrap_n, seed=args.bootstrap_seed,
+        n_resamples=args.bootstrap_n, seed=args.seed,
     )
 
     fp_d, tp_d = _downsample_curve(fp.astype(np.float32), tp.astype(np.float32),

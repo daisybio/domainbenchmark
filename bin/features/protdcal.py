@@ -8,7 +8,9 @@ import sqlite3
 from features import embeddings
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
+    # Deterministic encoder: `seed` is part of the encoder ABI so that a
+    # sampling encoder cannot be added without one. Unused here.
     # Interaction encoding: the group is the domain *pair* and the subgroup the
     # instance *pair*. Keys are joined with "_" but are never split apart again
     # -- the ML loader looks them up whole, built from the same instance ids the

@@ -17,7 +17,9 @@ def get_aa_comp(seq: str) -> list[float]:
     return [aa_count[aa] / total for aa in AA]
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
+    # Deterministic encoder: `seed` is part of the encoder ABI so that a
+    # sampling encoder cannot be added without one. Unused here.
     domain_sequence_df = pd.read_sql(
         f"""
                 SELECT {embeddings.DOMAIN_KEY_SQL},

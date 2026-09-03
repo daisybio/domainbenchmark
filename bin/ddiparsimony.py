@@ -45,6 +45,7 @@ def evaluate_reliability_train(
         Dict[Tuple[str, str], int],
         Dict[Tuple[str, str], int],
         list,
+        int,
     ],
 ) -> Tuple[float, float, float, float, Dict[Tuple[str, str], float]]:
     (
@@ -57,7 +58,13 @@ def evaluate_reliability_train(
         ddi_dict,
         ddi_score,
         candidate_cutoffs,
+        seed,
     ) = args
+    # `seed` rides along in the task tuple because this runs in a pool worker,
+    # which inherits no usable RNG state. The token is keyed on the reliability
+    # rate: that is what distinguishes one grid point from another, and the
+    # `avg_x_vec` rerun in run_ddiparsimony passes the same token so it
+    # reproduces exactly the vector these pw_scores were computed from.
     avg_score, n_runs, observed_x_avg = compute_lp_score(
         ppi_list,
         protein_domains,
@@ -67,6 +74,8 @@ def evaluate_reliability_train(
         reliability=r,
         num_runs=200,
         return_x=True,
+        seed=seed,
+        rng_token=f"train_grid:{r}",
     )
     if observed_x_avg is None:
         observed_x_avg = np.zeros(len(domain_pairs))
@@ -101,6 +110,8 @@ def evaluate_reliability_test(
         np.ndarray,
         Dict[Tuple[str, str], Tuple[int, int]],
         Dict[Tuple[str, str], int],
+        int,
+        str,
     ],
 ) -> Tuple[float, float, float, float, Dict[Tuple[str, str], float]]:
     (
@@ -113,7 +124,11 @@ def evaluate_reliability_test(
         random_x_matrix,
         ddi_dict,
         ddi_score,
+        seed,
+        variant,
     ) = args
+    # Token carries the variant: two test splits of the same database are
+    # scored at the same reliability, and they must not share a mask.
     avg_score, n_runs, observed_x_avg = compute_lp_score(
         ppi_list,
         protein_domains,
@@ -123,6 +138,8 @@ def evaluate_reliability_test(
         reliability=r,
         num_runs=200,
         return_x=True,
+        seed=seed,
+        rng_token=f"test_eval:{variant}:{r}",
     )
     if observed_x_avg is None:
         observed_x_avg = np.zeros(len(domain_pairs))
@@ -381,6 +398,7 @@ def run_ddiparsimony(
                 ddi_dict,
                 ddi_score,
                 pw_score_thresholds,
+                seed,
             )
             for r in reliability_rates
         ]
@@ -408,6 +426,10 @@ def run_ddiparsimony(
                 )
             # Save observed_x_avg and avg_x_vec if available
             # For this, rerun compute_lp_score with return_x=True and get avg_x_vec, observed_x_avg
+            # Same rng_token as the grid worker used for this `r`, so this
+            # rerun reproduces that worker's observed_x_avg exactly. Under the
+            # old global RNG the two diverged, and the avg_x_vec saved here did
+            # not correspond to the pw_scores saved beside it.
             avg_score, n_runs, avg_x_vec = compute_lp_score(
                 ppi_list,
                 protein_domains,
@@ -417,6 +439,8 @@ def run_ddiparsimony(
                 reliability=r,
                 num_runs=200,
                 return_x=True,
+                seed=seed,
+                rng_token=f"train_grid:{r}",
             )
             if avg_x_vec is not None:
                 np.save(os.path.join(out_dir, f"avg_x_vec_{suffix}.npy"), avg_x_vec)
@@ -517,6 +541,8 @@ def score_test_split(
         random_x_matrix,
         ddi_dict,
         ddi_score,
+        seed,
+        variant,
     )
     rel, cut, accuracy, fp_rate, pw_scores = evaluate_reliability_test(eval_rel_args)
     logging.info(
@@ -527,6 +553,9 @@ def score_test_split(
     suffix = variant
     with open(os.path.join(out_dir, f"pw_scores_{suffix}.json"), "w") as f:
         json.dump({f"{k[0]}_{k[1]}": v for k, v in pw_scores.items()}, f, indent=4)
+    # Same token as evaluate_reliability_test above, for the same reason as on
+    # the train side: the saved avg_x_vec must be the one the pw_scores came
+    # from.
     avg_score, n_runs, avg_x_vec = compute_lp_score(
         ppi_list,
         protein_domains,
@@ -536,6 +565,8 @@ def score_test_split(
         reliability=best_r,
         num_runs=200,
         return_x=True,
+        seed=seed,
+        rng_token=f"test_eval:{variant}:{best_r}",
     )
     if avg_x_vec is not None:
         np.save(os.path.join(out_dir, f"avg_x_vec_{suffix}.npy"), avg_x_vec)

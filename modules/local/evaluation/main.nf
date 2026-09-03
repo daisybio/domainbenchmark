@@ -29,6 +29,7 @@ process EVAL_ONE {
             --predictions ${predictions} \\
             --model_name ${meta.model} \\
             ${sources_arg} \\
+            --seed ${params.seed} \\
             --out per_model/${meta.model}.json
         """
 

@@ -373,7 +373,7 @@ def load_embedding_data(
                             np.array(file[domain_a][emb]).ravel()
                             for file in domain_encoding_files
                         ]
-                        + [np.empty(0)]
+                        + [np.empty(0, dtype=np.float32)]
                     )
                 )
             for emb in proteins_b:
@@ -383,7 +383,7 @@ def load_embedding_data(
                             np.array(file[domain_b][emb]).ravel()
                             for file in domain_encoding_files
                         ]
-                        + [np.empty(0)]
+                        + [np.empty(0, dtype=np.float32)]
                     )
                 )
             for emb in interactions:
@@ -393,7 +393,7 @@ def load_embedding_data(
                             np.array(file[combined_domain_id][emb]).ravel()
                             for file in interaction_encoding_files
                         ]
-                        + [np.empty(0)]
+                        + [np.empty(0, dtype=np.float32)]
                     )
                 )
 
@@ -452,8 +452,10 @@ def load_embedding_data(
             f"{len(labeled_domain_pairs)} labelled domain pairs -- check the "
             "DDI CSVs and the feature files."
         )
-    x = np.concatenate(x).astype(np.float32)
-    y = np.array(y).astype(np.float32)
+    # concatenate(dtype=...) rather than concatenate().astype(...): the latter
+    # allocated the full concatenated array and then a second full-size copy.
+    x = np.concatenate(x, dtype=np.float32)
+    y = np.array(y, dtype=np.float32)
     _load_cache[cache_key] = (x, y, result_ddi_pairs, result_protein_pairs)
     while len(_load_cache) > _LOAD_CACHE_MAX:
         _load_cache.popitem(last=False)

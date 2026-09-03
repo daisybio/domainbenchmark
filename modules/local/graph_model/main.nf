@@ -1,6 +1,6 @@
 process GRAPH_MODEL {
     tag "${meta.id}"
-    label 'process_high'
+    label 'process_graph'
 
     conda "${projectDir}/environments/general.yml"
     container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"

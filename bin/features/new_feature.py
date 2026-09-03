@@ -8,7 +8,7 @@ Steps to add a new feature:
 4. If your feature needs GPU or large memory, also add it to params.large_features
 
 The pipeline auto-discovers features by name: extract_features.py calls
-importlib.import_module(f"features.{feature_name}").extract_features(conn, out_file).
+importlib.import_module(f"features.{feature_name}").extract_features(conn, out_file, seed).
 
 Database schema (domain_protein_map table):
     domain_id       INT     -- FK to domain.id
@@ -51,7 +51,10 @@ import sqlite3
 from features import embeddings
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
+    # Every encoder takes `seed`. Draw from `derive_seed(seed, ...)` keyed on
+    # the (domain, instance) pair -- never from the global RNG, and never
+    # keyed on iteration order. See features/dummy.py.
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
