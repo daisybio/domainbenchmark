@@ -150,41 +150,79 @@ def probe(protein_terms, ppi_df, terms, go_undirected, threshold):
     print(f"  component sizes (top 15)      : {sizes[:15]}")
     print(f"  singletons                    : {sum(1 for s in sizes if s == 1)}")
 
-    # Realised (component, component) pairs over the actual PPI list. This is
-    # the ceiling on kgiddi's cluster count: two PPIs whose component pairs
-    # differ can never be unioned, and everything inside one component pair
-    # collapses to at most two clusters (one, unless both components are
-    # bipartite).
+    # Every PPI's realised (component, component) pairs, over the actual PPI
+    # list. Counted **per distinct PPI**, not per term-pair occurrence: a PPI
+    # with |T(a)| x |T(b)| term-pairs hits the same component pair repeatedly,
+    # and counting occurrences made this figure exceed the PPI total.
     realised = Counter()
     ppis_without_terms = 0
+    # blocks[i] = union-find parent over component pairs, keyed by the pair.
+    parent: dict = {}
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
     for p1, p2 in zip(ppi_df["protein_1"].values, ppi_df["protein_2"].values):
         t1s = protein_terms.get(p1)
         t2s = protein_terms.get(p2)
         if not t1s or not t2s:
             ppis_without_terms += 1
             continue
+        touched = set()
         for a in t1s:
             for b in t2s:
                 ca, cb = comp_of[term_index[a]], comp_of[term_index[b]]
-                realised[(min(ca, cb), max(ca, cb))] += 1
+                touched.add((min(ca, cb), max(ca, cb)))
+        for block in touched:
+            realised[block] += 1          # once per PPI, not once per term-pair
+            parent.setdefault(block, block)
+        # A PPI belongs to *all* the component pairs its term-pairs realise, so
+        # it welds them into one union-find class. This is the step the first
+        # version of this probe missed, and it is the one that matters: without
+        # it the "upper bound" below reads as a cluster count when it is only a
+        # ceiling.
+        it = iter(touched)
+        first = next(it)
+        for block in it:
+            union(first, block)
 
     bipartite = [nx.is_bipartite(g3.subgraph(c)) for c in components]
     both_bip = sum(1 for (ca, cb) in realised if bipartite[ca] and bipartite[cb])
     ceiling = len(realised) + both_bip
+    floor = len({find(b) for b in parent})
 
     print(f"  PPIs (after filtering)        : {len(ppi_df)}")
     print(f"  PPIs with no usable GO terms  : {ppis_without_terms}")
     print(f"  realised component pairs      : {len(realised)}")
     print(f"  ... of which both bipartite   : {both_bip}")
-    print(f"  => upper bound on PPI clusters: {ceiling}")
-    if ceiling <= 1:
-        print("  !! DEGENERATE: everything collapses into one cluster. chi2 has")
-        print("     no outside stratum, so build_ddi_network would raise here")
-        print("     regardless of how fast the implementation is.")
-    largest = realised.most_common(1)
-    if largest:
-        (ca, cb), n = largest[0]
-        print(f"  largest component pair covers : {n} / {len(ppi_df)} PPIs "
+    # Two bounds, because neither is tight on its own:
+    #  * ceiling: PPIs in different component pairs can never be unioned, and
+    #    one component pair splits in two only when both its components are
+    #    bipartite (Weichsel). Loose, because it ignores PPIs that bridge pairs.
+    #  * floor: after welding every component pair a shared PPI touches, and
+    #    assuming each block is internally connected. The real count can only be
+    #    higher (a block's *realised* term-pairs may not be connected to each
+    #    other, and parity may split it), never lower.
+    print(f"  => PPI clusters, lower bound  : {floor}")
+    print(f"  => PPI clusters, upper bound  : {ceiling}")
+    if floor <= 1:
+        print("  !! DEGENERATE: the whole interactome welds into one cluster.")
+        print("     chi2 gets no outside stratum, so build_ddi_network raises")
+        print("     here however fast the implementation is. This threshold is")
+        print("     unusable on this split.")
+    ordered = realised.most_common(3)
+    for (ca, cb), n in ordered:
+        print(f"  component pair ({ca},{cb}) covers  : {n} / {len(ppi_df)} PPIs "
               f"({100.0 * n / max(len(ppi_df), 1):.1f}%)")
 
 
