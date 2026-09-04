@@ -178,64 +178,151 @@ def get_go_info(go_graph):
     return go_levels, go_undirected
 
 
-def build_close_protein_index(protein_go_terms, go_undirected, threshold):
-    """`{protein: set of proteins within GO distance <= threshold}`.
+def build_go_term_balls(protein_go_terms, go_undirected, threshold):
+    """GO-term ids and, per term, the used terms within `threshold` hops.
 
-    Replaces `protein_distances` + `functionally_similar`, which computed and
-    stored every finite pairwise GO distance in order to compare each one
-    against `threshold` exactly once. See the note in `preprocessing`.
+    Returns `(term_id, balls)`: `term_id` maps a GO accession to a dense index,
+    and `balls[i]` lists the indices of every *annotated* term within
+    `threshold` GO-graph hops of term `i`, itself included.
 
-    `dist(p, q)` is `min over t1 in T(p), t2 in T(q)` of the GO-graph distance,
-    so `dist(p, q) <= threshold` iff some `t2 in T(q)` lies in the
-    radius-`threshold` ball around some `t1 in T(p)`. The balls are found by a
-    depth-limited BFS from each *used* term over the full undirected GO graph --
-    the full graph, because a shortest path between two annotated terms may pass
-    through unannotated ones, exactly as the all-pairs matrix allowed.
+    The BFS runs over the **full** undirected GO graph and only filters on the
+    way out, because a shortest path between two annotated terms may pass
+    through unannotated ones -- exactly what the all-pairs distance matrix this
+    replaces allowed. `balls` is symmetric (`j in balls[i]` iff `i in balls[j]`)
+    because GO-graph distance is.
 
-    A protein is **not** its own neighbour, matching the old behaviour:
-    `protein_distances` only ever held `i < j` pairs, so `(p, p)` was absent and
-    `close[p]` never contained `p`. That is load-bearing in
-    `build_ddi_network` -- it is what stops two PPIs that share a protein from
-    being related through that shared protein -- so it is preserved rather than
-    quietly "fixed".
+    This is the whole of the geometry kgiddi needs. Only ~3564 terms are
+    annotated on `external_test`'s proteins, so it is a few thousand bounded BFS
+    runs -- against the ~1.4e8-entry all-pairs dict and the 1.1e9-entry
+    per-protein-pair distance dict that used to stand in for it.
     """
     used_terms = sorted({t for terms in protein_go_terms.values() for t in terms})
-    used = set(used_terms)
+    term_id = {t: i for i, t in enumerate(used_terms)}
 
-    ball = {}
+    balls = []
     for term in used_terms:
         seen = {term}
         frontier = deque([(term, 0)])
         reachable = []
         while frontier:
             node, dist = frontier.popleft()
-            if node in used:
-                reachable.append(node)
+            idx = term_id.get(node)
+            if idx is not None:
+                reachable.append(idx)
             if dist == threshold:
                 continue
             for neighbour in go_undirected[node]:
                 if neighbour not in seen:
                     seen.add(neighbour)
                     frontier.append((neighbour, dist + 1))
-        ball[term] = reachable
+        balls.append(reachable)
+    return term_id, balls
 
-    proteins_by_term = defaultdict(list)
-    for protein, terms in protein_go_terms.items():
-        for term in terms:
-            proteins_by_term[term].append(protein)
 
-    close = defaultdict(set)
-    for protein, terms in protein_go_terms.items():
-        reach = set()
-        for term in terms:
-            reach.update(ball.get(term, ()))
-        neighbours = set()
-        for term in reach:
-            neighbours.update(proteins_by_term.get(term, ()))
-        neighbours.discard(protein)
-        if neighbours:
-            close[protein] = neighbours
-    return close
+def cluster_similar_ppis(ppi_nodes, protein_go_terms, term_id, balls):
+    """Union-find over PPIs under the functional-similarity relation.
+
+    Returns a `UnionFind` whose classes over `ppi_nodes` are the transitive
+    closure of
+
+        ppi(a,b) ~ ppi(c,d)  iff  (dist(a,c) <= T and dist(b,d) <= T)
+                              or  (dist(a,d) <= T and dist(b,c) <= T)
+
+    computed **without enumerating PPI pairs**. The previous implementation
+    enumerated candidates through a protein-keyed inverted index, at
+    `|PPI| x |close[p]| x deg` -- about 1e11 iterations on `external_test`,
+    which is the 17 h of silence after `----- I: Build DDI network -----` in the
+    2026-09-03 log.
+
+    How it avoids them: `dist(p, q) <= T` iff some term of `q` lies in the ball
+    of some term of `p`, so the relation is a statement about **unordered pairs
+    of GO terms**, of which there are far fewer than PPI pairs. Build a
+    union-find over `PPIs + realised term-pairs` and add two kinds of edge:
+
+    1. every PPI to each term-pair it realises. Sound because two PPIs
+       realising the *same* term-pair are always similar -- the witness is
+       `goDist(t, t) = 0 <= T`, matched straight or crossed.
+    2. term-pair `{u,v}` to realised term-pair `{x,y}` when
+       `x in ball(u) and y in ball(v)`. Canonicalising pairs as unordered makes
+       this one enumeration cover the crossed case too: the crossed match
+       `x in ball(v), y in ball(u)` produces the same *set* of canonical keys
+       under the substitution `x <-> y`, since the balls are symmetric.
+
+    Restricted to the PPI nodes, the components of that graph are exactly the
+    closure of `~`: an edge of `~` is witnessed by two adjacent term-pairs, and
+    conversely every path through a shared or adjacent term-pair is a chain of
+    genuine similarities.
+
+    **This fixes a bug, so cluster membership changes.** `protein_distances`
+    only ever held `i < j` pairs, so `(p, p)` was absent and the old `close[p]`
+    excluded `p`. Both old paths therefore required the matched proteins to be
+    *distinct* -- an extra `a != c and b != d` that is nowhere in the stated
+    relation and that `dist(p, p) = 0` contradicts. Two PPIs sharing a protein
+    were not related through it. They are now. That condition is about protein
+    identity, so it does not factor through GO terms and cannot be expressed
+    here; the stated relation is what this computes.
+    """
+    # Realised term-pairs, canonical (lo, hi) over term ids.
+    pair_id = {}
+
+    def realised_pairs(a, b, create):
+        """Canonical term-pair ids realised by ppi(a, b)."""
+        out = set()
+        terms_b = protein_go_terms.get(b) or ()
+        for term_a in protein_go_terms.get(a) or ():
+            ia = term_id.get(term_a)
+            if ia is None:
+                continue
+            for term_b in terms_b:
+                ib = term_id.get(term_b)
+                if ib is None:
+                    continue
+                key = (ia, ib) if ia <= ib else (ib, ia)
+                pid = pair_id.get(key)
+                if pid is None:
+                    if not create:
+                        continue
+                    pid = len(pair_id)
+                    pair_id[key] = pid
+                out.add(pid)
+        return out
+
+    # Two passes rather than one pass that caches a set per PPI: UnionFind wants
+    # its element set up front, and on `external_test` there are 1.78 M PPIs, so
+    # holding one small set each is a few hundred MB alive at the same time as
+    # the union-find. Recomputing costs `sum |T(a)|*|T(b)|` a second time --
+    # about 7 M iterations.
+    for a, b in ppi_nodes:
+        realised_pairs(a, b, create=True)
+
+    logging.info(
+        f"Similarity index: {len(pair_id)} realised GO-term pairs over "
+        f"{len(term_id)} annotated terms, mean ball size "
+        f"{sum(len(b) for b in balls) / max(len(balls), 1):.1f}"
+    )
+
+    # Term-pair nodes are keyed by a shape no PPI tuple can collide with:
+    # a PPI is (uniprot_id, uniprot_id).
+    def pair_node(pid):
+        return ("\0termpair", pid)
+
+    uf = UnionFind(list(ppi_nodes) + [pair_node(pid) for pid in pair_id.values()])
+
+    # Edge kind 1: PPI -- its own term-pairs.
+    for a, b in ppi_nodes:
+        for pid in realised_pairs(a, b, create=False):
+            uf.union((a, b), pair_node(pid))
+
+    # Edge kind 2: adjacent term-pairs.
+    for (u, v), pid in pair_id.items():
+        node_u = pair_node(pid)
+        for x in balls[u]:
+            for y in balls[v]:
+                key = (x, y) if x <= y else (y, x)
+                other = pair_id.get(key)
+                if other is not None:
+                    uf.union(node_u, pair_node(other))
+    return uf
 
 
 _MAX_SUBGRAPH_NODES = 800
@@ -527,41 +614,28 @@ def preprocessing(
         }
         protein_go_terms = permuted_protein_go_terms
 
-    # Thresholded GO-similarity index, built from GO-term balls.
+    # No protein-pair distance structure is built at all any more.
     #
     # What used to be here: an (n_go x n_go) all-pairs distance matrix, then a
     # `for i: for j > i` loop over every protein pair taking a numpy min per
     # pair, storing every finite distance in `protein_distances`.
     #
-    # Two reasons that had to go, both measured on external_test/test
-    # (47408 proteins with GO terms, 3564 used GO terms):
+    # Both halves were untenable at `external_test` scale (47408 proteins with
+    # GO terms, 3564 annotated GO terms):
     #
     #   * the double loop is 1.14e9 Python iterations -- 2 h 38 m in the
     #     2026-09-03 run, between "Permuting GO term assignments" and the next
     #     log line;
     #   * the molecular_function GO graph is essentially one connected
     #     component, so almost every pair has a *finite* distance and got
-    #     stored: ~1.1e9 dict entries, which is the 150 GB resident that run
-    #     reported against a 160 GB cap.
+    #     stored: ~1.1e9 dict entries, the 150 GB resident that run reported
+    #     against a 160 GB cap.
     #
-    # And none of those distances was ever read as a distance. The only
-    # consumers are `build_ddi_network`, which immediately thresholds them into
-    # "is q within `threshold` of p", and `functionally_similar`, which did the
-    # same comparison. So the thresholded relation is built directly.
-    #
-    # It factors through GO terms exactly: `dist(p, q) <= threshold` iff some
-    # term of q lies within `threshold` GO-graph hops of some term of p, i.e.
-    # iff `T(q)` meets the union of the radius-`threshold` balls around `T(p)`.
-    # With only ~3564 terms in play that is a few thousand bounded BFS runs
-    # instead of a billion-entry matrix.
-    close = build_close_protein_index(protein_go_terms, go_undirected, threshold)
-    n_close_pairs = sum(len(v) for v in close.values())
-    logging.info(
-        f"GO-similarity index at threshold {threshold}: "
-        f"{len(close)} proteins with at least one neighbour, "
-        f"{n_close_pairs} ordered close pairs, "
-        f"max neighbourhood {max((len(v) for v in close.values()), default=0)}"
-    )
+    # And no consumer ever read a distance *as* a distance -- both compared it
+    # to `threshold`. `build_ddi_network` now derives the whole relation from
+    # GO-term balls instead (see `build_go_term_balls` and
+    # `cluster_similar_ppis`), so all this function has to hand on is which
+    # terms each protein carries.
 
     # Creation of ppi_list
     ppi1s = ppi_df["protein_1"].values
@@ -599,22 +673,25 @@ def preprocessing(
     with open(os.path.join(out_dir, "kgiddi_go_domains.json"), "w") as f:
         json.dump(shared_go_domains, f, indent=2)
 
-    return ddi_df, close, ppi_list, pd_df, shared_go_domains
+    return ddi_df, protein_go_terms, ppi_list, pd_df, shared_go_domains
 
 
-def build_ddi_network(close, ppi_list, pd_df, threshold, context=""):
+def build_ddi_network(
+    protein_go_terms, go_undirected, ppi_list, pd_df, threshold, context=""
+):
     """Cluster functionally similar PPIs with union-find, then chi2 the DDIs.
 
-    `close` is the thresholded GO-similarity index from
-    `build_close_protein_index`: `close[p]` is every protein within `threshold`
-    GO-graph hops of `p`, excluding `p` itself. It replaces the
-    `protein_distances` dict this used to threshold on entry -- see the note in
-    `preprocessing` for why that dict is gone.
+    The clustering is delegated to `cluster_similar_ppis`, which works on
+    unordered GO-term pairs rather than PPI pairs. Two things it replaced:
 
-    The `KGIDDI_LEGACY_BUILD` O(N^2) all-pairs escape hatch is gone with it: it
-    called `functionally_similar(protein_distances, ...)`, and there are no
-    stored distances to call it on. The inverted-index path below is the only
-    one, and it is the one the 2026-09-03 run used.
+    * the `protein_distances` dict this used to threshold into `close[p]` on
+      entry -- see the note in `preprocessing`;
+    * the protein-keyed candidate loop, `|PPI| x |close[p]| x deg`, which never
+      finished on `external_test`.
+
+    The `KGIDDI_LEGACY_BUILD` O(N^2) escape hatch went too: it called
+    `functionally_similar(protein_distances, ...)` and there are no stored
+    distances left to call it on.
     """
     # Prepare list of all PPIs as sorted tuples, ordered by degree (number of interactions) descending
     # Ordering allows to cluster high-degree PPIs first, improving efficiency
@@ -629,45 +706,15 @@ def build_ddi_network(close, ppi_list, pd_df, threshold, context=""):
 
     ppi_nodes = [tuple(sorted(ppi)) for ppi in ppi_list]
     ppi_nodes.sort(key=ppi_node_degree, reverse=True)
-    uf = UnionFind(ppi_nodes)
 
+    term_id, balls = build_go_term_balls(protein_go_terms, go_undirected, threshold)
+    uf = cluster_similar_ppis(ppi_nodes, protein_go_terms, term_id, balls)
+
+    # Cluster numbering still follows first appearance over the degree-sorted
+    # `ppi_nodes`, unchanged, because it is not cosmetic: `score_test_split`
+    # builds `chi2_scores` as a dict comprehension over the groups, so for a DDI
+    # that appears in two clusters the later group wins.
     clusters_dict = defaultdict(set)
-    # Inverted-index path: enumerate only candidate similar PPIs via a
-    # protein-keyed index.
-    #
-    # Similarity: ppi(a,b) ~ ppi(c,d) iff (c in close[a] AND d in close[b])
-    #                                  OR (c in close[b] AND d in close[a])
-    ppi_by_protein = defaultdict(list)
-    for idx, (a, b) in enumerate(ppi_nodes):
-        ppi_by_protein[a].append(idx)
-        ppi_by_protein[b].append(idx)
-
-    for i, (a, b) in enumerate(ppi_nodes):
-        close_a = close.get(a, ())
-        close_b = close.get(b, ())
-        candidates = set()
-        # Rule 1: c ~ a AND d ~ b
-        for c in close_a:
-            for j in ppi_by_protein.get(c, ()):
-                if j <= i:
-                    continue
-                x, y = ppi_nodes[j]
-                other = y if x == c else x
-                if other in close_b:
-                    candidates.add(j)
-        # Rule 2: c ~ b AND d ~ a
-        for c in close_b:
-            for j in ppi_by_protein.get(c, ()):
-                if j <= i:
-                    continue
-                x, y = ppi_nodes[j]
-                other = y if x == c else x
-                if other in close_a:
-                    candidates.add(j)
-        for j in candidates:
-            if not uf.connected(ppi_nodes[i], ppi_nodes[j]):
-                uf.union(ppi_nodes[i], ppi_nodes[j])
-
     for ppi in ppi_nodes:
         clusters_dict[uf.find(ppi)].add(ppi)
     clusters = []
@@ -796,7 +843,7 @@ def run_kgiddi(
         best_params = {}
 
         # Get clusters
-        ddi_df, close, ppi_list, pd_df, shared_go_domains = preprocessing(
+        ddi_df, protein_go_terms, ppi_list, pd_df, shared_go_domains = preprocessing(
             db_train,
             go_graph_nx,
             go_levels,
@@ -810,7 +857,8 @@ def run_kgiddi(
 
         # Precompute parameter-independent structures
         connected_components, group_ddi_chi2 = build_ddi_network(
-            close, ppi_list, pd_df, threshold, context=f"{database_path} train"
+            protein_go_terms, go_undirected, ppi_list, pd_df, threshold,
+            context=f"{database_path} train",
         )
 
         known_ddis = set(
@@ -857,7 +905,7 @@ def run_kgiddi(
             f"Current Best Fold Enrichment: {best_fold} with parameters: {best_params}"
         )
         # Delete large training objects
-        del ddi_df, close, ppi_list, pd_df
+        del ddi_df, protein_go_terms, ppi_list, pd_df
         gc.collect()
 
     if not training:
@@ -903,7 +951,7 @@ def score_test_split(
     # Run preprocessing for test data
     (
         ddi_df_test,
-        close_test,
+        protein_go_terms_test,
         ppi_list_test,
         pd_df_test,
         shared_go_domains_test,
@@ -938,9 +986,17 @@ def score_test_split(
     logging.info("----- I: Build DDI network -----")
     # Precompute parameter-independent structures for test data
     connected_components_test, group_ddi_chi2_test = build_ddi_network(
-        close_test, ppi_list_test, pd_df_test, threshold,
+        protein_go_terms_test, go_undirected, ppi_list_test, pd_df_test, threshold,
         context=f"{db_test} test_{variant}",
     )
+    # Freed here rather than in the `del` block further down, because
+    # `network_expansion` runs in between and that is where the process pool
+    # starts. The pool uses the spawn start method, so workers do not inherit
+    # the parent's heap -- but the parent's resident set still counts against
+    # the same cgroup as every worker, and `ppi_list_test` alone is 1.78 M
+    # tuples for external_test. Neither name is referenced again.
+    del ppi_list_test, protein_go_terms_test
+    gc.collect()
 
     # For the selected chi_square_cutoff, get DDI edges
     best_ddis_per_group_test = select_best_ddis_per_group(
