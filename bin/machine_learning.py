@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from pathlib import Path
 from sklearn.metrics import matthews_corrcoef
-from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
+from sklearn.model_selection import PredefinedSplit
 from typing import List
 
 from determinism import seed_everything
@@ -493,9 +493,52 @@ class DDIModelTrainer(ABC):
     def _load_train_data(self, args, balance_method: str, seed: int):
         """Load training data with the given balance strategy. Returns (x, y)."""
 
-    @abstractmethod
     def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
-        """Create and fit a RandomizedSearchCV. Returns the fitted object."""
+        """Create and fit a RandomizedSearchCV. Returns the fitted object.
+
+        Only reached through the default `_search` below. A subclass that
+        overrides `_search` (RandomForestTrainer does) never needs this.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} uses the default _search but does not "
+            "implement _create_grid_search"
+        )
+
+    def _search(self, hyperparameters, n_iter, load_train, x_opt, y_opt, config, num_features):
+        """Pick hyperparameters. Returns `(best_params, best_score)`.
+
+        `load_train` is a zero-argument callable returning `(x_train, y_train)`
+        -- not the arrays themselves. The caller therefore holds no reference to
+        them, so an implementation can drop the training block the moment it has
+        consumed it. That matters at the scale of the all-feature combo: the
+        default path below has to materialise a concatenation of train and
+        validation to satisfy scikit-learn's single-array API, and holding
+        `x_train` alive alongside it doubled the peak for no reason.
+
+        The default is scikit-learn's randomised search over one
+        `PredefinedSplit` fold: fit on the train block, score on the validation
+        block. `RandomForestTrainer` overrides it with the equivalent explicit
+        loop, which needs neither the concatenation nor the per-candidate
+        fancy-index copy scikit-learn makes of it.
+        """
+        x_train, y_train = load_train()
+        n_train = len(x_train)
+        x = np.concatenate([x_train, x_opt], axis=0)
+        y = np.concatenate([y_train, y_opt], axis=0)
+        # Free the train block now that it is inside `x`: `x_train` is dead
+        # weight for the whole search otherwise, and on the all-feature combo it
+        # is several gigabytes.
+        del x_train, y_train
+        gc.collect()
+
+        split = PredefinedSplit([-1] * n_train + [0] * len(x_opt))
+        gs = self._create_grid_search(
+            hyperparameters, n_iter, split, x, y, config, num_features
+        )
+        best = (gs.best_params_, gs.best_score_)
+        del x, y, gs
+        gc.collect()
+        return best
 
     @abstractmethod
     def _refit(self, best_params, best_balance, args, config, num_features):
@@ -667,20 +710,18 @@ class DDIModelTrainer(ABC):
 
         for balance_method in balance_methods:
             print(f"[grid] balance_method={balance_method}")
-            x_train, y_train = self._load_train_data(
-                args, balance_method, args.seed
+            # Passed as a callable, not as arrays: see `_search`. Keeping the
+            # train block out of this frame is what lets the search free it.
+            best_params, best_score = self._search(
+                hparams_filtered,
+                n_iter,
+                lambda bm=balance_method: self._load_train_data(args, bm, args.seed),
+                x_opt,
+                y_opt,
+                config,
+                num_features,
             )
-
-            x = np.concatenate([x_train, x_opt], axis=0)
-            y = np.concatenate([y_train, y_opt], axis=0)
-            split = PredefinedSplit([-1] * len(x_train) + [0] * len(x_opt))
-
-            gs = self._create_grid_search(
-                hparams_filtered, n_iter, split, x, y, config, num_features
-            )
-            results.append((gs.best_params_, gs.best_score_, balance_method))
-
-            del x, y, x_train, y_train, gs
+            results.append((best_params, best_score, balance_method))
             gc.collect()
 
         results.sort(key=lambda r: r[1], reverse=True)
@@ -715,9 +756,33 @@ class DDIModelTrainer(ABC):
         print(f"Tuned threshold: {best_thr:.3f} (MCC={best_mcc:.3f})")
 
         y_pred = (opt_agg["predicted_probability"].values >= best_thr).astype(int)
-        confusion_matrix = pd.crosstab(
-            opt_agg["true_interaction"].values, y_pred,
-            rownames=["Actual"], colnames=["Predicted"], margins=True,
+        # Counted with bincount rather than `pd.crosstab`. Two reasons, and the
+        # second one killed a 2 h cluster task:
+        #
+        #  1. crosstab pivots the whole column pair to produce a 2x2 print. On
+        #     the all-feature combo that is a groupby over ~1.4 M rows for four
+        #     numbers.
+        #  2. `DataFrame.unstack` -- which crosstab reaches through -- imports
+        #     `pandas.core.reshape.reshape` *lazily*, at this line. On a node
+        #     with no squashfuse, apptainer unpacks the whole SIF to a temp
+        #     sandbox per task; an incomplete unpack leaves a container whose
+        #     only visible symptom is a ModuleNotFoundError at the first lazy
+        #     import, and this was the latest one in the run. Counting inline
+        #     removes the dependency on an import that happens two hours in.
+        #
+        # Index is 2*true + pred, so 0=TN, 1=FP, 2=FN, 3=TP.
+        tn, fp, fn, tp = np.bincount(
+            2 * opt_agg["true_interaction"].values.astype(np.int64) + y_pred,
+            minlength=4,
+        )
+        confusion_matrix = pd.DataFrame(
+            [
+                [tn, fp, tn + fp],
+                [fn, tp, fn + tp],
+                [tn + fn, fp + tp, tn + fp + fn + tp],
+            ],
+            index=pd.Index([0, 1, "All"], name="Actual"),
+            columns=pd.Index([0, 1, "All"], name="Predicted"),
         )
         print(f"\nConfusion Matrix (DDI-level):\n\n{confusion_matrix}\n")
 

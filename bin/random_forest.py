@@ -3,10 +3,12 @@
 
 import gc
 import sys
+import time
 
 import numpy as np
 import pickle
-from sklearn.model_selection import RandomizedSearchCV
+from sklearn.metrics import average_precision_score
+from sklearn.model_selection import ParameterSampler
 
 from machine_learning import DDIModelTrainer, load_embedding_data
 
@@ -160,26 +162,78 @@ class RandomForestTrainer(DDIModelTrainer):
         return _load_train_with_balance(args, balance_method, seed)
 
     def _predict_proba(self, classifier, x):
-        return classifier.predict_proba(x.astype(np.float32))[:, 1]
+        # asarray, not astype: astype copies unconditionally, and
+        # load_embedding_data already assembles float32. On the all-feature
+        # combo that copy is several gigabytes per call.
+        return classifier.predict_proba(np.asarray(x, dtype=np.float32))[:, 1]
 
-    def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
+    def _search(self, hyperparameters, n_iter, load_train, x_opt, y_opt, config, num_features):
+        """Explicit randomised search, equivalent to the RandomizedSearchCV it replaced.
+
+        The old form was `RandomizedSearchCV(..., n_jobs=1, cv=PredefinedSplit,
+        refit=False)` over `np.concatenate([x_train, x_opt])`. With exactly one
+        fold and no refit, that concatenation existed only to satisfy the
+        single-array API, and scikit-learn then fancy-indexed a full copy of the
+        train block back out of it for every one of the ~200 candidates. On the
+        all-feature combo (283 k rows x ~7.6 k float32 columns, ~8.6 GB) the peak
+        was the original arrays plus the concatenation plus that copy -- which is
+        what pushed the `*_all` tasks past the 160 GB cap into exit 137.
+
+        Equivalence, point by point:
+
+        * `PredefinedSplit([-1]*n_train + [0]*n_opt)` yields exactly one fold
+          with `train = range(n_train)` and `test = range(n_train, n)`, so
+          `X[train]` was `x_train` and `X[test]` was `x_opt`, value for value.
+          Fitting on `x_train` directly feeds the estimator identical bytes.
+        * `RandomizedSearchCV._run_search` enumerates
+          `ParameterSampler(param_distributions, n_iter, random_state=random_state)`.
+          Constructing the same sampler with the same int seed yields the same
+          candidates in the same order.
+        * `scoring="average_precision"` resolves to
+          `average_precision_score(y_test, predict_proba(X_test)[:, 1])`; neither
+          this estimator nor scikit-learn's own forest has `decision_function`.
+        * `best_index_ = rank_test_score.argmin()` with ranks from
+          `rankdata(-score, method="min")` selects the *first* candidate holding
+          the maximum. `if score > best_score` does the same.
+        * `best_score_` is the mean over folds, i.e. the single fold's score.
+
+        `error_score="raise"` has no counterpart because there is no wrapper to
+        swallow the exception: a failing fit propagates out of this loop.
+        """
         rf_class = self._rf_class()
-        x = x.astype(np.float32)
-        y = y.astype(np.int32)
-        classifier = rf_class(random_state=self._seed, **self._rf_extra_kwargs())
-        # n_jobs=1: GPU handles parallelism; parallel CV jobs risk OOM
-        gs = RandomizedSearchCV(
-            classifier, hyperparameters, n_iter=n_iter, n_jobs=1,
-            cv=cv_split, refit=False, verbose=2, scoring="average_precision",
-            # Without random_state the search samples a different subset of the
-            # grid on every run, so repeated runs pick different models.
-            random_state=self._seed,
-            # Surface the real exception on the first failed fit instead of
-            # letting sklearn mask all N folds behind "All N fits failed".
-            error_score="raise",
+        x_train, y_train = load_train()
+        x_train = np.asarray(x_train, dtype=np.float32)
+        y_train = np.asarray(y_train, dtype=np.int32)
+        x_opt = np.asarray(x_opt, dtype=np.float32)
+        y_opt = np.asarray(y_opt, dtype=np.int32)
+
+        best_params, best_score = None, -np.inf
+        candidates = list(
+            ParameterSampler(hyperparameters, n_iter, random_state=self._seed)
         )
-        gs.fit(x, y)
-        return gs
+        for i, params in enumerate(candidates, 1):
+            started = time.monotonic()
+            classifier = rf_class(
+                **params, random_state=self._seed, **self._rf_extra_kwargs()
+            )
+            classifier.fit(x_train, y_train)
+            score = average_precision_score(
+                y_opt, self._predict_proba(classifier, x_opt)
+            )
+            print(
+                f"[CV] {i}/{len(candidates)} "
+                + ", ".join(f"{k}={params[k]}" for k in sorted(params))
+                + f"; AP={score:.6f}; total time={time.monotonic() - started:6.1f}s",
+                flush=True,
+            )
+            if score > best_score:
+                best_score, best_params = score, params
+            del classifier
+            gc.collect()
+
+        del x_train, y_train
+        gc.collect()
+        return best_params, best_score
 
     def _refit(self, best_params, best_balance, args, config, num_features):
         rf_class = self._rf_class()
@@ -190,8 +244,8 @@ class RandomForestTrainer(DDIModelTrainer):
             **best_params, random_state=self._seed, **self._rf_extra_kwargs()
         )
         print("Refitting best parameter model on training data...")
-        x_f32 = x_train.astype(np.float32)
-        y_i32 = y_train.astype(np.int32)
+        x_f32 = np.asarray(x_train, dtype=np.float32)
+        y_i32 = np.asarray(y_train, dtype=np.int32)
         del x_train, y_train
         gc.collect()
         classifier.fit(x_f32, y_i32)
