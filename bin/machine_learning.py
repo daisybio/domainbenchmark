@@ -452,9 +452,32 @@ def load_embedding_data(
             f"{len(labeled_domain_pairs)} labelled domain pairs -- check the "
             "DDI CSVs and the feature files."
         )
-    # concatenate(dtype=...) rather than concatenate().astype(...): the latter
-    # allocated the full concatenated array and then a second full-size copy.
-    x = np.concatenate(x, dtype=np.float32)
+    # Assemble into one preallocated array, releasing each block as it is
+    # copied in, instead of `np.concatenate(x, dtype=np.float32)`.
+    #
+    # concatenate already avoided the second full-size copy that
+    # `concatenate().astype()` made, but it could not release the *input*: the
+    # list still referenced every block while the output array was being
+    # allocated, so the peak was two full copies of the data. For
+    # external_test's `test` split -- 1385692 rows x 9174 float32 = 50.8 GB --
+    # that peak is 101.6 GB, and it is spread over ~138 k separate blocks whose
+    # freeing leaves the allocator too fragmented to return the arena.
+    #
+    # Dropping each reference right after the copy keeps the peak at one full
+    # array plus the not-yet-copied tail. Bitwise identical: same row order,
+    # and assigning into a float32 destination applies the same
+    # round-half-to-even cast concatenate's `dtype=` did.
+    n_cols = x[0].shape[1]
+    n_rows = sum(block.shape[0] for block in x)
+    out = np.empty((n_rows, n_cols), dtype=np.float32)
+    at = 0
+    for i in range(len(x)):
+        block = x[i]
+        out[at:at + block.shape[0]] = block
+        at += block.shape[0]
+        x[i] = None          # release as we go; the tail shrinks, the peak does not grow
+    del block
+    x = out
     y = np.array(y, dtype=np.float32)
     _load_cache[cache_key] = (x, y, result_ddi_pairs, result_protein_pairs)
     while len(_load_cache) > _LOAD_CACHE_MAX:
@@ -522,6 +545,11 @@ class DDIModelTrainer(ABC):
         fancy-index copy scikit-learn makes of it.
         """
         x_train, y_train = load_train()
+        # Anything derived from the training data alone -- input standardisation
+        # statistics, say -- has to be fitted here, before the concatenation.
+        # Fitting it on `x` would compute it over train *and* validation, which
+        # is exactly the leak the split exists to prevent.
+        self._fit_preprocessing(x_train, y_train)
         n_train = len(x_train)
         x = np.concatenate([x_train, x_opt], axis=0)
         y = np.concatenate([y_train, y_opt], axis=0)
@@ -554,6 +582,17 @@ class DDIModelTrainer(ABC):
 
     def _pre_train_hook(self, args):
         """Called before training starts. Override for e.g. CUDA probe."""
+        pass
+
+    def _fit_preprocessing(self, x_train, y_train):
+        """Fit any train-only preprocessing before the search sees the data.
+
+        Called by `_search` on the training block alone, so a subclass can
+        derive statistics from it without those statistics being contaminated by
+        the validation block the search scores against. `NeuralNetworkTrainer`
+        uses it for input standardisation; tree models need none, so the default
+        does nothing.
+        """
         pass
 
     def _predict_proba(self, classifier, x):

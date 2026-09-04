@@ -21,7 +21,7 @@
             0.7,
             0.8
         ],
-        "threshold": 3,
+        "threshold": 1,
         "go_graph": "/nfs/data/CoBiNet_Masterpraktikum/go-basic.obo"
     },
     "permutation": false,

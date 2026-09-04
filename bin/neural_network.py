@@ -63,9 +63,76 @@ class SeededNeuralNetBinaryClassifier(NeuralNetBinaryClassifier):
         return super().initialize()
 
 
+def standardisation_stats(x, chunk_rows: int = 8192):
+    """Per-column mean and standard deviation of `x`, for input standardisation.
+
+    Computed in float64 over row chunks. Both parts matter at this scale: the
+    all-feature combo is ~283 k rows x 9174 columns, where `x.mean(axis=0)` on a
+    float32 array accumulates in float32 and loses precision, and a
+    `x.astype(np.float64)` would be a second full-size allocation of a matrix
+    that is already 10 GB.
+
+    Columns with zero variance get scale 1.0 rather than 0.0 -- the same
+    convention `sklearn.preprocessing.StandardScaler` uses. Several are
+    genuinely constant here (an amino acid absent from every domain in the
+    split, say), and dividing by their standard deviation would put inf or nan
+    into every row.
+    """
+    n_rows, n_cols = x.shape
+    total = np.zeros(n_cols, dtype=np.float64)
+    total_sq = np.zeros(n_cols, dtype=np.float64)
+    for start in range(0, n_rows, chunk_rows):
+        # 8192 rows of 9174 float64 columns is ~600 MB. Deliberately not larger:
+        # a 65536-row chunk is 4.8 GB, and `np.square(block)` would allocate a
+        # second one, so the statistics pass would cost more than the matrix.
+        block = np.asarray(x[start:start + chunk_rows], dtype=np.float64)
+        total += block.sum(axis=0)
+        block *= block          # in place -- no second full-size chunk
+        total_sq += block.sum(axis=0)
+        del block
+    mean = total / n_rows
+    variance = np.maximum(total_sq / n_rows - np.square(mean), 0.0)
+    scale = np.sqrt(variance)
+    scale[scale == 0.0] = 1.0
+    return mean.astype(np.float32), scale.astype(np.float32)
+
+
 class MLPModule(torch.nn.Module):
+    """MLP with input standardisation folded in as non-trainable buffers.
+
+    The standardisation lives *inside* the module rather than in a
+    `sklearn.pipeline.Pipeline` for two reasons:
+
+    * Memory. A `StandardScaler.transform` on the test matrix would allocate a
+      second copy of it, and for external_test's `test` split that is 50.8 GB --
+      the exact allocation that OOM-killed this process before. As buffers, the
+      shift and scale are applied per mini-batch on the device, so they cost
+      nothing on the host.
+    * Persistence. `_save_model` stores `classifier.module_` with `torch.save`,
+      so buffers travel with the model and `--predict-only` standardises with
+      the training statistics automatically. A Pipeline would have needed a
+      separate artefact, and every `module__*` key in
+      `assets/NeuralNetwork.json` would have had to be re-prefixed.
+
+    Why it is needed at all: the feature vector concatenates sources whose
+    scales differ by orders of magnitude -- aacomp is a composition in [0, 1],
+    the ESM/ProtT5 columns are raw activations. Unstandardised, ~70 of the 100
+    grid candidates on external_test collapsed to a constant output and scored
+    exactly the validation base rate (0.53010142 = 7370/13903), and three more
+    diverged to NaN. That is most of the search budget spent on models that
+    carry no information.
+
+    `input_mean`/`input_std` default to no-op (0 and 1) so a module constructed
+    without them behaves as it did before.
+    """
+
     def __init__(
-        self, input_size: int, hidden_layer_sizes: List[int] = None, dropout_rate=0.5
+        self,
+        input_size: int,
+        hidden_layer_sizes: List[int] = None,
+        dropout_rate=0.5,
+        input_mean=None,
+        input_std=None,
     ):
         if hidden_layer_sizes is None:
             hidden_layer_sizes = []
@@ -79,8 +146,24 @@ class MLPModule(torch.nn.Module):
                 layers.append(torch.nn.Dropout(dropout_rate))
         self.layers = torch.nn.Sequential(*layers)
 
+        mean = (
+            torch.zeros(input_size, dtype=torch.float32)
+            if input_mean is None
+            else torch.as_tensor(np.asarray(input_mean, dtype=np.float32))
+        )
+        std = (
+            torch.ones(input_size, dtype=torch.float32)
+            if input_std is None
+            else torch.as_tensor(np.asarray(input_std, dtype=np.float32))
+        )
+        # Buffers, not parameters: they are statistics of the training split, not
+        # something gradient descent may move. Registering them puts them in
+        # state_dict, so they survive torch.save/torch.load.
+        self.register_buffer("input_mean", mean)
+        self.register_buffer("input_std", std)
+
     def forward(self, x):
-        return self.layers(x)
+        return self.layers((x - self.input_mean) / self.input_std)
 
 
 class NeuralNetworkTrainer(DDIModelTrainer):
@@ -104,6 +187,20 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             balance_classes=downsample, seed=seed,
         )
 
+    # Set by _fit_preprocessing from the training block only. None means "no
+    # standardisation", which is what MLPModule's defaults give.
+    _input_mean = None
+    _input_std = None
+
+    def _fit_preprocessing(self, x_train, y_train):
+        self._input_mean, self._input_std = standardisation_stats(x_train)
+        n_const = int(np.sum(self._input_std == 1.0))
+        print(
+            f"[standardise] fitted on {x_train.shape[0]} training rows x "
+            f"{x_train.shape[1]} features ({n_const} zero-variance columns left "
+            "unscaled)"
+        )
+
     def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
         device = config["device"]
         if device in ("auto", "cuda") and not torch.cuda.is_available():
@@ -124,6 +221,8 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             device=device,
             verbose=0,
             module__input_size=num_features,
+            module__input_mean=self._input_mean,
+            module__input_std=self._input_std,
             iterator_train__shuffle=True,
             # random_state: an unseeded ValidSplit draws a different holdout on
             # every fit, which moves both the EarlyStopping signal and the score
@@ -150,6 +249,13 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         n_neg = int(np.sum(y_train == 0))
         pos_weight = torch.tensor([n_neg / max(n_pos, 1)])
 
+        # Re-fitted here rather than reused from the search: `best_balance` need
+        # not be the last balance method the grid loop tried, and the
+        # standardisation has to describe the block this model is actually
+        # trained on. It then rides along in the saved module's buffers, so
+        # predict() and --predict-only standardise with these same statistics.
+        self._fit_preprocessing(x_train, y_train)
+
         device = config["device"]
         if device in ("auto", "cuda") and not torch.cuda.is_available():
             device = "cpu"
@@ -164,6 +270,8 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             **best_params,
             verbose=1,
             module__input_size=num_features,
+            module__input_mean=self._input_mean,
+            module__input_std=self._input_std,
             criterion__pos_weight=pos_weight,
             iterator_train__shuffle=True,
             train_split=ValidSplit(0.2, stratified=True, random_state=self._seed),
@@ -189,16 +297,43 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         module.eval()
         return module
 
+    # Rows per forward pass on the raw-module path. MLPModule is Linear + ReLU +
+    # Dropout only -- no BatchNorm, nothing that mixes rows -- so chunking the
+    # forward pass is bitwise identical to one call over the whole matrix.
+    _PREDICT_CHUNK_ROWS = 65536
+
     def _predict_proba(self, classifier, x):
         if isinstance(classifier, torch.nn.Module):
+            # Chunked, because the test matrix is not small: external_test's
+            # `test` split is 1385692 x 9174 float32 = 50.8 GB, and the previous
+            # form did `torch.tensor(x)` (a full 50.8 GB host copy) and then
+            # `.to(device)` (a 50.8 GB transfer onto a 44 GB A40).
+            device = (
+                next(classifier.parameters()).device
+                if hasattr(classifier, "layers")
+                else None
+            )
+            out = np.empty(len(x), dtype=np.float32)
             with torch.no_grad():
-                x_t = torch.tensor(x, dtype=torch.float32)
-                if hasattr(classifier, "layers"):
-                    device = next(classifier.parameters()).device
-                    x_t = x_t.to(device)
-                logits = classifier(x_t).squeeze(-1)
-                return torch.sigmoid(logits).cpu().numpy()
-        return classifier.predict_proba(x.astype(np.float32))[:, 1]
+                for start in range(0, len(x), self._PREDICT_CHUNK_ROWS):
+                    stop = min(start + self._PREDICT_CHUNK_ROWS, len(x))
+                    x_t = torch.from_numpy(
+                        np.asarray(x[start:stop], dtype=np.float32)
+                    )
+                    if device is not None:
+                        x_t = x_t.to(device)
+                    logits = classifier(x_t).squeeze(-1)
+                    out[start:stop] = torch.sigmoid(logits).cpu().numpy()
+                    del x_t, logits
+            return out
+        # asarray, not astype: astype copies unconditionally, and
+        # load_embedding_data already assembles float32. On the all-feature
+        # combo that copy was a second 50.8 GB allocation on top of the array
+        # it was copying -- which is the OOM that killed
+        # external_test_neural_network_all at the *prediction* step, after the
+        # grid search and refit had both completed. skorch batches internally
+        # from here, so nothing else needs chunking on this path.
+        return classifier.predict_proba(np.asarray(x, dtype=np.float32))[:, 1]
 
 
 if __name__ == "__main__":

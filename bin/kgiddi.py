@@ -5,7 +5,7 @@ import os
 import pandas as pd
 import networkx as nx
 import json
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
 import numpy as np
 from pathlib import Path
 import gc
@@ -165,35 +165,77 @@ def get_go_info(go_graph):
     logging.info(level_stats)
     logging.info(depth_stats)
 
-    # For each go term, compute the shortest path to all other go terms, in the induced indirected graph, as the distances will be symmetric, calculate efficiently the all pairs shortest path lengths in the undirected version of the graph
+    # The undirected view, not an all-pairs distance dict.
+    #
+    # `dict(nx.all_pairs_shortest_path_length(go_undirected))` used to be built
+    # here: ~1.4e8 entries over the 10131-node molecular_function graph, tens of
+    # GB, for every kgiddi task. Its only consumer thresholded the distances, and
+    # only ever between the few thousand GO terms actually annotated on proteins
+    # in the split -- which `preprocessing` discovers, and this function cannot.
+    # So the graph is handed on and the bounded BFS happens there, per used term.
     go_undirected = go_graph.to_undirected()
-    all_pairs_shortest_path_length = dict(
-        nx.all_pairs_shortest_path_length(go_undirected)
-    )
 
-    return go_levels, all_pairs_shortest_path_length
+    return go_levels, go_undirected
 
 
-# Functionally similar check (replace with your actual logic)
-def functionally_similar(protein_distances, ppi1, ppi2, threshold):
-    a, b = ppi1
-    c, d = ppi2
-    dist_ac = protein_distances.get(tuple(sorted((a, c))), float("inf"))
-    dist_ad = protein_distances.get(tuple(sorted((a, d))), float("inf"))
-    dist_bc = protein_distances.get(tuple(sorted((b, c))), float("inf"))
-    dist_bd = protein_distances.get(tuple(sorted((b, d))), float("inf"))
-    # Use your threshold and logic here (example: at least one pair below threshold)
-    return (
-        dist_ac is not None
-        and dist_bd is not None
-        and dist_ac <= threshold
-        and dist_bd <= threshold
-    ) or (
-        dist_ad is not None
-        and dist_bc is not None
-        and dist_ad <= threshold
-        and dist_bc <= threshold
-    )
+def build_close_protein_index(protein_go_terms, go_undirected, threshold):
+    """`{protein: set of proteins within GO distance <= threshold}`.
+
+    Replaces `protein_distances` + `functionally_similar`, which computed and
+    stored every finite pairwise GO distance in order to compare each one
+    against `threshold` exactly once. See the note in `preprocessing`.
+
+    `dist(p, q)` is `min over t1 in T(p), t2 in T(q)` of the GO-graph distance,
+    so `dist(p, q) <= threshold` iff some `t2 in T(q)` lies in the
+    radius-`threshold` ball around some `t1 in T(p)`. The balls are found by a
+    depth-limited BFS from each *used* term over the full undirected GO graph --
+    the full graph, because a shortest path between two annotated terms may pass
+    through unannotated ones, exactly as the all-pairs matrix allowed.
+
+    A protein is **not** its own neighbour, matching the old behaviour:
+    `protein_distances` only ever held `i < j` pairs, so `(p, p)` was absent and
+    `close[p]` never contained `p`. That is load-bearing in
+    `build_ddi_network` -- it is what stops two PPIs that share a protein from
+    being related through that shared protein -- so it is preserved rather than
+    quietly "fixed".
+    """
+    used_terms = sorted({t for terms in protein_go_terms.values() for t in terms})
+    used = set(used_terms)
+
+    ball = {}
+    for term in used_terms:
+        seen = {term}
+        frontier = deque([(term, 0)])
+        reachable = []
+        while frontier:
+            node, dist = frontier.popleft()
+            if node in used:
+                reachable.append(node)
+            if dist == threshold:
+                continue
+            for neighbour in go_undirected[node]:
+                if neighbour not in seen:
+                    seen.add(neighbour)
+                    frontier.append((neighbour, dist + 1))
+        ball[term] = reachable
+
+    proteins_by_term = defaultdict(list)
+    for protein, terms in protein_go_terms.items():
+        for term in terms:
+            proteins_by_term[term].append(protein)
+
+    close = defaultdict(set)
+    for protein, terms in protein_go_terms.items():
+        reach = set()
+        for term in terms:
+            reach.update(ball.get(term, ()))
+        neighbours = set()
+        for term in reach:
+            neighbours.update(proteins_by_term.get(term, ()))
+        neighbours.discard(protein)
+        if neighbours:
+            close[protein] = neighbours
+    return close
 
 
 _MAX_SUBGRAPH_NODES = 800
@@ -355,8 +397,9 @@ def preprocessing(
     db_path,
     go_graph,
     go_levels,
-    all_pairs_shortest_path_length,
+    go_undirected,
     out_dir,
+    threshold,
     permutation=False,
     seed=42,
     ppi_score_cutoff=DEFAULT_PPI_SCORE_CUTOFF,
@@ -448,14 +491,8 @@ def preprocessing(
         ppi_partners[p1].add(p2)
         ppi_partners[p2].add(p1)
 
-    # Filter distances to only those go terms present in pgo_df
-    valid_go_terms = set(pgo_df["go_accession"].unique())
-    filtered_distances = []
-    for source, targets in all_pairs_shortest_path_length.items():
-        if source in valid_go_terms:
-            for target, dist in targets.items():
-                if target in valid_go_terms and source != target:
-                    filtered_distances.append(dist)
+    # (A loop over the whole all-pairs distance dict used to sit here, building
+    # a `filtered_distances` list that nothing ever read. Removed with the dict.)
 
     # Now get for each protein the go_term(s) with the highest level (most specific)
     protein_go_terms = {}
@@ -490,55 +527,41 @@ def preprocessing(
         }
         protein_go_terms = permuted_protein_go_terms
 
-    # Vectorized + sparsified protein_distances construction.
+    # Thresholded GO-similarity index, built from GO-term balls.
     #
-    # Legacy version materialized a dict of N*(N-1)/2 entries (~44 M for
-    # n_proteins≈9400) using a triple Python loop over GO term lookups. New
-    # version:
-    #   1. Builds a single GO-term-id matrix D once from the precomputed
-    #      all_pairs_shortest_path_length (one pass, no per-pair dict lookups).
-    #   2. Per-pair min distance via numpy slice (D[ti[:,None], tj[None,:]]).
-    #   3. Emits only finite distances — pairs with no GO-graph path between
-    #      their most-specific terms never reach the consumer, which used to
-    #      get None and treat it as not-similar anyway.
-    used_go_terms = sorted(
-        {t for terms in protein_go_terms.values() for t in terms}
+    # What used to be here: an (n_go x n_go) all-pairs distance matrix, then a
+    # `for i: for j > i` loop over every protein pair taking a numpy min per
+    # pair, storing every finite distance in `protein_distances`.
+    #
+    # Two reasons that had to go, both measured on external_test/test
+    # (47408 proteins with GO terms, 3564 used GO terms):
+    #
+    #   * the double loop is 1.14e9 Python iterations -- 2 h 38 m in the
+    #     2026-09-03 run, between "Permuting GO term assignments" and the next
+    #     log line;
+    #   * the molecular_function GO graph is essentially one connected
+    #     component, so almost every pair has a *finite* distance and got
+    #     stored: ~1.1e9 dict entries, which is the 150 GB resident that run
+    #     reported against a 160 GB cap.
+    #
+    # And none of those distances was ever read as a distance. The only
+    # consumers are `build_ddi_network`, which immediately thresholds them into
+    # "is q within `threshold` of p", and `functionally_similar`, which did the
+    # same comparison. So the thresholded relation is built directly.
+    #
+    # It factors through GO terms exactly: `dist(p, q) <= threshold` iff some
+    # term of q lies within `threshold` GO-graph hops of some term of p, i.e.
+    # iff `T(q)` meets the union of the radius-`threshold` balls around `T(p)`.
+    # With only ~3564 terms in play that is a few thousand bounded BFS runs
+    # instead of a billion-entry matrix.
+    close = build_close_protein_index(protein_go_terms, go_undirected, threshold)
+    n_close_pairs = sum(len(v) for v in close.values())
+    logging.info(
+        f"GO-similarity index at threshold {threshold}: "
+        f"{len(close)} proteins with at least one neighbour, "
+        f"{n_close_pairs} ordered close pairs, "
+        f"max neighbourhood {max((len(v) for v in close.values()), default=0)}"
     )
-    go_id = {t: i for i, t in enumerate(used_go_terms)}
-    n_go = len(used_go_terms)
-    D = np.full((n_go, n_go), np.inf, dtype=np.float32)
-    for source, targets in all_pairs_shortest_path_length.items():
-        si = go_id.get(source)
-        if si is None:
-            continue
-        for target, dist in targets.items():
-            ti_ = go_id.get(target)
-            if ti_ is not None:
-                D[si, ti_] = dist
-    protein_term_ids = {
-        p: np.fromiter(
-            (go_id[t] for t in terms if t in go_id),
-            dtype=np.intp,
-            count=sum(1 for t in terms if t in go_id),
-        )
-        for p, terms in protein_go_terms.items()
-    }
-    proteins_list = list(protein_term_ids.keys())
-    n_proteins = len(proteins_list)
-    protein_distances = {}
-    for i in range(n_proteins):
-        ti = protein_term_ids[proteins_list[i]]
-        if ti.size == 0:
-            continue
-        p_i = proteins_list[i]
-        for j in range(i + 1, n_proteins):
-            tj = protein_term_ids[proteins_list[j]]
-            if tj.size == 0:
-                continue
-            min_dist = float(D[ti[:, None], tj[None, :]].min())
-            if np.isfinite(min_dist):
-                p_j = proteins_list[j]
-                protein_distances[tuple(sorted((p_i, p_j)))] = min_dist
 
     # Creation of ppi_list
     ppi1s = ppi_df["protein_1"].values
@@ -576,11 +599,23 @@ def preprocessing(
     with open(os.path.join(out_dir, "kgiddi_go_domains.json"), "w") as f:
         json.dump(shared_go_domains, f, indent=2)
 
-    return ddi_df, protein_distances, ppi_list, pd_df, shared_go_domains
+    return ddi_df, close, ppi_list, pd_df, shared_go_domains
 
 
-def build_ddi_network(protein_distances, ppi_list, pd_df, threshold, context=""):
+def build_ddi_network(close, ppi_list, pd_df, threshold, context=""):
+    """Cluster functionally similar PPIs with union-find, then chi2 the DDIs.
 
+    `close` is the thresholded GO-similarity index from
+    `build_close_protein_index`: `close[p]` is every protein within `threshold`
+    GO-graph hops of `p`, excluding `p` itself. It replaces the
+    `protein_distances` dict this used to threshold on entry -- see the note in
+    `preprocessing` for why that dict is gone.
+
+    The `KGIDDI_LEGACY_BUILD` O(N^2) all-pairs escape hatch is gone with it: it
+    called `functionally_similar(protein_distances, ...)`, and there are no
+    stored distances to call it on. The inverted-index path below is the only
+    one, and it is the one the 2026-09-03 run used.
+    """
     # Prepare list of all PPIs as sorted tuples, ordered by degree (number of interactions) descending
     # Ordering allows to cluster high-degree PPIs first, improving efficiency
     ppi_degree = Counter()
@@ -597,65 +632,41 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold, context="")
     uf = UnionFind(ppi_nodes)
 
     clusters_dict = defaultdict(set)
-    if os.environ.get("KGIDDI_LEGACY_BUILD"):
-        # Legacy O(N^2) all-pairs scan. Kept as a parity escape hatch — set
-        # KGIDDI_LEGACY_BUILD=1 to compare against the inverted-index path on
-        # the same inputs.
-        logging.warning(
-            "KGIDDI_LEGACY_BUILD set — using O(N^2) all-pairs Union-Find loop"
-        )
-        for i, ppi1 in enumerate(ppi_nodes):
-            for j in range(i + 1, len(ppi_nodes)):
-                ppi2 = ppi_nodes[j]
-                if not uf.connected(ppi1, ppi2):
-                    if functionally_similar(
-                        protein_distances, ppi1, ppi2, threshold
-                    ):
-                        uf.union(ppi1, ppi2)
-    else:
-        # Inverted-index path: enumerate only candidate similar PPIs via a
-        # protein-keyed index. Drops the 2.25e10 pair scan that previously
-        # took 6-7 hours per kgiddi task.
-        #
-        # Similarity: ppi(a,b) ~ ppi(c,d) iff (c in close[a] AND d in close[b])
-        #                                  OR (c in close[b] AND d in close[a])
-        # where close[p] = {q : protein_distances[(p,q)] <= threshold}.
-        close = defaultdict(set)
-        for (p, q), d in protein_distances.items():
-            if d is not None and d <= threshold:
-                close[p].add(q)
-                close[q].add(p)
+    # Inverted-index path: enumerate only candidate similar PPIs via a
+    # protein-keyed index.
+    #
+    # Similarity: ppi(a,b) ~ ppi(c,d) iff (c in close[a] AND d in close[b])
+    #                                  OR (c in close[b] AND d in close[a])
+    ppi_by_protein = defaultdict(list)
+    for idx, (a, b) in enumerate(ppi_nodes):
+        ppi_by_protein[a].append(idx)
+        ppi_by_protein[b].append(idx)
 
-        ppi_by_protein = defaultdict(list)
-        for idx, (a, b) in enumerate(ppi_nodes):
-            ppi_by_protein[a].append(idx)
-            ppi_by_protein[b].append(idx)
-
-        for i, (a, b) in enumerate(ppi_nodes):
-            close_a = close.get(a, ())
-            close_b = close.get(b, ())
-            candidates = set()
-            # Rule 1: c ~ a AND d ~ b
-            for c in close_a:
-                for j in ppi_by_protein.get(c, ()):
-                    if j <= i:
-                        continue
-                    x, y = ppi_nodes[j]
-                    other = y if x == c else x
-                    if other in close_b:
-                        candidates.add(j)
-            # Rule 2: c ~ b AND d ~ a
-            for c in close_b:
-                for j in ppi_by_protein.get(c, ()):
-                    if j <= i:
-                        continue
-                    x, y = ppi_nodes[j]
-                    other = y if x == c else x
-                    if other in close_a:
-                        candidates.add(j)
-            for j in candidates:
-                if not uf.connected(ppi_nodes[i], ppi_nodes[j]):
-                    uf.union(ppi_nodes[i], ppi_nodes[j])
+    for i, (a, b) in enumerate(ppi_nodes):
+        close_a = close.get(a, ())
+        close_b = close.get(b, ())
+        candidates = set()
+        # Rule 1: c ~ a AND d ~ b
+        for c in close_a:
+            for j in ppi_by_protein.get(c, ()):
+                if j <= i:
+                    continue
+                x, y = ppi_nodes[j]
+                other = y if x == c else x
+                if other in close_b:
+                    candidates.add(j)
+        # Rule 2: c ~ b AND d ~ a
+        for c in close_b:
+            for j in ppi_by_protein.get(c, ()):
+                if j <= i:
+                    continue
+                x, y = ppi_nodes[j]
+                other = y if x == c else x
+                if other in close_a:
+                    candidates.add(j)
+        for j in candidates:
+            if not uf.connected(ppi_nodes[i], ppi_nodes[j]):
+                uf.union(ppi_nodes[i], ppi_nodes[j])
 
     for ppi in ppi_nodes:
         clusters_dict[uf.find(ppi)].add(ppi)
@@ -694,9 +705,13 @@ def build_ddi_network(protein_distances, ppi_list, pd_df, threshold, context="")
     # PPI interactions as set of tuples
     ppi_interactions = set(ppi_list)
     # Protein to domain mapping as dict of sets
+    # zip over the column arrays, not `iterrows()`: that builds a Series per
+    # row, and pd_df has ~63 k rows for external_test.
     pd_filtered_dict = defaultdict(set)
-    for _, row in pd_df.iterrows():
-        pd_filtered_dict[row["uniprot_id"]].add(row["pfam_id"])
+    for uniprot_id, pfam_id in zip(
+        pd_df["uniprot_id"].values, pd_df["pfam_id"].values
+    ):
+        pd_filtered_dict[uniprot_id].add(pfam_id)
 
     connected_components = {
         cluster["group_name"]: cluster["members"] for cluster in clusters
@@ -772,7 +787,7 @@ def run_kgiddi(
     )
 
     # Get necessary information from GO graph
-    go_levels, aps_paths = get_go_info(go_graph_nx)
+    go_levels, go_undirected = get_go_info(go_graph_nx)
 
     log_resource_usage("Start run_kgiddi")
 
@@ -781,12 +796,13 @@ def run_kgiddi(
         best_params = {}
 
         # Get clusters
-        ddi_df, protein_distances, ppi_list, pd_df, shared_go_domains = preprocessing(
+        ddi_df, close, ppi_list, pd_df, shared_go_domains = preprocessing(
             db_train,
             go_graph_nx,
             go_levels,
-            aps_paths,
+            go_undirected,
             out_dir,
+            threshold,
             permutation=permutation,
             seed=seed,
             ppi_score_cutoff=ppi_score_cutoff,
@@ -794,7 +810,7 @@ def run_kgiddi(
 
         # Precompute parameter-independent structures
         connected_components, group_ddi_chi2 = build_ddi_network(
-            protein_distances, ppi_list, pd_df, threshold, context=f"{database_path} train"
+            close, ppi_list, pd_df, threshold, context=f"{database_path} train"
         )
 
         known_ddis = set(
@@ -841,7 +857,7 @@ def run_kgiddi(
             f"Current Best Fold Enrichment: {best_fold} with parameters: {best_params}"
         )
         # Delete large training objects
-        del ddi_df, protein_distances, ppi_list, pd_df
+        del ddi_df, close, ppi_list, pd_df
         gc.collect()
 
     if not training:
@@ -857,7 +873,7 @@ def run_kgiddi(
             params_json,
             go_graph_nx,
             go_levels,
-            aps_paths,
+            go_undirected,
             out_dir,
             threshold,
             permutation,
@@ -875,7 +891,7 @@ def score_test_split(
     params_json,
     go_graph_nx,
     go_levels,
-    aps_paths,
+    go_undirected,
     out_dir,
     threshold,
     permutation,
@@ -887,7 +903,7 @@ def score_test_split(
     # Run preprocessing for test data
     (
         ddi_df_test,
-        protein_distances_test,
+        close_test,
         ppi_list_test,
         pd_df_test,
         shared_go_domains_test,
@@ -895,8 +911,9 @@ def score_test_split(
         db_test,
         go_graph_nx,
         go_levels,
-        aps_paths,
+        go_undirected,
         out_dir,
+        threshold,
         permutation=permutation,
         seed=seed,
         ppi_score_cutoff=ppi_score_cutoff,
@@ -921,7 +938,7 @@ def score_test_split(
     logging.info("----- I: Build DDI network -----")
     # Precompute parameter-independent structures for test data
     connected_components_test, group_ddi_chi2_test = build_ddi_network(
-        protein_distances_test, ppi_list_test, pd_df_test, threshold,
+        close_test, ppi_list_test, pd_df_test, threshold,
         context=f"{db_test} test_{variant}",
     )
 
@@ -993,10 +1010,20 @@ def score_test_split(
     # Prepare output: Domain id1, domain id2, true interaction (0/1), predicted interaction (0/1), predicted probability (chi2 score normalized)
     # Every DDI row in a split database belongs to that split by construction
     # (domainsplit's SUBSET_SPLIT_DB), so there is nothing to filter out.
-    ddi_actual = {
-        (row["domain_a"], row["domain_b"]): row["interaction"]
-        for _, row in ddi_df_test.iterrows()
-    }
+    # zip over the column arrays rather than `iterrows()` -- 138642 rows for
+    # external_test, each of which was materialised as a Series. Insertion order
+    # is unchanged, which matters: `random_jitter` below is indexed positionally
+    # against `ddi_actual.items()`. Duplicate keys still keep the last
+    # occurrence, exactly as the dict comprehension did.
+    ddi_actual = dict(
+        zip(
+            zip(
+                ddi_df_test["domain_a"].values,
+                ddi_df_test["domain_b"].values,
+            ),
+            ddi_df_test["interaction"].values,
+        )
+    )
     output_rows = []
     # Normalize chi2 scores for later roc curve plotting, using max chi2 score in test data
     # A single DDI can legitimately score 0 (its contingency row or column is
