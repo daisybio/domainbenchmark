@@ -1,4 +1,5 @@
 import h5py
+import numpy as np
 
 # HDF5 layout is `h5[pfam_id][instance_key]`.
 #
@@ -43,10 +44,17 @@ def write_instance(out_file: h5py.File, domain_key: str, instance_key: str, valu
 
     `domain_key` is the Pfam accession (see the note above), `instance_key` the
     opaque domain-instance identifier.
+
+    Cast to float32, the only precision the pipeline carries -- the ML loader
+    assembles every row into a float32 array, so anything wider is truncated on
+    the way in anyway, and the rounding is the same either way. Without the cast
+    h5py takes the dtype from what it is handed, so the `list[float]` an encoder
+    naturally returns lands as float64 and doubles the file (aacomp and aaencode
+    both did).
     """
     if domain_key not in out_file:
         domain_group = out_file.create_group(domain_key)
     else:
         domain_group = out_file[domain_key]
 
-    domain_group[instance_key] = value
+    domain_group[instance_key] = np.asarray(value, dtype=np.float32)
