@@ -161,11 +161,39 @@ class RandomForestTrainer(DDIModelTrainer):
     def _load_train_data(self, args, balance_method, seed):
         return _load_train_with_balance(args, balance_method, seed)
 
+    # Rows per predict_proba call. Both backends score rows independently --
+    # cuML's FIL walks each row through every tree, sklearn sums per-tree
+    # probabilities in tree order -- so chunking is bitwise identical to one
+    # call over the whole matrix.
+    _PREDICT_CHUNK_ROWS = 65536
+
     def _predict_proba(self, classifier, x):
         # asarray, not astype: astype copies unconditionally, and
         # load_embedding_data already assembles float32. On the all-feature
         # combo that copy is several gigabytes per call.
-        return classifier.predict_proba(np.asarray(x, dtype=np.float32))[:, 1]
+        #
+        # Chunked, because cuML copies the whole input onto the device:
+        # external_test's `test` split is 1385692 x 9174 float32 = 50.8 GB
+        # against a 44 GB A40, so the un-chunked call cannot run at all. A
+        # single chunk is 2.4 GB. Inputs at or below one chunk take the old
+        # path untouched, dtype included -- the CPU backend returns float64 and
+        # the tuned MCC threshold is sensitive to that.
+        head = classifier.predict_proba(
+            np.asarray(x[:self._PREDICT_CHUNK_ROWS], dtype=np.float32)
+        )[:, 1]
+        n_rows = len(x)
+        if n_rows <= self._PREDICT_CHUNK_ROWS:
+            return head
+
+        out = np.empty(n_rows, dtype=head.dtype)
+        out[:len(head)] = head
+        del head
+        for start in range(self._PREDICT_CHUNK_ROWS, n_rows, self._PREDICT_CHUNK_ROWS):
+            stop = min(start + self._PREDICT_CHUNK_ROWS, n_rows)
+            out[start:stop] = classifier.predict_proba(
+                np.asarray(x[start:stop], dtype=np.float32)
+            )[:, 1]
+        return out
 
     def _search(self, hyperparameters, n_iter, load_train, x_opt, y_opt, config, num_features):
         """Explicit randomised search, equivalent to the RandomizedSearchCV it replaced.

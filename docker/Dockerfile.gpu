@@ -1,8 +1,8 @@
 FROM mambaorg/micromamba:1.5.10
 
-# Build/tag as konstantinpelz/domainbenchmark-gpu:1.0.0 — synced with environments/ml.yml
+# Build/tag as konstantinpelz/domainbenchmark-gpu:1.0.1 — synced with environments/ml.yml
 LABEL org.opencontainers.image.source="https://github.com/daisybio/domainbenchmark"
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.version="1.0.1"
 LABEL org.opencontainers.image.description="GPU container (CUDA 12.8, cuML 26.02, torch 2.7, skorch)"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -36,6 +36,7 @@ RUN micromamba create -y -n ${ENV_NAME} -c rapidsai -c conda-forge -c nvidia \
     cudnn=9 \
     pip=25.0 \
     biopython \
+    pyarrow \
     && micromamba clean --all --yes
 
 RUN micromamba run -n ${ENV_NAME} pip install \

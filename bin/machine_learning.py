@@ -192,6 +192,7 @@ def load_embedding_data(
         str(ddi_path),
         dataset,
         bool(balance_classes),
+        bool(return_protein_pairs),
         int(seed),
     )
     if cache_key in _load_cache:
@@ -259,12 +260,34 @@ def load_embedding_data(
             "instance cross-product per DDI pair."
         )
 
-    x = []
-    y = []
     result_ddi_pairs = []
     result_protein_pairs = []
 
-    # Load embeddings and instantiate the domain pairs
+    # Load embeddings and instantiate the domain pairs.
+    #
+    # Two passes over the same open files. The first resolves which (domain
+    # pair, instance pair) combinations every feature file actually carries --
+    # h5py key lookups only, nothing is read -- and the second reads the vectors
+    # straight into one preallocated float32 array.
+    #
+    # The single-pass form built a list of per-pair blocks and copied that into
+    # the destination afterwards, which cost two full materialisations, and the
+    # blocks were float64: aacomp and aaencode store Python lists (h5py writes
+    # those as float64) while the published embeddings are float16, so
+    # `np.concatenate` promoted every row to the widest input. On external_test's
+    # `test` split -- 1385692 rows x 9174 columns -- the block list alone held
+    # 101.7 GB against a 50.8 GB destination. Releasing each block right after
+    # copying it did not bound the peak: at ~734 KB a block, glibc ratchets its
+    # mmap threshold past that size after the first frees, so the blocks come
+    # from the brk arena and freeing the interior never returns pages to the OS.
+    # Peak was ~152 GB against a 160 GB cap, and the task was OOM-killed while
+    # loading the test split.
+    #
+    # Writing each row directly into the float32 destination drops both the
+    # float64 widening and the second copy, leaving the destination as the peak.
+    # Bitwise identical to the old path: float16 and float32 sources are exact
+    # in float32, and a float64 source is rounded half-to-even exactly once
+    # either way -- the old code only deferred that rounding to the block copy.
     with ExitStack() as stack:
         domain_encoding_files = []
         domain_encoding_names = []
@@ -296,6 +319,10 @@ def load_embedding_data(
         pair_hits = {name: 0 for name in domain_encoding_names + interaction_encoding_names}
         candidates_seen = 0
         candidates_resolved = 0
+        # (domain_a, domain_b, interaction, instance_combinations) per usable
+        # pair. The combination tuples are the ones `instance_pairs` already
+        # owns, so this costs pointers rather than a second copy of the keys.
+        plan = []
 
         for domain_a, domain_b, interaction in labeled_domain_pairs:
             pair_found = True
@@ -355,64 +382,8 @@ def load_embedding_data(
             candidates_resolved += len(instance_combinations)
             if not instance_combinations:
                 continue
-            proteins_a, proteins_b = zip(*instance_combinations)
-            interactions = [f"{ia}_{ib}" for ia, ib in instance_combinations]
+            plan.append((domain_a, domain_b, interaction, instance_combinations))
 
-            # load embeddings for the instance pairs
-            # we will concatenate the embeddings from all features for both domains and the interaction
-            # the embeddings should have the shape (n_instance_pairs, embedding_size) where embedding_size is the sum of the sizes of all features
-            # so each row corresponds to a specific protein pair and the columns correspond to the concatenated features for that pair
-            embeddings_a = []
-            embeddings_b = []
-            interaction_embeddings = []
-
-            for emb in proteins_a:
-                embeddings_a.append(
-                    np.concatenate(
-                        [
-                            np.array(file[domain_a][emb]).ravel()
-                            for file in domain_encoding_files
-                        ]
-                        + [np.empty(0, dtype=np.float32)]
-                    )
-                )
-            for emb in proteins_b:
-                embeddings_b.append(
-                    np.concatenate(
-                        [
-                            np.array(file[domain_b][emb]).ravel()
-                            for file in domain_encoding_files
-                        ]
-                        + [np.empty(0, dtype=np.float32)]
-                    )
-                )
-            for emb in interactions:
-                interaction_embeddings.append(
-                    np.concatenate(
-                        [
-                            np.array(file[combined_domain_id][emb]).ravel()
-                            for file in interaction_encoding_files
-                        ]
-                        + [np.empty(0, dtype=np.float32)]
-                    )
-                )
-
-            joined_embeddings = np.concatenate(
-                [embeddings_a, embeddings_b, interaction_embeddings], axis=1
-            )
-
-            # filter out rows with NaN values
-            nan_filter = ~np.isnan(joined_embeddings).any(axis=1)
-            joined_embeddings = joined_embeddings[nan_filter]
-
-            x.append(joined_embeddings)
-
-            # append interaction multiple times
-            y.extend([interaction] * joined_embeddings.shape[0])
-            result_ddi_pairs.extend([(domain_a, domain_b)] * joined_embeddings.shape[0])
-            result_protein_pairs.extend(
-                np.array(instance_combinations)[nan_filter].tolist()
-            )
         # Assert the join resolved rather than assuming it. A feature that
         # matched no domain pair at all is not "sparse coverage" -- it is a file
         # keyed by something other than these databases' domain ids.
@@ -445,40 +416,79 @@ def load_embedding_data(
                 "not."
             )
 
-    if len(x) == 0:
-        raise ValueError(
-            f"{dataset}: no usable rows. {candidates_resolved} instance pairs "
-            f"resolved out of {candidates_seen} candidates across "
-            f"{len(labeled_domain_pairs)} labelled domain pairs -- check the "
-            "DDI CSVs and the feature files."
-        )
-    # Assemble into one preallocated array, releasing each block as it is
-    # copied in, instead of `np.concatenate(x, dtype=np.float32)`.
-    #
-    # concatenate already avoided the second full-size copy that
-    # `concatenate().astype()` made, but it could not release the *input*: the
-    # list still referenced every block while the output array was being
-    # allocated, so the peak was two full copies of the data. For
-    # external_test's `test` split -- 1385692 rows x 9174 float32 = 50.8 GB --
-    # that peak is 101.6 GB, and it is spread over ~138 k separate blocks whose
-    # freeing leaves the allocator too fragmented to return the arena.
-    #
-    # Dropping each reference right after the copy keeps the peak at one full
-    # array plus the not-yet-copied tail. Bitwise identical: same row order,
-    # and assigning into a float32 destination applies the same
-    # round-half-to-even cast concatenate's `dtype=` did.
-    n_cols = x[0].shape[1]
-    n_rows = sum(block.shape[0] for block in x)
-    out = np.empty((n_rows, n_cols), dtype=np.float32)
-    at = 0
-    for i in range(len(x)):
-        block = x[i]
-        out[at:at + block.shape[0]] = block
-        at += block.shape[0]
-        x[i] = None          # release as we go; the tail shrinks, the peak does not grow
-    del block
-    x = out
-    y = np.array(y, dtype=np.float32)
+        if not plan:
+            raise ValueError(
+                f"{dataset}: no usable rows. {candidates_resolved} instance pairs "
+                f"resolved out of {candidates_seen} candidates across "
+                f"{len(labeled_domain_pairs)} labelled domain pairs -- check the "
+                "DDI CSVs and the feature files."
+            )
+
+        # Column widths, taken from the first resolved combination.
+        # `combination_available` passed for it in every file, so every lookup
+        # here exists; `.shape` on an h5py dataset is metadata, nothing is read.
+        first_a, first_b, _, first_combos = plan[0]
+        first_ia, first_ib = first_combos[0]
+        domain_widths = [
+            int(np.prod(f[first_a][first_ia].shape)) for f in domain_encoding_files
+        ]
+        interaction_widths = [
+            int(np.prod(f[f"{first_a}_{first_b}"][f"{first_ia}_{first_ib}"].shape))
+            for f in interaction_encoding_files
+        ]
+        n_cols = 2 * sum(domain_widths) + sum(interaction_widths)
+
+        # Upper bound: the NaN filter below only ever removes rows, so allocate
+        # for every resolved combination and slice at the end. `out[:at]` is a
+        # view, which keeps the whole allocation alive -- the right trade here,
+        # since copying it down would need exactly the second full-size buffer
+        # this rewrite removed.
+        n_upper = sum(len(combos) for *_, combos in plan)
+        out = np.empty((n_upper, n_cols), dtype=np.float32)
+        y = np.empty(n_upper, dtype=np.float32)
+
+        at = 0
+        for domain_a, domain_b, interaction, instance_combinations in plan:
+            # Group handles hoisted out of the row loop: one lookup per (pair,
+            # file) instead of one per (row, file).
+            groups_a = [f[domain_a] for f in domain_encoding_files]
+            groups_b = [f[domain_b] for f in domain_encoding_files]
+            interaction_groups = [
+                f[f"{domain_a}_{domain_b}"] for f in interaction_encoding_files
+            ]
+            # One tuple per pair, referenced once per row -- the old
+            # `[(domain_a, domain_b)] * n` shared it the same way.
+            ddi_pair = (domain_a, domain_b)
+
+            for instance_a, instance_b in instance_combinations:
+                row = out[at]
+                col = 0
+                for group, width in zip(groups_a, domain_widths):
+                    row[col:col + width] = np.asarray(group[instance_a]).ravel()
+                    col += width
+                for group, width in zip(groups_b, domain_widths):
+                    row[col:col + width] = np.asarray(group[instance_b]).ravel()
+                    col += width
+                if interaction_groups:
+                    joined_instance = f"{instance_a}_{instance_b}"
+                    for group, width in zip(interaction_groups, interaction_widths):
+                        row[col:col + width] = np.asarray(
+                            group[joined_instance]
+                        ).ravel()
+                        col += width
+
+                # Drop rows carrying a NaN. `at` does not advance, so the next
+                # row overwrites this one in place.
+                if np.isnan(row).any():
+                    continue
+                y[at] = interaction
+                result_ddi_pairs.append(ddi_pair)
+                if return_protein_pairs:
+                    result_protein_pairs.append([instance_a, instance_b])
+                at += 1
+
+    x = out[:at]
+    y = y[:at]
     _load_cache[cache_key] = (x, y, result_ddi_pairs, result_protein_pairs)
     while len(_load_cache) > _LOAD_CACHE_MAX:
         _load_cache.popitem(last=False)
@@ -664,6 +674,9 @@ class DDIModelTrainer(ABC):
         training happens once and only the scoring loop fans out.
         """
         args.out_predictions_dir.mkdir(parents=True, exist_ok=True)
+        # train() leaves the validation split cached; nothing below wants it,
+        # and the test splits are the largest arrays the process ever holds.
+        clear_load_cache()
 
         for test_split in args.test_splits:
             variant = variant_of(test_split)
