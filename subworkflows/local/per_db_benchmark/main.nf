@@ -21,7 +21,7 @@ include { FEATURE_EXTRACTION                            } from '../../../modules
 include { NEURAL_NETWORK                                } from '../../../modules/local/neural_network/main.nf'
 include { RANDOM_FOREST                                 } from '../../../modules/local/random_forest/main.nf'
 include { GRAPH_MODEL                                   } from '../../../modules/local/graph_model/main.nf'
-include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
+include { EVAL_ONE; METADATA; ENRICHMENT; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 
 
 def csvToList(s) {
@@ -65,8 +65,8 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         // DDI + Feature extraction (per-DB)
         // ---------------------------------------------------------------
-        DDI_EXTRACTION(db_ch)
-        ddi_ch = DDI_EXTRACTION.out.ddi   // tuple(meta, ddi_dir)
+        DDI_EXTRACTION(db_ch) // in addition writes out mapping file to DDI dir for later use in metadata creation
+        ddi_ch = DDI_EXTRACTION.out.ddi   // tuple(meta, ddi_dir)  
 
         FEATURE_EXTRACTION(Channel.from(ml_features), db_ch)
 
@@ -151,14 +151,82 @@ workflow PER_DB_BENCHMARK {
             }
         EVAL_ONE(all_predictions_ch)
 
+
         // ---------------------------------------------------------------
-        // Per-DB MultiQC reduce. Group EVAL_ONE outputs by DB, then join
+        // If params.metadata is provided, first generate the metadata for each database
+        // Following run the enrichment analysis for each model and database combination
+        // This is needed as for each database type the corresponding metadata for the ddis needs to be aggregated accordingly
+        // ---------------------------------------------------------------
+
+        // params.metadata points to a directory containing two files: domain_metadata.csv and ddi_metadata.csv
+        def metadata_input = params.metadata ? file(params.metadata) : null
+
+        enrichment_output_ch = Channel.empty()
+
+        if (metadata_input) {
+            // Only need ddi_keyes, there only the test set is actually needed for the enrichment analysis, as the evaluation is only performed on the test set.
+            def metadata_ch = ddi_keyed.map { _db_id, meta, ddi_dir ->
+                tuple(meta, metadata_input, ddi_dir)
+            }
+
+
+            // def metadata_ch = db_ch.map { meta, db_path ->
+            //     m = [
+            //         id: "${meta.id}_metadata",
+            //         db: meta.id  // the db here is identical to meta_id in db channel and therefore to meta.db in the predictions channel
+            //     ]
+            //     tuple(m, metadata, db_path)
+            // }
+
+            METADATA(metadata_ch)
+
+            // ---------------------------------------------------------------
+            // Per-model enrichment (scatter)
+            // ---------------------------------------------------------------
+
+
+            // key METADATA output by db id
+            metadata_keyed_ch = METADATA.out.metadata
+                .map { meta, metadata_file -> tuple(meta.db, metadata_file) }
+
+            // key predictions by db id, then join with the metadata channel
+            all_predictions_ch = NEURAL_NETWORK.out.predictions
+                .mix(RANDOM_FOREST.out.predictions)
+                .mix(GRAPH_MODEL.out.predictions)
+                .map { meta, pred ->
+                    def f          = pred instanceof java.util.List ? pred[0] : pred
+                    def model_name = file(f).getParent().getName()
+                    def m_eval     = [
+                        id   : "${meta.db}_${model_name}",
+                        db   : meta.db,
+                        model: model_name
+                    ]
+                    tuple(meta.db, m_eval, f)
+                }
+                .combine(metadata_keyed_ch, by: 0)
+                .map { _db_id, m_eval, f, metadata_file ->
+                    tuple(m_eval, metadata_file, f)
+                }
+
+            ENRICHMENT(all_predictions_ch)
+
+            enrichment_output_ch = ENRICHMENT.out.metrics
+        }
+
+
+        
+        
+
+        // ---------------------------------------------------------------
+        // Per-DB MultiQC reduce. Group EVAL_ONE and ENRICHMENT outputs by DB, then join
         // back to db_ch to recover (meta, db_path) for the EVALUATION call.
+        // Evaluation gets the JSONs from both the EVAL_ONE and ENRICHMENT processes, plus the old report path for comparison.
         // ---------------------------------------------------------------
         per_model_jsons_ch = EVAL_ONE.out.metrics
             .map { meta, j -> tuple(meta.db, j) }
+            .mix(enrichment_output_ch.map { meta, j -> tuple(meta.db, j) })
             .groupTuple()
-
+            
         evaluation_input_ch = db_ch
             .map { meta, db_path -> tuple(meta.id, meta, db_path) }
             .join(per_model_jsons_ch)
@@ -182,6 +250,12 @@ workflow PER_DB_BENCHMARK {
             .mix(GRAPH_MODEL.out.versions)
             .mix(EVAL_ONE.out.versions)
             .mix(EVALUATION.out.versions)
+
+        if (metadata_input) {
+            ch_versions = ch_versions
+                .mix(METADATA.out.versions)
+                .mix(ENRICHMENT.out.versions)
+        }
 
     emit:
         report   = EVALUATION.out.report   // tuple(meta, evaluation/)

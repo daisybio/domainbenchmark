@@ -29,9 +29,14 @@ process DDI_EXTRACTION {
                                 NOT negative AS interaction
                         FROM domain_domain_interaction;
                 ''', conn)
+                mapping_df = pd.read_sql('''
+                        SELECT id as domain_id, pfam_id
+                        FROM domain;
+                ''', conn)
 
             os.makedirs(f"${meta.id}/DDI/", exist_ok=True)
             ddi_df.to_csv(f"${meta.id}/DDI/test.csv", index=False)
+            mapping_df.to_csv(f"${meta.id}/DDI/mapping.csv", index=False)
             PYEOF
 
             cat <<-END_VERSIONS > versions.yml
@@ -49,16 +54,25 @@ process DDI_EXTRACTION {
             import os
 
             os.makedirs(f"${meta.id}/DDI/", exist_ok=True)
+
             for dbtype in ('train', 'test', 'optimization'):
                 path = f"${database_dir}/{dbtype}.sqlite3"
                 if os.path.isfile(path):
+                    print(f"Processing {dbtype} split from {path}")
                     with sqlite3.connect(path) as conn:
                         ddi_df = pd.read_sql('''
                                 SELECT domain_id_a AS domain_1, domain_id_b AS domain_2,
                                         NOT negative AS interaction
                                 FROM domain_domain_interaction
-                                WHERE is_evaluation_relevant;
                         ''', conn)
+                    if dbtype == 'test':
+                        mapping_df = pd.read_sql('''
+                                SELECT id as domain_id, pfam_id
+                                FROM domain;
+                        ''', conn)
+                        print(f"Found {len(mapping_df)} mapping entries for {dbtype} split.")
+                        mapping_df.to_csv(f"${meta.id}/DDI/mapping.csv", index=False)
+                    
                     ddi_df.to_csv(f"${meta.id}/DDI/{dbtype}.csv", index=False)
             PYEOF
 

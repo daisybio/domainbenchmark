@@ -432,6 +432,141 @@ def aggregate_per_model_metrics(per_model_files):
     return metrics_aucap, roc_curves, pr_curves, metrics_df, model_list
 
 
+ENRICHMENT_TARGET_ORDER = ["binary", "predicted", "combined", "error"]
+
+ENRICHMENT_TARGET_LABELS = {
+    "error": "Prediction error",
+    "binary": "True interaction",
+    "predicted": "Predicted interaction",
+    "combined": "Combined (TN/FN/FP/TP)",
+}
+
+
+def aggregate_per_model_enrichment(per_model_files):
+
+    """
+    Load per-model enrichment JSON sidecars from `eval_enrichment.py`.
+ 
+    Each file has the shape:
+        {
+          "model_name": str,
+          "<target>": {
+              "model_kind": "ols" | "logit" | "mnlogit",
+              "complete_model": {
+                  "r2": float, "r2_adj": float, "r2_label": str,
+                  "n_samples": int, "n_features": int,
+                  "coefficients": {feature: float},
+                  "pvalues": {feature: float},
+                  "odds_ratios": {feature: float},        # logit only
+                  "per_class": {...},                     # mnlogit only
+              },
+              "partial_model_r2": {feature: float},
+              "single_feature_r2": {feature: float},
+              "checks": {...},
+          },
+          ... one entry per target ("error", "binary", "predicted", "combined") ...
+        }
+ 
+    Returns
+    -------
+    enrichment_by_model : dict[model_name -> parsed json]
+    models   : sorted list of model names found
+    targets  : list of target names found, in ENRICHMENT_TARGET_ORDER where possible
+    features : sorted list of all feature names found across all models/targets
+    """
+
+
+    enrichment_by_model = {}
+    targets_seen = set()
+    features_seen = set()
+ 
+    for fp in per_model_files:
+        with open(fp, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        model_name = obj.get("model_name") or os.path.basename(fp).split(".enrichment.json")[0]
+        enrichment_by_model[model_name] = obj
+ 
+        for target_name, target_data in obj.items():
+            if target_name == "model_name" or not isinstance(target_data, dict):
+                continue
+            targets_seen.add(target_name)
+            features_seen.update(target_data.get("partial_model_r2", {}).keys())
+            features_seen.update(target_data.get("single_feature_r2", {}).keys())
+ 
+    models = sorted(enrichment_by_model.keys())
+    targets = [t for t in ENRICHMENT_TARGET_ORDER if t in targets_seen]
+    targets += sorted(targets_seen - set(targets))
+    features = sorted(features_seen)
+ 
+    return enrichment_by_model, models, targets, features
+
+
+
+
+def get_signed_effect(target_data: dict, feature: str):
+    """
+    Best-effort *signed* effect size for `feature` within one target's
+    `complete_model`, used for the cross-target sign-agreement heatmap.
+ 
+    - OLS / Logit: the (signed) coefficient itself.
+    - MNLogit: the top-level "coefficients" entry is a mean of *absolute*
+      values across the non-baseline equations (see eval_enrichment.py),
+      so it carries no sign. Instead we use the coefficient of the
+      TP-vs-baseline(TN) equation ("class_3_vs_baseline"), i.e. the slice of
+      the combined target that is most directly comparable to "does this
+      feature push towards a real, correctly-predicted interaction" - the
+      other two non-baseline equations (FN, FP) are still available in the
+      per-model JSON for closer inspection, just not summarised here.
+ 
+    Returns None if no signed effect is available for this feature/target.
+    """
+    model_kind = target_data.get("model_kind")
+    complete_model = target_data.get("complete_model", {})
+    if model_kind in ("ols", "logit"):
+        return complete_model.get("coefficients", {}).get(feature)
+ 
+    if model_kind == "mnlogit":
+        per_class = complete_model.get("per_class", {})
+        tp_eq = per_class.get("class_3_vs_baseline", {})
+        return tp_eq.get("coefficients", {}).get(feature)
+ 
+    return None
+
+
+def get_odds_ratio_series(target_data: dict):
+    """
+    Return a list of (label, odds_ratio_dict, ci_low_dict, ci_high_dict)
+    tuples for whichever odds ratios exist on this target's complete_model:
+    one series for a plain Logit target, or one series per non-baseline
+    equation for an MNLogit target. Empty list if the target has no odds
+    ratios (e.g. the "error" / OLS target).
+    """
+    model_kind = target_data.get("model_kind")
+    complete_model = target_data.get("complete_model", {})
+    series = []
+ 
+    if model_kind == "logit" and "odds_ratios" in complete_model:
+        series.append((
+            "",
+            complete_model["odds_ratios"],
+            complete_model.get("ci_lower", {}),
+            complete_model.get("ci_upper", {}),
+        ))
+ 
+    elif model_kind == "mnlogit" and "per_class" in complete_model:
+        for eq_name, eq_data in complete_model["per_class"].items():
+            series.append((
+                f" ({eq_name})",
+                eq_data.get("odds_ratios", {}),
+                eq_data.get("ci_lower", {}),
+                eq_data.get("ci_upper", {}),
+            ))
+ 
+    return series
+
+
+
+
 def calculate_metrics(y_true, y_pred, model_name) -> dict[str, object]:
     TP = np.sum((y_true == 1) & (y_pred == 1))
     TN = np.sum((y_true == 0) & (y_pred == 0))

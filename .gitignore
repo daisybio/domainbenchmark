@@ -213,3 +213,4 @@ run_eval_multiqc_single.sh
 # Claude
 .claude/
 .mcp.json
+bin/check_h5_file.ipynb

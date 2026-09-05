@@ -14,7 +14,7 @@ process EVAL_ONE {
         tuple val(meta), path(predictions)
 
     output:
-        tuple val(meta), path("per_model/${meta.model}.json"), emit: metrics
+        tuple val(meta), path("per_model/${meta.model}.eval.json"), emit: metrics
         path "versions.yml",                                    emit: versions
 
     script:
@@ -24,7 +24,7 @@ process EVAL_ONE {
         eval_one.py \\
             --predictions ${predictions} \\
             --model_name ${meta.model} \\
-            --out per_model/${meta.model}.json
+            --out per_model/${meta.model}.eval.json
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":
@@ -32,6 +32,71 @@ process EVAL_ONE {
         END_VERSIONS
         """
 }
+
+
+process METADATA {
+    tag "${meta.id}"
+    label 'process_eval_metadata_creation'
+
+    conda "${projectDir}/environments/general.yml"
+    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
+
+    input:
+        tuple val(meta), path(metadata), path(ddi_dir)
+
+    output:
+        tuple val(meta), path("metadata/${meta.id}.csv"), emit: metadata
+        path "versions.yml",                  emit: versions
+
+    script:
+        """
+        mkdir -p metadata
+
+        create_metadata.py \\
+            --metadata ${metadata} \\
+            --ddi ${ddi_dir}/test.csv \\
+            --mapping ${ddi_dir}/mapping.csv \\
+            --out metadata/${meta.id}.csv
+
+        cat <<-END_VERSIONS > versions.yml
+        "${task.process}":
+            python: \$(python --version 2>&1 | sed 's/Python //')
+        END_VERSIONS
+        """
+}
+
+process ENRICHMENT {
+    tag "${meta.id}"
+    label 'process_eval_enrichment'
+
+    conda "${projectDir}/environments/general.yml"
+    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
+
+    input:
+        tuple val(meta), path(metadata), path(predictions)
+
+    output:
+        tuple val(meta), path("per_model/${meta.model}.enrichment.json"), emit: metrics
+        path "versions.yml",                                    emit: versions
+
+    script:
+        """
+        mkdir -p per_model
+
+        eval_enrichment.py \\
+            --predictions ${predictions} \\
+            --model_name ${meta.model} \\
+            --metadata ${metadata} \\
+            --standardize \\
+            --out per_model/${meta.model}.enrichment.json
+
+        cat <<-END_VERSIONS > versions.yml
+        "${task.process}":
+            python: \$(python --version 2>&1 | sed 's/Python //')
+        END_VERSIONS
+        """
+}
+
 
 
 process EVALUATION {

@@ -17,12 +17,17 @@ from pathlib import Path
 import json
 import multiqc
 import shutil
+import numpy as np
 from eval_multiqc_functions import (
     process_models,
     calc_curves_roc_pr,
     analyse_database,
     aggregate_per_model_metrics,
     paired_bootstrap_diff,
+    aggregate_per_model_enrichment,
+    get_signed_effect,
+    get_odds_ratio_series,
+    ENRICHMENT_TARGET_LABELS,
 )
 import logging
 
@@ -32,6 +37,7 @@ PREFIX = "combined"
 REPORT_NAME = "ddi_report"
 ID = "eval"
 DB_PREFIX = "db_"
+ENRICHMENT_PREFIX = "enrichment_"
 
 
 def parse_arguments():
@@ -54,7 +60,7 @@ def parse_arguments():
         required=False,
         nargs="+",
         default=None,
-        help="B1 path: per-model JSON sidecars from eval_one.py.",
+        help="B1 path: per-model JSON sidecars from eval_one.py and eval_enrichment.py.",
     )
     p.add_argument(
         "--out_dir", required=True, help="Output directory to store evaluation results."
@@ -474,6 +480,289 @@ def write_multiqc_json_metrics(
     logging.info("[OK] Wrote MultiQC JSON (ROC + PR)")
 
 
+
+
+### Enrichment (regression) MultiQC blocks ###
+#
+# Four plot families, one write function each, all called from
+# write_multiqc_json_enrichment():
+#
+#   1. Heatmaps  - one PNG-style interactive heatmap per (target, r2-kind),
+#                  x = model, y = feature. Kept as separate blocks (not
+#                  switchable) because MultiQC's heatmap plot already uses
+#                  its two buttons for the ordered/clustered toggle.
+#   2. R2 barplot - one grouped bar chart: x = model, series = target,
+#                   value = adjusted R2 / pseudo-R2.
+#   3. Feature importance - one switchable bargraph (partial R2 per feature,
+#                            colored/ordered like the old matplotlib plot),
+#                            one dataset per (model, target) combination.
+#   4. Odds ratios + agreement heatmap - switchable bargraph of odds ratios
+#      for every (model, target/equation) that has a Logit/MNLogit fit, plus
+#      one sign-agreement heatmap per model (feature x target).
+
+
+ 
+def _safe(val):
+    """Round-trip a float through JSON-safe None if it's NaN/inf."""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if np.isfinite(f) else None
+
+
+def write_enrichment_r2_heatmaps(enrichment_by_model, models, targets, features, outdir, prefix):
+    """One heatmap per (target, r2-kind) with x=model, y=feature."""
+    block_ids = []
+    for target in targets:
+        label = ENRICHMENT_TARGET_LABELS.get(target, target)
+        for key, key_label in (("partial_model_r2", "Partial"), ("single_feature_r2", "Single-feature")):
+            matrix = []
+            for feat in features:
+                row = []
+                for model in models:
+                    val = (
+                        enrichment_by_model.get(model, {})
+                        .get(target, {})
+                        .get(key, {})
+                        .get(feat)
+                    )
+                    row.append(_safe(val))
+                matrix.append(row)
+ 
+            block_id = f"{prefix}{target}_{key}_heatmap"
+            block = {
+                "id": block_id,
+                "section_name": f"{label}: {key_label} R\u00b2 by feature",
+                "plot_type": "heatmap",
+                "pconfig": {
+                    "id": block_id,
+                    "title": f"{label} \u2014 {key_label} R\u00b2 (feature \u00d7 model)",
+                    "xTitle": "Model",
+                    "yTitle": "Feature",
+                    "min": 0,
+                },
+                "xcats": models,
+                "ycats": features,
+                "data": matrix,
+            }
+            with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
+                json.dump(block, f, indent=2)
+            block_ids.append(block_id)
+    return block_ids
+
+
+def write_enrichment_r2_barplot(enrichment_by_model, models, targets, outdir, prefix):
+    """Grouped bar chart: x=model, series=target, value=adjusted R2/pseudo-R2."""
+    data = {}
+    for model in models:
+        row = {}
+        for target in targets:
+            cm = enrichment_by_model.get(model, {}).get(target, {}).get("complete_model", {})
+            row[target] = _safe(cm.get("r2_adj"))
+        data[model] = row
+ 
+    cats = {t: {"name": ENRICHMENT_TARGET_LABELS.get(t, t)} for t in targets}
+ 
+    block_id = f"{prefix}r2_adj_barplot"
+    block = {
+        "id": block_id,
+        "section_name": "Adjusted R\u00b2 / pseudo-R\u00b2 per model and target",
+        "plot_type": "bargraph",
+        "pconfig": {
+            "id": block_id,
+            "title": "Adjusted R\u00b2 (OLS) / pseudo-R\u00b2 (Logit, McFadden) by model and target",
+            "ylab": "Adjusted R\u00b2 / pseudo-R\u00b2",
+            "xlab": "Model",
+            "tt_decimals": 3,
+            "use_legend": True,
+        },
+        "cats": cats,
+        "data": data,
+    }
+    with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
+        json.dump(block, f, indent=2)
+    return block_id
+ 
+
+
+def write_enrichment_feature_importance(enrichment_by_model, models, targets, outdir, prefix):
+    """
+    Switchable bargraph reproducing the old `plot_feature_importance` matplotlib
+    plot: one dataset per (model, target), bars = partial R2 per feature,
+    sorted descending, with the corresponding p-value kept alongside so the
+    front-end can still flag significance (via bar color/tooltip) the way the
+    matplotlib version did with '*'/'**'/'***'.
+    """
+    datasets = []
+    data_labels = []
+ 
+    for model in models:
+        for target in targets:
+            target_data = enrichment_by_model.get(model, {}).get(target, {})
+            partial_r2 = target_data.get("partial_model_r2", {})
+            pvalues = target_data.get("complete_model", {}).get("pvalues", {})
+ 
+            finite_items = {f: v for f, v in partial_r2.items() if v is not None and np.isfinite(v)}
+            if not finite_items:
+                continue
+            sorted_items = sorted(finite_items.items(), key=lambda kv: kv[1], reverse=True)
+ 
+            dataset = {}
+            for feat, val in sorted_items:
+                p = pvalues.get(feat, 1.0)
+                sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
+                dataset[feat] = {"Partial R\u00b2": _safe(val), "significance": sig}
+ 
+            datasets.append(dataset)
+            label = ENRICHMENT_TARGET_LABELS.get(target, target)
+            data_labels.append({"name": f"{model}: {label}", "ylab": "Partial R\u00b2"})
+ 
+    if not datasets:
+        return None
+
+
+
+    block_id = f"{prefix}feature_importance"
+    block = {
+        "id": block_id,
+        "section_name": "Feature importance (partial R\u00b2)",
+        "plot_type": "bargraph",
+        "pconfig": {
+            "id": block_id,
+            "title": "Feature importance \u2014 partial R\u00b2 per feature",
+            "data_labels": data_labels,
+        },
+        "data": datasets,
+    }
+    with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
+        json.dump(block, f, indent=2)
+    return block_id
+
+
+
+def write_enrichment_odds_ratios(enrichment_by_model, models, targets, outdir, prefix):
+    """
+    Switchable bargraph of odds ratios (log2 scale) for every (model, target /
+    MNLogit equation) that actually fit a Logit/MNLogit model. A vertical
+    reference at log2(OR)=0 (OR=1, i.e. "no effect") is left to the frontend
+    default gridline at 0 since MultiQC bargraph doesn't support annotated
+    reference lines in this JSON schema.
+    """
+    datasets = []
+    data_labels = []
+ 
+    for model in models:
+        for target in targets:
+            target_data = enrichment_by_model.get(model, {}).get(target, {})
+            for suffix, odds_ratios, _ci_lo, _ci_hi in get_odds_ratio_series(target_data):
+                finite_items = {
+                    f: v for f, v in odds_ratios.items() if v is not None and np.isfinite(v) and v > 0
+                }
+                if not finite_items:
+                    continue
+                sorted_items = sorted(finite_items.items(), key=lambda kv: kv[1], reverse=True)
+                dataset = {feat: {"log2(Odds Ratio)": _safe(np.log2(val))} for feat, val in sorted_items}
+                datasets.append(dataset)
+                label = ENRICHMENT_TARGET_LABELS.get(target, target)
+                data_labels.append({"name": f"{model}: {label}{suffix}", "ylab": "log2(Odds Ratio)"})
+ 
+    if not datasets:
+        return None
+ 
+    block_id = f"{prefix}odds_ratios"
+    block = {
+        "id": block_id,
+        "section_name": "Odds ratios per feature",
+        "plot_type": "bargraph",
+        "pconfig": {
+            "id": block_id,
+            "title": "Odds ratios (log2 scale) \u2014 Logit / MNLogit targets",
+            "data_labels": data_labels,
+        },
+        "data": datasets,
+    }
+    with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
+        json.dump(block, f, indent=2)
+    return block_id
+
+
+
+def write_enrichment_agreement_heatmaps(enrichment_by_model, models, targets, features, outdir, prefix):
+    """
+    One sign-agreement heatmap per model: feature x target, value = sign of
+    the (best-effort) signed coefficient (see get_signed_effect), so it's
+    immediately visible which features push the same direction across
+    "true interaction", "predicted interaction", "combined (TP slice)" and
+    "prediction error" - vs. which ones the model relies on but that don't
+    reflect real biology (or vice versa).
+    """
+    block_ids = []
+    for model in models:
+        matrix = []
+        for feat in features:
+            row = []
+            for target in targets:
+                target_data = enrichment_by_model.get(model, {}).get(target, {})
+                effect = get_signed_effect(target_data, feat)
+                if effect is None or not np.isfinite(effect):
+                    row.append(None)
+                else:
+                    row.append(float(np.sign(effect)))
+            matrix.append(row)
+ 
+        block_id = f"{prefix}{model}_agreement_heatmap"
+        target_labels = [ENRICHMENT_TARGET_LABELS.get(t, t) for t in targets]
+        block = {
+            "id": block_id,
+            "section_name": f"{model}: feature-effect agreement across targets",
+            "plot_type": "heatmap",
+            "pconfig": {
+                "id": block_id,
+                "title": f"{model} \u2014 sign of feature effect (blue=negative, red=positive)",
+                "xTitle": "Target",
+                "yTitle": "Feature",
+                "min": -1,
+                "max": 1,
+            },
+            "xcats": target_labels,
+            "ycats": features,
+            "data": matrix,
+        }
+        with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
+            json.dump(block, f, indent=2)
+        block_ids.append(block_id)
+    return block_ids
+ 
+
+
+def write_multiqc_json_enrichment(per_model_enrichment_files, outdir, prefix=ENRICHMENT_PREFIX):
+    """Entry point: aggregates per-model enrichment JSONs and writes all
+    enrichment-related MultiQC custom-content blocks."""
+    if not per_model_enrichment_files:
+        return
+ 
+    enrichment_by_model, models, targets, features = aggregate_per_model_enrichment(
+        per_model_enrichment_files
+    )
+    if not models or not targets:
+        logging.info("[WARN] No usable enrichment data found - skipping enrichment blocks.")
+        return
+ 
+    write_enrichment_r2_heatmaps(enrichment_by_model, models, targets, features, outdir, prefix)
+    write_enrichment_r2_barplot(enrichment_by_model, models, targets, outdir, prefix)
+    write_enrichment_feature_importance(enrichment_by_model, models, targets, outdir, prefix)
+    write_enrichment_odds_ratios(enrichment_by_model, models, targets, outdir, prefix)
+    write_enrichment_agreement_heatmaps(enrichment_by_model, models, targets, features, outdir, prefix)
+ 
+    logging.info(
+        f"[OK] Wrote MultiQC enrichment JSON blocks for {len(models)} model(s), "
+        f"{len(targets)} target(s), {len(features)} feature(s)."
+    )
+
+
 def get_old_dbnames(old_report_path) -> list[str]:
     # Get database names from old MultiQC report's config
     # @old_report_path: path to old MultiQC report
@@ -556,6 +845,13 @@ def write_multiqc_config(
     betweenness_blocks = pick(r"_betweenness_distribution")
     clustering_blocks = pick(r"_clustering_distribution")
 
+    enrichment_r2_barplot = pick(rf"^{ENRICHMENT_PREFIX}r2_adj_barplot$")
+    enrichment_feature_importance = pick(rf"^{ENRICHMENT_PREFIX}feature_importance$")
+    enrichment_odds_ratios = pick(rf"^{ENRICHMENT_PREFIX}odds_ratios$")
+    enrichment_r2_heatmaps = pick(rf"^{ENRICHMENT_PREFIX}.*_(partial_model_r2|single_feature_r2)_heatmap$")
+    enrichment_agreement_heatmaps = pick(rf"^{ENRICHMENT_PREFIX}.*_agreement_heatmap$")
+
+
     ordered = (
         white_tbl
         + metric_blocks
@@ -563,6 +859,11 @@ def write_multiqc_config(
         + pairwise_blocks
         + roc_blocks
         + pr_blocks
+        + enrichment_r2_barplot
+        + enrichment_feature_importance
+        + enrichment_odds_ratios
+        + enrichment_r2_heatmaps
+        + enrichment_agreement_heatmaps
         + db_blocks
         + degree_blocks
         + betweenness_blocks
@@ -716,9 +1017,24 @@ def main():
         print(
             f"[INFO] Aggregating per-model JSON sidecars (n={len(args.per_model_metrics)})"
         )
+        # Two types of json files now, one from eval_one.py and one from eval_enrichment.py
+        # They have different contents and structures, can be identified by .eval.json / .enrichment.json suffixes
+        # For the eval.json files, nothiing changes
+        # For the enrichment new functions are added to process the enrichment.json files
+
+        per_model_metrics_eval = [m for m in args.per_model_metrics if m.endswith(".eval.json")]
+        per_model_metrics_enrichment = [m for m in args.per_model_metrics if m.endswith(".enrichment.json")]
+        
         metrics_auc_pr, roc_curves, pr_curves, metrics_df, model_list = (
-            aggregate_per_model_metrics(args.per_model_metrics)
+            aggregate_per_model_metrics(per_model_metrics_eval)
         )
+
+        if per_model_metrics_enrichment:
+            print(
+                f"[INFO] Aggregating per-model enrichment JSON sidecars (n={len(per_model_metrics_enrichment)})"
+            )
+            write_multiqc_json_enrichment(per_model_metrics_enrichment, args.out_dir)
+        
     elif args.predictions:
         print("[INFO] Loading model predictions (legacy in-process path)")
         combined_score_csv, metrics_df, model_list = process_models(args.predictions)
