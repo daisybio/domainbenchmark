@@ -18,6 +18,40 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
+def _warm_lazy_torch_imports():
+    """Resolve torch's lazily-imported subpackages while the image is fresh.
+
+    `torch.optim.Optimizer.add_param_group` is wrapped in
+    `torch._compile._disable_dynamo`, whose `inner` does `import torch._dynamo`
+    on its *first* call and then caches the result on the function object. In
+    this process that first call is `_refit`, because RandomizedSearchCV runs
+    every candidate fit in a joblib worker (`jobs` in assets/NeuralNetwork.json
+    is 5) -- the parent builds no optimizer of its own until the search is over.
+    On external_test/prott5 that is ~1h45m after the interpreter started.
+
+    The GPU nodes have no squashfuse, so apptainer logs `Converting SIF file to
+    temporary sandbox...` and unpacks the whole image into node-local temp. A
+    tmp sweep in the hour and a half the parent spends idle takes `torch/
+    _dynamo/` with it -- nothing else notices, because everything else is
+    already in sys.modules -- and the refit dies with
+    `ModuleNotFoundError: No module named 'torch._dynamo'` after a full grid
+    search. exit 1 is not in base.config's retry set, so it ends the run.
+
+    Building a throwaway optimizer here walks that exact path (it is
+    `SGD.__init__` -> `add_param_group` -> `inner`) at import time, when the
+    sandbox is minutes old, and leaves the module cached for the refit. It
+    draws nothing from any RNG, so it cannot move a seeded result.
+
+    This is a guard, not the cure: the cure is squashfuse on the nodes (which
+    also fixes the SIF-unpacking walltime blowups noted in conf/base.config) or
+    an APPTAINER_TMPDIR no sweeper touches.
+    """
+    torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.1)
+
+
+_warm_lazy_torch_imports()
+
+
 class SeedFit(Callback):
     """Reseed every RNG at the start of each training loop.
 

@@ -58,12 +58,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
             if instance_key in pair_group:
                 print(f"Warning: Duplicate entry for {instance_key} in {pair_key}.")
             else:
-                # float32 for the same reason embeddings.write_instance casts:
-                # the ML loader assembles float32 rows, so anything wider is
-                # truncated on the way in. This encoder keys by domain *pair*
-                # rather than by domain, so it writes here instead of going
-                # through write_instance and needs the cast of its own.
-                pair_group[instance_key] = np.asarray(encoding, dtype=np.float32)
+                pair_group[instance_key] = encoding
 
         # write both directions
         write_to_h5(f"{domain_key_1}_{domain_key_2}", f"{instance_1}_{instance_2}")
