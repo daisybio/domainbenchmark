@@ -14,6 +14,7 @@ import json
 
 # from eval_multiqc_functions import *
 import logging
+from enrichment_plots import combine_enrichment_blocks
 
 import matplotlib.pyplot as plt
 
@@ -33,6 +34,7 @@ for i in range(n_stops):
 
 REPORT_NAME = "ddi_report"
 ID = "eval"
+ENRICHMENT_PREFIX = "enrichment_"
 DB_PREFIX = "db_"
 
 
@@ -104,6 +106,12 @@ def write_multiqc_config(outdir) -> str:
     betweenness_blocks = pick(r"_betweenness_distribution")
     clustering_blocks = pick(r"_clustering_distribution")
 
+    enrichment_r2_barplot = pick(rf"^{ENRICHMENT_PREFIX}r2_adj_barplot$")
+    enrichment_r2_heatmaps = pick(rf"^{ENRICHMENT_PREFIX}(partial_model_r2|single_feature_r2)_heatmap$")
+    enrichment_feature_importance = pick(rf"^{ENRICHMENT_PREFIX}feature_importance_(switch|grouped)$")
+    enrichment_odds_ratios = pick(rf"^{ENRICHMENT_PREFIX}odds_ratios_(switch|grouped)$")
+    enrichment_agreement = pick(rf"^{ENRICHMENT_PREFIX}agreement_(summary|detail)$")
+
     # db_header = pick(r"db_header$")
     # models_header = pick(r"models_header$")
 
@@ -120,6 +128,11 @@ def write_multiqc_config(outdir) -> str:
         + pr_heatmap_ci
         + roc_curves_block
         + pr_curves_block
+        + enrichment_r2_barplot
+        + enrichment_r2_heatmaps
+        + enrichment_feature_importance
+        + enrichment_odds_ratios
+        + enrichment_agreement
     )
 
     # Now add old report blocks that are not already present
@@ -634,6 +647,7 @@ def main():
 
     all_blocks = []
     db_names = []
+    enrichment_blocks_by_db = {}
 
     # Collect and relabel all blocks from each report
     for report_dir in args.reports:
@@ -647,6 +661,14 @@ def main():
                 src = os.path.join(report_dir, fn)
                 with open(src, "r", encoding="utf-8") as f:
                     block = json.load(f)
+
+                # Enrichment blocks (Plotly-in-MultiQC, from enrichment_plots.py) carry
+                # their own raw per-database trace data and are merged separately,
+                # with a "database" axis added, instead of being copied per-db-suffixed.
+                if block["id"].startswith(ENRICHMENT_PREFIX):
+                    enrichment_blocks_by_db.setdefault(db_name, {})[block["id"]] = block
+                    continue
+
                 block = relabel_multiqc_block(block, db_name)
                 # Write to output dir with new name
                 # delete the old _mqc.json suffix and add the db_name and _mqc.json back
@@ -675,6 +697,13 @@ def main():
 
     # Cross-database comparison
     cross_db_comparison(all_blocks, outdir_json)
+
+    # Enrichment: merge per-database Plotly blocks into one block per plot
+    # family, adding a "database" selector (single-db reports fall through
+    # to a plain copy inside combine_enrichment_blocks()).
+    enrichment_ids = combine_enrichment_blocks(enrichment_blocks_by_db, outdir_json)
+    if enrichment_ids:
+        logging.info(f"[OK] Combined {len(enrichment_ids)} enrichment block(s) across {len(enrichment_blocks_by_db)} database(s).")
 
     # create_section_header("models_header", "Models Results", outdir_json)
     # create_section_header("db_header", "Database Results", outdir_json)
