@@ -3,21 +3,24 @@ process RANDOM_FOREST {
     label 'process_gpu'
 
     conda "${projectDir}/environments/ml.yml"
-    container "docker://konstantinpelz/domainbenchmark-gpu:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.1"
 
     input:
         tuple val(meta), path('DDI'), path('features/*'), path('config.json')
 
     output:
-        tuple val(meta), path("random_forest_${meta.combo_id}/predictions.parquet"), emit: predictions
+        tuple val(meta), path("random_forest_${meta.combo_id}/predictions_*.parquet"), emit: predictions
         tuple val(meta), path("random_forest_${meta.combo_id}/model/"),               emit: model
-        path "versions.yml",                                                          emit: versions
 
     script:
         def output_base        = "random_forest_${meta.combo_id}"
-        def output_predictions = "${output_base}/predictions.parquet"
         def output_model_dir   = "${output_base}/model"
-        def max_combos_arg     = params.max_protein_combinations_per_ddi ? "--max_protein_combinations_per_ddi ${params.max_protein_combinations_per_ddi}" : ''
+        // One trained model, scored against every test split of this database
+        // (test_balanced + test_realistic, or a single test).
+        def test_splits        = meta.tests.values().join(' ')
+        // Without --allow_cpu the script exits 140 when its CUDA smoke test
+        // fails, so Nextflow retries on a healthy GPU node.
+        def allow_cpu          = params.allow_cpu_ml ? '--allow_cpu' : ''
         """
         mkdir -p ${output_model_dir}
 
@@ -26,16 +29,21 @@ process RANDOM_FOREST {
             --features_path features/ \\
             --ddi_path DDI/ \\
             --config config.json \\
-            --out_predictions ${output_predictions} \\
+            --out_predictions_dir ${output_base} \\
+            --test_splits ${test_splits} \\
             --out_model_dir ${output_model_dir} \\
-            ${max_combos_arg} \\
-            --seed ${params.seed}
+            --seed ${params.seed} ${allow_cpu}
+        """
 
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            scikit-learn: \$(python -c 'import sklearn; print(sklearn.__version__)')
-        END_VERSIONS
+    stub:
+        def output_base = "random_forest_${meta.combo_id}"
+        def variants    = meta.tests.keySet().join(' ')
+        """
+        mkdir -p ${output_base}/model
+        for v in ${variants}; do
+            touch ${output_base}/predictions_\${v}.parquet
+        done
+        touch ${output_base}/model/model_parameters.json
         """
 }
 
@@ -45,19 +53,18 @@ process RANDOM_FOREST_EVALUATION {
     label 'process_long'
 
     conda "${projectDir}/environments/ml.yml"
-    container "docker://konstantinpelz/domainbenchmark-gpu:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.1"
 
     input:
         tuple val(meta), path('DDI'), path('features/*'), path('config.json'), path(prev_results)
 
     output:
-        tuple val(meta), path("random_forest_${meta.combo_id}/predictions.parquet"), emit: predictions
-        path "versions.yml",                                                         emit: versions
+        tuple val(meta), path("random_forest_${meta.combo_id}/predictions_*.parquet"), emit: predictions
 
     script:
         def output_base    = "random_forest_${meta.combo_id}"
         def model_dir      = "${prev_results}/rf_output/${output_base}/model"
-        def max_combos_arg = params.max_protein_combinations_per_ddi ? "--max_protein_combinations_per_ddi ${params.max_protein_combinations_per_ddi}" : ''
+        def test_splits    = meta.tests.values().join(' ')
         """
         mkdir -p ${output_base}
 
@@ -66,15 +73,19 @@ process RANDOM_FOREST_EVALUATION {
             --features_path features/ \\
             --ddi_path DDI/ \\
             --config config.json \\
-            --out_predictions ${output_base}/predictions.parquet \\
+            --out_predictions_dir ${output_base} \\
+            --test_splits ${test_splits} \\
             --model_dir ${model_dir} \\
-            ${max_combos_arg} \\
             --predict-only
+        """
 
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            scikit-learn: \$(python -c 'import sklearn; print(sklearn.__version__)')
-        END_VERSIONS
+    stub:
+        def output_base = "random_forest_${meta.combo_id}"
+        def variants    = meta.tests.keySet().join(' ')
+        """
+        mkdir -p ${output_base}
+        for v in ${variants}; do
+            touch ${output_base}/predictions_\${v}.parquet
+        done
         """
 }

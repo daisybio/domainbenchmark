@@ -1,21 +1,22 @@
 process GRAPH_MODEL {
     tag "${meta.id}"
-    label 'process_high'
+    label 'process_graph'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
         tuple val(meta), path(database), path(model_json)
 
     output:
-        tuple val(meta), path("${meta.model}/predictions.parquet"), emit: predictions
-        tuple val(meta), path("${meta.model}/model/"),               emit: model
-        path "versions.yml",                                         emit: versions
+        tuple val(meta), path("${meta.model}/predictions_*.parquet"), emit: predictions
+        tuple val(meta), path("${meta.model}/model/"),                emit: model
 
     script:
-        def output_model_dir   = "${meta.model}/model"
-        def output_predictions = "${meta.model}/predictions.parquet"
+        def output_model_dir = "${meta.model}/model"
+        // Trained once on the train split, scored against every test split of
+        // this database -- one predictions_<variant>.parquet per test set.
+        def test_splits      = meta.tests.values().join(' ')
         """
         mkdir -p ${output_model_dir}
 
@@ -24,13 +25,20 @@ process GRAPH_MODEL {
             --model ${meta.model} \\
             --params ${model_json} \\
             --out_dir ${output_model_dir} \\
-            --out_predictions ${output_predictions} \\
-            --threads ${task.cpus}
+            --out_predictions_dir ${meta.model} \\
+            --test_splits ${test_splits} \\
+            --threads ${task.cpus} \\
+            --ppi_score_cutoff ${params.ppi_score_cutoff} \\
+            --seed ${params.seed}
+        """
 
-        cat <<-END_VERSIONS > versions.yml
-        "${task.process}":
-            python: \$(python --version 2>&1 | sed 's/Python //')
-            networkx: \$(python -c 'import networkx; print(networkx.__version__)')
-        END_VERSIONS
+    stub:
+        def variants = meta.tests.keySet().join(' ')
+        """
+        mkdir -p ${meta.model}/model
+        for v in ${variants}; do
+            touch ${meta.model}/predictions_\${v}.parquet
+        done
+        touch ${meta.model}/model/model.txt
         """
 }

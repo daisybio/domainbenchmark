@@ -10,18 +10,18 @@
             "type": "object",
             "fa_icon": "fas fa-terminal",
             "description": "Define where the pipeline should find input data and save output data.",
-            "required": ["outdir"],
+            "required": [
+                "outdir"
+            ],
             "properties": {
-                 "input": {
+                "input": {
                     "type": "string",
-                    "format": "file-path",
+                    "format": "path",
                     "exists": true,
-                    "schema": "assets/schema_input.json",
-                    "mimetype": "text/csv",
-                    "pattern": "^\\S+\\.csv$",
-                    "description": "Path to comma-separated samplesheet listing database splits to run.",
-                    "help_text": "CSV with one row per database split (columns: id, db_path). Relative db_path values are resolved against the project directory.",
-                    "fa_icon": "fas fa-file-csv"
+                    "pattern": "^\\S+$",
+                    "description": "Samplesheet CSV, or a directory of database directories.",
+                    "help_text": "Two forms are accepted. A path ending in .csv is read as a samplesheet (columns: id, db_path; relative db_path values resolve against the project directory). A directory is scanned for immediate subdirectories containing train.sqlite3 -- the layout daisybio/domainsplit publishes under databases/ -- and each becomes a dataset named after its directory. Every dataset directory must hold train.sqlite3, validation.sqlite3, and one or more test*.sqlite3; each test split is benchmarked separately against the same trained models.",
+                    "fa_icon": "fas fa-folder-open"
                 },
                 "outdir": {
                     "type": "string",
@@ -29,6 +29,24 @@
                     "description": "The output directory where the results will be saved.",
                     "default": "./results",
                     "fa_icon": "fas fa-folder-open"
+                },
+                "embeddings": {
+                    "type": "string",
+                    "format": "directory-path",
+                    "exists": true,
+                    "description": "domainsplit's results/embeddings/ directory, holding one <model>_domain_embeddings.h5 per embedding model.",
+                    "help_text": "Required only when --published_features is non-empty, and even then it can usually be left unset: domainsplit publishes embeddings/ as a sibling of the databases/ directory, so with --input <run>/results/databases the pipeline derives <run>/results/embeddings and fails only if that does not exist. A samplesheet input still needs it explicitly, because its rows can point anywhere. The files are keyed h5[pfam_id][instance_id] and are per-RUN, not per-split: one file holds every domain the run saw and each split database is a subset of it. VERIFY_EMBEDDINGS checks the pairing before any model trains.",
+                    "fa_icon": "fas fa-vector-square"
+                },
+                "min_embedding_coverage": {
+                    "type": "number",
+                    "default": 0.5,
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Minimum fraction of a split's (pfam_id, instance_id) pairs a published embedding file must resolve before the pairing is accepted.",
+                    "help_text": "A same-run file resolves close to 100% (domainsplit's exporter drops a handful of instances for --max-len or an OOM at batch size 1). This catches an export that does not cover these databases at all -- the wrong dataset, or one made before domains were added. It cannot catch an export from a different run over the same domain universe: Pfam accessions are stable across runs. Pairing the right export with the right databases is the caller's job, which the derived --embeddings default does by construction.",
+                    "fa_icon": "fas fa-percent",
+                    "hidden": true
                 },
                 "email": {
                     "type": "string",
@@ -58,6 +76,15 @@
                     "description": "Comma-separated list of graph-based DDI models to run. Pass 'none' (or an empty string) to disable.",
                     "fa_icon": "fas fa-project-diagram"
                 },
+                "ppi_score_cutoff": {
+                    "type": "integer",
+                    "default": 400,
+                    "minimum": 0,
+                    "maximum": 1000,
+                    "description": "Minimum STRING combined_score (0-1000) a PPI must reach to enter the interactome shared by every graph model.",
+                    "help_text": "All graph models are scored against each other, so they read one cutoff rather than a per-model value. 400 is STRING's 'medium confidence' band and STRING's own default. Raising it shrinks a split's interactome sharply -- at 900, minimal_leakage/test_balanced keeps 2 of its 254 PPIs, which collapses KGIDDI's chi2 stratification into a single union-find cluster and fails the run.",
+                    "fa_icon": "fas fa-filter"
+                },
                 "machine_learning_models": {
                     "type": "string",
                     "default": "neural_network,random_forest",
@@ -67,24 +94,25 @@
                 },
                 "machine_learning_features": {
                     "type": "string",
-                    "default": "dummy,aacomp,aaencode,prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
+                    "default": "dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of feature encodings to compute and feed into the ML / RF classifiers.",
                     "fa_icon": "fas fa-vector-square"
                 },
                 "large_features": {
                     "type": "string",
-                    "default": "prott5_protein_domain_embeddings,esm3_protein_domain_embeddings,esmc_protein_domain_embeddings,esm3_domain_embeddings,esmc_domain_embeddings",
+                    "default": "esm3_embeddings,esmc_embeddings,prott5_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
-                    "description": "Comma-separated list of features whose embedding dim makes ML / RF tasks need the heavy GPU label (process_gpu_large).",
+                    "description": "Comma-separated list of features whose embedding dim makes feature-extraction / NN / RF tasks need the heavy memory-time envelope (160 GB, 36 h) instead of the default one (40 GB, 12 h). Applied by the withName rules in conf/modules.config.",
                     "fa_icon": "fas fa-weight-hanging"
                 },
-                "max_protein_combinations_per_ddi": {
-                    "type": ["integer", "null"],
-                    "default": null,
-                    "minimum": 1,
-                    "description": "Cap on protein-pair instantiations per DDI domain pair for ML / RF training and prediction. Sampled without replacement; if fewer combinations exist than the cap, all are used. Leave null / unset to use every available combination. Default: 15.",
-                    "fa_icon": "fas fa-random"
+                "published_features": {
+                    "type": "string",
+                    "default": "esm3_embeddings,esmc_embeddings,prott5_embeddings",
+                    "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
+                    "description": "Comma-separated list of features read from --embeddings instead of being extracted from the split databases.",
+                    "help_text": "domainsplit embeds the cut domain sequence once per run and publishes one mean-pooled vector per domain instance, so these features skip FEATURE_EXTRACTION entirely and one file serves every split of the run. Entries only take effect if they also appear in --machine_learning_features. Requires --embeddings.",
+                    "fa_icon": "fas fa-file-import"
                 },
                 "modeljson": {
                     "type": "string",
@@ -100,11 +128,24 @@
                     "description": "Path to a prior evaluation/ directory used as a baseline for the MultiQC report.",
                     "fa_icon": "fas fa-history"
                 },
+                "mqc_order": {
+                    "type": "string",
+                    "description": "Comma-separated dataset (run label) order for the MultiQC reports, e.g. random_balanced,minimal_leakage_hcni_realistic,external_test.",
+                    "help_text": "A dataset is one (database, test variant) run label. Several report sections exist once per dataset and several more carry every dataset inside one block (the tabs of the combined ROC/PR and by-source plots, the columns of the AUC/AP heatmaps); left unset all of them come out alphabetically. A name that does not exist in the data is a hard failure. A dataset present in the data but missing from the list warns and is appended alphabetically after the ordered ones.",
+                    "fa_icon": "fas fa-sort-amount-down"
+                },
                 "seed": {
                     "type": "integer",
                     "default": 42,
                     "description": "Global RNG seed (numpy / torch / cuML).",
                     "fa_icon": "fas fa-dice"
+                },
+                "allow_cpu_ml": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Let GPU-only ML models fall back to a CPU implementation instead of failing.",
+                    "help_text": "RANDOM_FOREST trains with cuML and normally exits with retry code 140 when its CUDA smoke test fails, so Nextflow reschedules the task onto a healthy GPU node. Set this on GPU-less machines (CI, laptops) to train with scikit-learn on the CPU instead. Leave it off for real runs: a CPU fit of the full grid is orders of magnitude slower, and the fallback would mask a broken GPU node.",
+                    "fa_icon": "fas fa-microchip"
                 }
             }
         },
@@ -175,7 +216,14 @@
                     "description": "Method used to save pipeline results to output directory.",
                     "help_text": "The Nextflow `publishDir` option specifies which intermediate files should be saved to the output directory. This option tells the pipeline what method should be used to move these files. See [Nextflow docs](https://www.nextflow.io/docs/latest/process.html#publishdir) for details.",
                     "fa_icon": "fas fa-copy",
-                    "enum": ["symlink", "rellink", "link", "copy", "copyNoFollow", "move"],
+                    "enum": [
+                        "symlink",
+                        "rellink",
+                        "link",
+                        "copy",
+                        "copyNoFollow",
+                        "move"
+                    ],
                     "hidden": true
                 },
                 "email_on_fail": {
@@ -206,24 +254,6 @@
                     "fa_icon": "fas fa-palette",
                     "hidden": true
                 },
-                "multiqc_config": {
-                    "type": "string",
-                    "format": "file-path",
-                    "description": "Custom config file to supply to MultiQC.",
-                    "fa_icon": "fas fa-cog",
-                    "hidden": true
-                },
-                "multiqc_logo": {
-                    "type": "string",
-                    "description": "Custom logo file to supply to MultiQC. File name must also be set in the MultiQC config file",
-                    "fa_icon": "fas fa-image",
-                    "hidden": true
-                },
-                "multiqc_methods_description": {
-                    "type": "string",
-                    "description": "Custom MultiQC yaml file containing HTML including a methods description.",
-                    "fa_icon": "fas fa-cog"
-                },
                 "validate_params": {
                     "type": "boolean",
                     "description": "Boolean whether to validate parameters against the schema at runtime",
@@ -245,7 +275,10 @@
                     "hidden": true
                 },
                 "help": {
-                    "type": ["boolean", "string"],
+                    "type": [
+                        "boolean",
+                        "string"
+                    ],
                     "description": "Display the help message."
                 },
                 "help_full": {

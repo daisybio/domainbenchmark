@@ -36,8 +36,6 @@ workflow PIPELINE_INITIALISATION {
 
     main:
 
-    ch_versions = channel.empty()
-
     //
     // Print version and exit if required and dump pipeline parameters to JSON file
     //
@@ -83,23 +81,41 @@ workflow PIPELINE_INITIALISATION {
     // Custom tests
     //
     if (params.input) {
-        db_ch = Channel
-            .fromPath(params.input, checkIfExists: true)
-            .splitCsv(header: true)
-            .map { row ->
-                def db_path = row.db_path.startsWith('/')
-                    ? file(row.db_path, checkIfExists: true)
-                    : file("${workflow.projectDir}/${row.db_path}", checkIfExists: true)
-                def id      = row.id ?: db_path.getName()
-                tuple([ id: id, db: id ], db_path)
+        def input_path = file(params.input, checkIfExists: true)
+
+        if (input_path.isDirectory()) {
+            // Directory mode: `--input databases/` as published by
+            // daisybio/domainsplit. Every immediate subdirectory holding a
+            // train.sqlite3 is a dataset, named after the directory.
+            def dataset_dirs = input_path
+                .listFiles()
+                .findAll { it.isDirectory() && it.resolve('train.sqlite3').exists() }
+                .sort { it.getName() }
+
+            if (!dataset_dirs) {
+                error("No dataset directories containing train.sqlite3 found under ${input_path}")
             }
+
+            db_ch = Channel.fromList(
+                dataset_dirs.collect { dir -> datasetTuple(dir.getName(), dir) }
+            )
+        } else {
+            db_ch = Channel
+                .fromPath(params.input, checkIfExists: true)
+                .splitCsv(header: true)
+                .map { row ->
+                    def db_path = row.db_path.startsWith('/')
+                        ? file(row.db_path, checkIfExists: true)
+                        : file("${workflow.projectDir}/${row.db_path}", checkIfExists: true)
+                    datasetTuple(row.id ?: db_path.getName(), db_path)
+                }
+        }
     } else {
-        error "No input provided: set --input <samplesheet.csv>"
+        error "No input provided: set --input <samplesheet.csv|databases/>"
     }
 
     emit:
-    db_ch       = db_ch
-    versions    = ch_versions
+    db_ch = db_ch
 }
 
 /*
@@ -154,83 +170,43 @@ workflow PIPELINE_COMPLETION {
 */
 
 //
-// Validate channels from input samplesheet
+// Discover the sqlite splits inside one database directory.
 //
-def validateInputSamplesheet(input) {
-    def (metas, fastqs) = input[1..2]
+// daisybio/domainsplit publishes `databases/<dataset>/<split>.sqlite3` with
+// `train`, `validation`, and one or more `test*` splits: `test` for a dataset
+// whose test set comes from BUILD_EXTERNAL_TEST, `test_balanced` +
+// `test_realistic` for one with an internal test set. Each test split is
+// benchmarked separately against the same trained models.
+//
+// Returns [ splits, tests ]:
+//   splits — ordered split names, i.e. the sqlite stems
+//   tests  — variant -> split name (`test_balanced` -> `balanced`, `test` -> `test`)
+//
+def discoverSplits(db_dir) {
+    def names = db_dir.list().findAll { it.endsWith('.sqlite3') }.collect { it - '.sqlite3' }
 
-    // Check that multiple runs of the same sample are of the same datatype i.e. single-end / paired-end
-    def endedness_ok = metas.collect{ meta -> meta.single_end }.unique().size == 1
-    if (!endedness_ok) {
-        error("Please check input samplesheet -> Multiple runs of a sample must be of the same datatype i.e. single-end or paired-end: ${metas[0].id}")
+    ['train', 'validation'].each { required ->
+        if (!names.contains(required)) {
+            error("Database directory ${db_dir} is missing ${required}.sqlite3 (found: ${names.sort().join(', ')})")
+        }
     }
 
-    return [ metas[0], fastqs ]
+    def test_splits = names.findAll { it == 'test' || it.startsWith('test_') }.sort()
+    if (!test_splits) {
+        error("Database directory ${db_dir} contains no test*.sqlite3 split (found: ${names.sort().join(', ')})")
+    }
+
+    def tests = test_splits.collectEntries { split ->
+        [ (split == 'test' ? 'test' : split - 'test_'), split ]
+    }
+
+    return [ ['train', 'validation'] + test_splits, tests ]
 }
+
 //
-// Generate methods description for MultiQC
+// Build the (meta, db_path) tuple for one database directory.
 //
-def toolCitationText() {
-    def citation_text = [
-            "Tools used in the workflow included:",
-            "MultiQC (Ewels et al. 2016),",
-            "scikit-learn (Pedregosa et al. 2011),",
-            "PyTorch (Paszke et al. 2019),",
-            "NetworkX (Hagberg et al. 2008),",
-            "ESM-3 (Hayes et al. 2024),",
-            "ESM-C (EvolutionaryScale 2024),",
-            "ProtT5 (Elnaggar et al. 2022),",
-            "and ProtDCal (Ruiz-Blanco et al. 2015)",
-            "."
-        ].join(' ').trim()
-
-    return citation_text
-}
-
-def toolBibliographyText() {
-    def reference_text = [
-            "<li>Ewels, P., Magnusson, M., Lundin, S., & Käller, M. (2016). MultiQC: summarize analysis results for multiple tools and samples in a single report. Bioinformatics, 32(19), 3047–3048. doi: 10.1093/bioinformatics/btw354</li>",
-            "<li>Pedregosa, F. et al. (2011). Scikit-learn: Machine Learning in Python. Journal of Machine Learning Research, 12, 2825–2830.</li>",
-            "<li>Paszke, A. et al. (2019). PyTorch: An Imperative Style, High-Performance Deep Learning Library. NeurIPS 32.</li>",
-            "<li>Hagberg, A., Schult, D., & Swart, P. (2008). Exploring network structure, dynamics, and function using NetworkX. SciPy 2008.</li>",
-            "<li>Hayes, T. et al. (2024). Simulating 500 million years of evolution with a language model. bioRxiv. doi: 10.1101/2024.07.01.600583</li>",
-            "<li>EvolutionaryScale (2024). ESM Cambrian: revealing the mysteries of proteins with unsupervised learning.</li>",
-            "<li>Elnaggar, A. et al. (2022). ProtTrans: Toward Understanding the Language of Life Through Self-Supervised Learning. IEEE TPAMI, 44(10), 7112–7127. doi: 10.1109/TPAMI.2021.3095381</li>",
-            "<li>Ruiz-Blanco, Y. B., Paz, W., Green, J., & Marrero-Ponce, Y. (2015). ProtDCal: A program to compute general-purpose-numerical descriptors for sequences and 3D-structures of proteins. BMC Bioinformatics, 16, 162. doi: 10.1186/s12859-015-0586-0</li>"
-        ].join(' ').trim()
-
-    return reference_text
-}
-
-def methodsDescriptionText(mqc_methods_yaml) {
-    // Convert  to a named map so can be used as with familiar NXF ${workflow} variable syntax in the MultiQC YML file
-    def meta = [:]
-    meta.workflow = workflow.toMap()
-    meta["manifest_map"] = workflow.manifest.toMap()
-
-    // Pipeline DOI
-    if (meta.manifest_map.doi) {
-        // Using a loop to handle multiple DOIs
-        // Removing `https://doi.org/` to handle pipelines using DOIs vs DOI resolvers
-        // Removing ` ` since the manifest.doi is a string and not a proper list
-        def temp_doi_ref = ""
-        def manifest_doi = meta.manifest_map.doi.tokenize(",")
-        manifest_doi.each { doi_ref ->
-            temp_doi_ref += "(doi: <a href=\'https://doi.org/${doi_ref.replace("https://doi.org/", "").replace(" ", "")}\'>${doi_ref.replace("https://doi.org/", "").replace(" ", "")}</a>), "
-        }
-        meta["doi_text"] = temp_doi_ref.substring(0, temp_doi_ref.length() - 2)
-    } else meta["doi_text"] = ""
-    meta["nodoi_text"] = meta.manifest_map.doi ? "" : "<li>If available, make sure to update the text to include the Zenodo DOI of version of the pipeline used. </li>"
-
-    // Tool references
-    meta["tool_citations"] = toolCitationText().replaceAll(", \\.", ".").replaceAll("\\. \\.", ".").replaceAll(", \\.", ".")
-    meta["tool_bibliography"] = toolBibliographyText()
-
-
-    def methods_text = mqc_methods_yaml.text
-
-    def engine =  new groovy.text.SimpleTemplateEngine()
-    def description_html = engine.createTemplate(methods_text).make(meta)
-
-    return description_html.toString()
+def datasetTuple(id, db_dir) {
+    def (splits, tests) = discoverSplits(db_dir)
+    return tuple([ id: id, db: id, splits: splits, tests: tests ], db_dir)
 }

@@ -1,2 +1,4 @@
 id,db_path
-random_ddi_random_addition,/nfs/data/CoBiNet_Masterpraktikum/domainsplit/results/teschting_smoke_af/databases_scored/random_ddi_random_addition
+random,/nfs/data/CoBiNet_Masterpraktikum/databases/random
+minimal_leakage,/nfs/data/CoBiNet_Masterpraktikum/databases/minimal_leakage
+external_test,/nfs/data/CoBiNet_Masterpraktikum/databases/external_test

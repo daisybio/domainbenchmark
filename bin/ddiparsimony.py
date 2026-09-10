@@ -23,7 +23,14 @@ from ddiparsimony_functions import (
     compute_fp_rate,
     compute_random_x_matrix_parallel,
 )
-from load_data_gm import load_ppi, load_pd_mapping, load_ddi, check_file_existence
+from load_data_gm import (
+    DEFAULT_PPI_SCORE_CUTOFF,
+    check_file_existence,
+    canonical_pair,
+    load_ddi,
+    load_pd_mapping,
+    load_ppi,
+)
 
 
 # --- Training: grid search for best reliability and cutoff ---
@@ -38,6 +45,7 @@ def evaluate_reliability_train(
         Dict[Tuple[str, str], int],
         Dict[Tuple[str, str], int],
         list,
+        int,
     ],
 ) -> Tuple[float, float, float, float, Dict[Tuple[str, str], float]]:
     (
@@ -50,7 +58,13 @@ def evaluate_reliability_train(
         ddi_dict,
         ddi_score,
         candidate_cutoffs,
+        seed,
     ) = args
+    # `seed` rides along in the task tuple because this runs in a pool worker,
+    # which inherits no usable RNG state. The token is keyed on the reliability
+    # rate: that is what distinguishes one grid point from another, and the
+    # `avg_x_vec` rerun in run_ddiparsimony passes the same token so it
+    # reproduces exactly the vector these pw_scores were computed from.
     avg_score, n_runs, observed_x_avg = compute_lp_score(
         ppi_list,
         protein_domains,
@@ -60,6 +74,8 @@ def evaluate_reliability_train(
         reliability=r,
         num_runs=200,
         return_x=True,
+        seed=seed,
+        rng_token=f"train_grid:{r}",
     )
     if observed_x_avg is None:
         observed_x_avg = np.zeros(len(domain_pairs))
@@ -94,6 +110,8 @@ def evaluate_reliability_test(
         np.ndarray,
         Dict[Tuple[str, str], Tuple[int, int]],
         Dict[Tuple[str, str], int],
+        int,
+        str,
     ],
 ) -> Tuple[float, float, float, float, Dict[Tuple[str, str], float]]:
     (
@@ -106,7 +124,11 @@ def evaluate_reliability_test(
         random_x_matrix,
         ddi_dict,
         ddi_score,
+        seed,
+        variant,
     ) = args
+    # Token carries the variant: two test splits of the same database are
+    # scored at the same reliability, and they must not share a mask.
     avg_score, n_runs, observed_x_avg = compute_lp_score(
         ppi_list,
         protein_domains,
@@ -116,6 +138,8 @@ def evaluate_reliability_test(
         reliability=r,
         num_runs=200,
         return_x=True,
+        seed=seed,
+        rng_token=f"test_eval:{variant}:{r}",
     )
     if observed_x_avg is None:
         observed_x_avg = np.zeros(len(domain_pairs))
@@ -138,7 +162,11 @@ def evaluate_reliability_test(
 
 
 def preprocessing(
-    db_path: Path, output_dir: Path, threads: int = 1
+    db_path: Path,
+    output_dir: Path,
+    threads: int = 1,
+    seed: int = 42,
+    ppi_score_cutoff: int = DEFAULT_PPI_SCORE_CUTOFF,
 ) -> Tuple[
     List[Tuple[str, str]],
     np.ndarray,
@@ -152,9 +180,29 @@ def preprocessing(
     pd_df = load_pd_mapping(db_path)
     ppi_df = load_ppi(db_path)
 
-    # Reduce ppi_df to interactions with score > 900
-    logging.info("Filtering PPI data for high-confidence interactions...")
-    ppi_df = ppi_df[ppi_df["score"] > 900].reset_index(drop=True)
+    logging.info(
+        f"Filtering PPI data by STRING confidence (score >= {ppi_score_cutoff})..."
+    )
+    n_ppi_raw = len(ppi_df)
+    # Inclusive because STRING's confidence bands are closed at their lower
+    # edge (>= 900 highest, >= 700 high, >= 400 medium), so a strict > drops
+    # every row sitting exactly on the boundary. Kept identical to kgiddi's
+    # cutoff so both graph models score the same interactome -- see the longer
+    # note in bin/kgiddi.py for why 900 is too strict for a split database.
+    ppi_df = ppi_df[ppi_df["score"] >= ppi_score_cutoff].reset_index(drop=True)
+    # Same hazard as in kgiddi: an empty interactome does not raise here, it
+    # produces an all-negative prediction set that only fails downstream in
+    # EVAL_ONE (single-class y_true). Fail where the cause is visible.
+    if ppi_df.empty:
+        raise ValueError(
+            f"{db_path}: no PPIs left after the confidence filter "
+            f"(ppi_score_cutoff={ppi_score_cutoff}, {n_ppi_raw} PPI rows in the "
+            "database). Either this split database ships no "
+            "protein_protein_interaction rows, or its score column is on a "
+            "different scale than the cutoff assumes -- check "
+            "`SELECT count(*), min(score), max(score) FROM "
+            "protein_protein_interaction`."
+        )
 
     # Reduce ddi_df and pd_df based on proteins in ppi_df
     logging.info("Filtering DDI and PD mapping data based on PPI proteins...")
@@ -247,6 +295,7 @@ def preprocessing(
             ddi_score,
             num_iterations=1000,
             max_workers=threads,
+            seed=seed,
         )
         np.save(rxm_path, random_x_matrix)
 
@@ -262,12 +311,35 @@ def preprocessing(
 
 
 def run_ddiparsimony(
-    database: str, params_file: str, out_dir: str, out_predictions: str, threads: int = 1
+    database: str,
+    params_file: str,
+    out_dir: str,
+    test_splits: dict,
+    threads: int = 1,
+    seed: int = 42,
+    ppi_score_cutoff: int | None = None,
 ):
+    """Train once, score every test split.
+
+    `test_splits` maps variant -> (split name, output predictions path). The
+    reliability rate and pw-score cutoff are optimised on the train split once
+    and reused for each test set.
+
+    `ppi_score_cutoff` is the pipeline-level `params.ppi_score_cutoff`
+    (`--ppi_score_cutoff` on the command line). When it is None the model JSON's
+    own `parameter_list.ppi_score_cutoff` is used, and failing that
+    DEFAULT_PPI_SCORE_CUTOFF -- KGIDDI resolves it identically, so both graph
+    models always score the same interactome.
+    """
     db_train = Path(os.path.join(database, "train.sqlite3"))
-    db_test = Path(os.path.join(database, "test.sqlite3"))
     check_file_existence(db_train)
-    check_file_existence(db_test)
+
+    test_dbs = {
+        variant: Path(os.path.join(database, f"{split}.sqlite3"))
+        for variant, (split, _) in test_splits.items()
+    }
+    for db_test in test_dbs.values():
+        check_file_existence(db_test)
 
     # Load json parameters
     with open(params_file) as f:
@@ -279,6 +351,10 @@ def run_ddiparsimony(
         pw_score_thresholds = params_json.get("parameter_list", {}).get(
             "pw_score_threshold", [0.7, 0.8, 0.9]
         )
+        if ppi_score_cutoff is None:
+            ppi_score_cutoff = params_json.get("parameter_list", {}).get(
+                "ppi_score_cutoff", DEFAULT_PPI_SCORE_CUTOFF
+            )
 
     opt_param = params_json.get("optimized", {})
 
@@ -306,7 +382,7 @@ def run_ddiparsimony(
             protein_domains,
             ppi_list,
             ddi_score,
-        ) = preprocessing(db_train, Path(out_dir), threads)
+        ) = preprocessing(db_train, Path(out_dir), threads, seed, ppi_score_cutoff)
         import gc
 
         domain_pair_to_idx = {pair: idx for idx, pair in enumerate(domain_pairs)}
@@ -322,6 +398,7 @@ def run_ddiparsimony(
                 ddi_dict,
                 ddi_score,
                 pw_score_thresholds,
+                seed,
             )
             for r in reliability_rates
         ]
@@ -349,6 +426,10 @@ def run_ddiparsimony(
                 )
             # Save observed_x_avg and avg_x_vec if available
             # For this, rerun compute_lp_score with return_x=True and get avg_x_vec, observed_x_avg
+            # Same rng_token as the grid worker used for this `r`, so this
+            # rerun reproduces that worker's observed_x_avg exactly. Under the
+            # old global RNG the two diverged, and the avg_x_vec saved here did
+            # not correspond to the pw_scores saved beside it.
             avg_score, n_runs, avg_x_vec = compute_lp_score(
                 ppi_list,
                 protein_domains,
@@ -358,6 +439,8 @@ def run_ddiparsimony(
                 reliability=r,
                 num_runs=200,
                 return_x=True,
+                seed=seed,
+                rng_token=f"train_grid:{r}",
             )
             if avg_x_vec is not None:
                 np.save(os.path.join(out_dir, f"avg_x_vec_{suffix}.npy"), avg_x_vec)
@@ -404,22 +487,50 @@ def run_ddiparsimony(
         )
         gc.collect()
 
-    logging.info(
-        f"Testing with best reliability: {best_r} and pw-score cutoff: {best_cutoff}"
-    )
+    if best_cutoff is None:
+        best_cutoff = 1.0  # default when no optimisation ran
+
+    for variant, (split, out_predictions) in test_splits.items():
+        logging.info(
+            f"Testing split {split} (variant {variant}) with best reliability: "
+            f"{best_r} and pw-score cutoff: {best_cutoff}"
+        )
+        score_test_split(
+            test_dbs[variant],
+            out_predictions,
+            variant,
+            best_r,
+            best_cutoff,
+            params_json,
+            out_dir,
+            threads,
+            seed,
+            ppi_score_cutoff,
+        )
+
+
+def score_test_split(
+    db_test,
+    out_predictions,
+    variant,
+    best_r,
+    best_cutoff,
+    params_json,
+    out_dir,
+    threads,
+    seed=42,
+    ppi_score_cutoff=DEFAULT_PPI_SCORE_CUTOFF,
+):
+    """Score one test split with the reliability/cutoff chosen on the train split."""
     # Preprocessing on test data
     domain_pairs, random_x_matrix, ddi_dict, protein_domains, ppi_list, ddi_score = (
-        preprocessing(db_test, Path(out_dir), threads)
+        preprocessing(db_test, Path(out_dir), threads, seed, ppi_score_cutoff)
     )
     import gc
 
     domain_pair_to_idx = {pair: idx for idx, pair in enumerate(domain_pairs)}
 
     # Call function evaluate_reliability_test
-    if best_cutoff is None:
-        best_cutoff = (
-            1.0  # or another default float value appropriate for your use case
-        )
     eval_rel_args = (
         best_r,
         best_cutoff,
@@ -430,6 +541,8 @@ def run_ddiparsimony(
         random_x_matrix,
         ddi_dict,
         ddi_score,
+        seed,
+        variant,
     )
     rel, cut, accuracy, fp_rate, pw_scores = evaluate_reliability_test(eval_rel_args)
     logging.info(
@@ -437,9 +550,12 @@ def run_ddiparsimony(
     )
 
     # Save test log files
-    suffix = "test"
+    suffix = variant
     with open(os.path.join(out_dir, f"pw_scores_{suffix}.json"), "w") as f:
         json.dump({f"{k[0]}_{k[1]}": v for k, v in pw_scores.items()}, f, indent=4)
+    # Same token as evaluate_reliability_test above, for the same reason as on
+    # the train side: the saved avg_x_vec must be the one the pw_scores came
+    # from.
     avg_score, n_runs, avg_x_vec = compute_lp_score(
         ppi_list,
         protein_domains,
@@ -449,38 +565,42 @@ def run_ddiparsimony(
         reliability=best_r,
         num_runs=200,
         return_x=True,
+        seed=seed,
+        rng_token=f"test_eval:{variant}:{best_r}",
     )
     if avg_x_vec is not None:
         np.save(os.path.join(out_dir, f"avg_x_vec_{suffix}.npy"), avg_x_vec)
         observed_x_avg = avg_x_vec
         np.save(os.path.join(out_dir, f"observed_x_avg_{suffix}.npy"), observed_x_avg)
 
-    params_json["optimized"] = {
+    optimized = {
         "reliability_rate": best_r,
         "pw_cutoff": best_cutoff,
         "accuracy": accuracy,
         "fp_rate": fp_rate,
     }
 
-    with open(os.path.join(out_dir, "ddiparsimony.json"), "w") as jf:
-        json.dump(params_json, jf, indent=4)
+    with open(os.path.join(out_dir, f"ddiparsimony_{variant}.json"), "w") as jf:
+        json.dump(dict(params_json, optimized=optimized), jf, indent=4)
 
     # Prepare output
     output_rows = []
     for pair in domain_pairs:
-        # Check if eval_relevant
+        # Every DDI row in a split database belongs to that split by
+        # construction (domainsplit's SUBSET_SPLIT_DB) -- nothing to filter.
         d1, d2 = pair
-        observed, eval_relevant = ddi_dict.get(pair, (0, 0))
-        if not eval_relevant:
-            continue
+        observed, _ = ddi_dict.get(pair, (0, 0))
         if best_cutoff is not None:
             predicted = int(pw_scores.get(pair, 0) <= best_cutoff)
         else:
             predicted = 0  # or handle as appropriate for your use case
+        # `pair` keys every lookup above; only the emitted orientation is
+        # canonicalised, so every predictions file in the run agrees.
+        out_a, out_b = canonical_pair(d1, d2)
         output_rows.append(
             {
-                "domain_a": d1,
-                "domain_b": d2,
+                "domain_a": out_a,
+                "domain_b": out_b,
                 "true_interaction": observed,
                 "predicted_interaction": predicted,
                 "predicted_probability": 1 - pw_scores.get(pair, 0),
@@ -530,5 +650,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--out_predictions", required=False, help="Output predictions file path"
     )
+    parser.add_argument(
+        "--test_split", default="test", help="Name of the test split to score"
+    )
     args = parser.parse_args()
-    run_ddiparsimony(args.database, args.params, args.out_dir, args.out_predictions)
+    variant = (
+        args.test_split[len("test_"):]
+        if args.test_split.startswith("test_")
+        else args.test_split
+    )
+    run_ddiparsimony(
+        args.database,
+        args.params,
+        args.out_dir,
+        {variant: (args.test_split, args.out_predictions)},
+    )

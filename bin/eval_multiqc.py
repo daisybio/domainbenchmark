@@ -24,6 +24,9 @@ from eval_multiqc_functions import (
     analyse_database,
     aggregate_per_model_metrics,
     paired_bootstrap_diff,
+    parse_dataset_order,
+    sort_by_dataset,
+    is_retired_block,
 )
 from enrichment_plots import write_enrichment_plotly_blocks
 import logging
@@ -63,9 +66,32 @@ def parse_arguments():
         "--out_dir", required=True, help="Output directory to store evaluation results."
     )
     p.add_argument(
+        "--db_name",
+        default=None,
+        help="Label for this run in the report (default: the --database directory "
+             "name). The pipeline passes the run label, so the two test variants of "
+             "one database identify themselves separately.",
+    )
+    p.add_argument(
+        "--test_split",
+        default="test",
+        help="Test split of --database to profile (e.g. test_balanced). Each "
+             "test set of a database is reported as its own dataset.",
+    )
+    p.add_argument(
         "--report",
         default=None,
         help="Path to previous MultiQC report to merge data from.",
+    )
+    p.add_argument(
+        "--mqc_order",
+        default=None,
+        help="Comma-separated dataset (run label) order for the report, e.g. "
+             "'random_balanced,minimal_leakage_hcni_realistic,external_test'. "
+             "Sections that exist once per dataset follow it. Not strict here: "
+             "one report only holds its own dataset plus whatever it merged from "
+             "--report, so a name that does not appear is not an error at this "
+             "stage -- combine_eval.py does enforce it.",
     )
     p.add_argument(
         "--id", dest="run_id", default=None,
@@ -98,8 +124,14 @@ def copy_old_report_blocks(old_report_dir, out_dir):
     # @out_dir: directory to copy old report blocks into
     # Copies db JSON blocks from old report to new output directory
     for fn in os.listdir(old_report_dir):
-        if fn.endswith("_db_mqc.json"):  # only copy database analysis blocks
-            shutil.copy2(os.path.join(old_report_dir, fn), out_dir)
+        if not fn.endswith("_db_mqc.json"):  # only copy database analysis blocks
+            continue
+        # An older report still carries the retired distribution blocks, and
+        # MultiQC renders every block it finds regardless of the config order.
+        if is_retired_block(fn):
+            logging.info(f"[INFO] Skipping retired block from old report: {fn}")
+            continue
+        shutil.copy2(os.path.join(old_report_dir, fn), out_dir)
 
 
 def to_pairs(x, y) -> list[list[float]]:
@@ -114,7 +146,7 @@ def merge_data(old, new):
     New values take precedence if sample/metric overlap.
     """
     merged = {}
-    all_samples = set(old.keys()).union(new.keys())
+    all_samples = sorted(set(old.keys()).union(new.keys()))
     print(len(old.keys()), len(new.keys()), len(all_samples))
     for sample in all_samples:
         merged[sample] = {}
@@ -127,29 +159,6 @@ def merge_data(old, new):
     return merged
 
 
-def _write_distribution_block(data, metric, label, interaction_type, db_name, outdir):
-    block_id = f"{DB_PREFIX}{interaction_type}_{metric}_distribution"
-    block = {
-        "id": block_id,
-        "section_name": f"{interaction_type.upper()} {label} Distribution",
-        "plot_type": "box",
-        "pconfig": {
-            "id": block_id,
-            "title": f"{interaction_type.upper()} {label} Distribution",
-            "xlab": "Database",
-            "ylab": label,
-        },
-        "data": data,
-        "raw_data": data,
-    }
-    block = add_db_name_to_block(block, db_name)
-    with open(
-        os.path.join(outdir, f"{interaction_type}_{metric}_distribution_{db_name}_db_mqc.json"),
-        "w",
-    ) as f:
-        json.dump(block, f, indent=2)
-
-
 def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
     # Write MultiQC JSON blocks for database analysis results
     # @db_analysis: dict with database analysis results
@@ -159,7 +168,7 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
     # Prepare data for MultiQC table
 
     data = {}
-    for db_type in db_analysis:  # db_type: train/optimization/test
+    for db_type in db_analysis:  # db_type: train/validation/test
         db_data = db_analysis[db_type]
         for interaction_type in ["ppi", "ddi"]:
             network_data = db_data[f"{interaction_type}_network_data"]
@@ -195,42 +204,10 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
     ) as f:
         json.dump(db_block, f, indent=2)
 
-    # Create violin plots for network distributions
-    # Separate DDI and PPI for databases, each violinplot contains the three databases (train/optimization/test), if available
-    degree_distributions = {}
-    betweenness_distributions = {}
-    clustering_distributions = {}
-
-    for network_type in ["ppi", "ddi"]:
-        # Initialize dicts
-        degree_distributions[network_type] = {}
-        betweenness_distributions[network_type] = {}
-        clustering_distributions[network_type] = {}
-        for db_type in db_analysis:  # db_type: train/optimization/test
-            db_data = db_analysis[db_type]
-            degree_distributions[network_type][db_type] = db_data[
-                f"{network_type}_network_data"
-            ]["degree_distribution"]
-            betweenness_distributions[network_type][db_type] = db_data[
-                f"{network_type}_network_data"
-            ]["betweenness_centrality"]
-            clustering_distributions[network_type][db_type] = db_data[
-                f"{network_type}_network_data"
-            ]["clustering_coefficient"]
-
-    for interaction_type in ["ppi", "ddi"]:
-        _write_distribution_block(
-            degree_distributions[interaction_type], "degree", "Degree",
-            interaction_type, db_name, outdir,
-        )
-        _write_distribution_block(
-            betweenness_distributions[interaction_type], "betweenness", "Betweenness Centrality",
-            interaction_type, db_name, outdir,
-        )
-        _write_distribution_block(
-            clustering_distributions[interaction_type], "clustering", "Clustering Coefficient",
-            interaction_type, db_name, outdir,
-        )
+    # The degree / betweenness / clustering box-plot blocks that used to be
+    # written here are gone: two of the three were hardcoded placeholders and
+    # the third asked a question `database_analysis` above already answers.
+    # See `analyse_interaction_network` in eval_multiqc_functions.py.
 
 
 def load_old_json_block(old_report_dir, file_name_suffix, block_id):
@@ -496,17 +473,18 @@ def get_old_dbnames(old_report_path) -> list[str]:
                             db_names.append(m.group(1))
             except Exception:
                 pass
-    return list(set(db_names))
+    return sorted(set(db_names))
 
 
 def write_multiqc_config(
-    outdir, old_report_path=None, db_name=None, same_db=False
+    outdir, old_report_path=None, db_name=None, same_db=False, dataset_order=None
 ) -> str:
     # Write MultiQC config file to specify module order
     # @outdir: output directory where MultiQC JSON files are located
     # @old_report_path: path to old MultiQC report (for merging)
     # @db_name: name of the database (used for block IDs)
     # @same_db: whether the database analysis is the same as in the old report
+    # @dataset_order: --mqc_order, applied to the per-dataset blocks
     # Returns path to written multiqc_config.yaml
     json_ids = []
     for fn in os.listdir(outdir):
@@ -555,9 +533,23 @@ def write_multiqc_config(
     pairwise_blocks = pick(r"_pairwise_significance$")
 
     db_blocks = pick(r"database_analysis")
-    degree_blocks = pick(r"_degree_distribution")
-    betweenness_blocks = pick(r"_betweenness_distribution")
-    clustering_blocks = pick(r"_clustering_distribution")
+
+    # Blocks that exist once per dataset carry the run label as an id suffix, so
+    # `--mqc_order` decides the order they are listed in. Everything else keeps
+    # the alphabetical order `all_ids` already has -- it is a function of the
+    # file names only, which is what keeps the report bytes reproducible.
+    #
+    # Not strict at this stage: one of these reports covers a single dataset
+    # (plus whatever it merged from --report), so most of the requested names
+    # legitimately do not appear. combine_eval.py sees them all and enforces it.
+    if dataset_order:
+        order = dataset_order
+        metric_blocks = sort_by_dataset(metric_blocks, order)
+        auc_ap_tbl = sort_by_dataset(auc_ap_tbl, order)
+        pairwise_blocks = sort_by_dataset(pairwise_blocks, order)
+        roc_blocks = sort_by_dataset(roc_blocks, order)
+        pr_blocks = sort_by_dataset(pr_blocks, order)
+        db_blocks = sort_by_dataset(db_blocks, order)
 
     enrichment_r2_barplot = pick(rf"^{ENRICHMENT_PREFIX}r2_adj_barplot$")
     enrichment_r2_heatmaps = pick(rf"^{ENRICHMENT_PREFIX}(partial_model_r2|single_feature_r2)_heatmap$")
@@ -579,9 +571,6 @@ def write_multiqc_config(
         + enrichment_odds_ratios
         + enrichment_agreement
         + db_blocks
-        + degree_blocks
-        + betweenness_blocks
-        + clustering_blocks
     )
 
     # Now add old report blocks that are not already present
@@ -688,13 +677,86 @@ def fix_trailing_punctuation_in_report(html_path: str) -> None:
         logging.info("[INFO] No stray trailing dots found to fix.")
 
 
+#: Per-source accuracy sidecar. Deliberately NOT a `*_mqc.json` block: the
+#: per-source view is a cross-dataset comparison, so only `combine_eval.py`
+#: renders it (as one tabbed bar graph over every (database, variant)). MultiQC
+#: ignores the file here, but it travels with the published `evaluation/` dir.
+SOURCE_ACCURACY_SIDECAR = "source_accuracy.json"
+
+
+def write_source_accuracy_sidecar(per_model_paths, outdir, db_name, test_split) -> None:
+    """Collect `per_source` from every model's eval_one sidecar into one file.
+
+    @per_model_paths: eval_one.py JSON sidecars for this (database, variant)
+    @outdir: evaluation output directory
+    @db_name: run label, i.e. the dataset this file describes
+    @test_split: the split the numbers were measured on
+
+    Counts (`n`, `n_pos`, `n_neg`) describe the test split itself and are
+    therefore model-independent -- taken from whichever model reports them, with
+    disagreements logged rather than silently reconciled. `n_scored` / `correct`
+    stay per model so `combine_eval.py` can both flag partial coverage and add up
+    an exact cross-dataset total.
+    """
+    models = {}
+    totals = {}
+    for path in per_model_paths or []:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+        except Exception as e:
+            logging.info(f"[WARN] Could not read per-model sidecar {path}: {e}")
+            continue
+        per_source = obj.get("per_source") or {}
+        if not per_source:
+            continue
+        model = obj.get("model_name") or os.path.splitext(os.path.basename(path))[0]
+        models[model] = {
+            source: {
+                "n_scored": int(stats.get("n_scored", 0)),
+                "correct": int(stats.get("correct", 0)),
+                "accuracy": stats.get("accuracy"),
+            }
+            for source, stats in per_source.items()
+        }
+        for source, stats in per_source.items():
+            counts = {
+                "n": int(stats.get("n", 0)),
+                "n_pos": int(stats.get("n_pos", 0)),
+                "n_neg": int(stats.get("n_neg", 0)),
+            }
+            if source in totals and totals[source] != counts:
+                logging.info(
+                    f"[WARN] Model '{model}' disagrees on the size of source "
+                    f"'{source}' ({counts} vs {totals[source]}); keeping the first."
+                )
+                continue
+            totals.setdefault(source, counts)
+
+    if not models:
+        print("[INFO] No per-source metrics in the per-model sidecars; skipping "
+              f"{SOURCE_ACCURACY_SIDECAR}")
+        return
+
+    payload = {
+        "db_name": db_name,
+        "test_split": test_split,
+        "totals": totals,
+        "models": models,
+    }
+    out_path = os.path.join(outdir, SOURCE_ACCURACY_SIDECAR)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"[INFO] Wrote {out_path} ({len(models)} models, {len(totals)} sources)")
+
+
 def main():
     args = parse_arguments()
     # print arguments for logging
     logging.info(f"[INFO] Arguments: {args}")
     print(f"[INFO] Arguments: {args}")
 
-    db_name = os.path.basename(os.path.normpath(args.database))
+    db_name = args.db_name or os.path.basename(os.path.normpath(args.database))
     print(f"[INFO] Database name: {db_name}")
 
     old_db_names = []
@@ -788,7 +850,7 @@ def main():
             f"[INFO] Database analysis for '{db_name}' already present in old report. Skipping re-analysis."
         )
     else:
-        db_analysis = analyse_database(args.database)
+        db_analysis = analyse_database(args.database, test_split=args.test_split)
         write_multiqc_json_database_analysis(db_analysis, args.out_dir, db_name)
 
     print(f"[INFO] Database analysis completed for: {db_name}")
@@ -805,8 +867,17 @@ def main():
     )
     print("[INFO] MultiQC JSON blocks written for model evaluation metrics and curves.")
 
+    # Per-source accuracy travels as a plain sidecar for combine_eval.py.
+    if args.per_model_metrics:
+        write_source_accuracy_sidecar(
+            args.per_model_metrics, args.out_dir, db_name, args.test_split
+        )
+
     # Part5: Config + run MultiQC
-    cfg_path = write_multiqc_config(args.out_dir, args.report, db_name, same_db=same_db)
+    cfg_path = write_multiqc_config(
+        args.out_dir, args.report, db_name, same_db=same_db,
+        dataset_order=parse_dataset_order(args.mqc_order),
+    )
     final_report = run_multiqc(args.out_dir, args.out_dir, cfg_path)
     fix_trailing_punctuation_in_report(final_report)
 

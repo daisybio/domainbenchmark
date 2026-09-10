@@ -2,34 +2,34 @@
 import h5py
 import pandas as pd
 import sqlite3
+from features import embeddings
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
+    # Deterministic encoder: `seed` is part of the encoder ABI so that a
+    # sampling encoder cannot be added without one. Unused here.
     domain_sequence_df = pd.read_sql(
-        """
-                SELECT domain_id, protein_id, UPPER(domain_sequence) AS sequence
-                FROM domain_protein_map;
+        f"""
+                SELECT {embeddings.DOMAIN_KEY_SQL},
+                       {embeddings.INSTANCE_KEY_SQL},
+                       UPPER(domain_sequence) AS sequence
+                FROM domain_protein_map
+                {embeddings.DOMAIN_JOIN_SQL};
             """,
         conn,
     )
 
     domain_sequence_df["encoding"] = domain_sequence_df["sequence"].apply(aaencode)
-    domain_sequence_df["domain_id"] = domain_sequence_df["domain_id"].astype(str)
-    domain_sequence_df["protein_id"] = domain_sequence_df["protein_id"].astype(str)
+    domain_sequence_df["domain_key"] = domain_sequence_df["domain_key"].astype(str)
+    domain_sequence_df["instance_key"] = domain_sequence_df["instance_key"].astype(str)
 
     for (
-        domain_id,
-        uniprot_id,
+        domain_key,
+        instance_key,
         domain_sequence,
         encoding,
     ) in domain_sequence_df.itertuples(index=False):
-        # create a group for each domain_id and put uniprot_id as a subgroup
-        if domain_id not in out_file:
-            pfam_group = out_file.create_group(domain_id)
-        else:
-            pfam_group = out_file[domain_id]
-
-        pfam_group[uniprot_id] = encoding
+        embeddings.write_instance(out_file, domain_key, instance_key, encoding)
 
     print(domain_sequence_df.head())
 

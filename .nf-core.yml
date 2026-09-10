@@ -11,11 +11,18 @@ lint:
   nextflow_config:
     - manifest.name
     - manifest.homePage
-  multiqc_config:
-    - report_comment
+  # No pipeline-level MULTIQC process: bin/eval_multiqc.py and
+  # bin/combine_eval.py write their own MultiQC configs, so there is no
+  # assets/multiqc_config.yml for this test to inspect.
+  multiqc_config: false
   files_exist:
     - conf/igenomes.config
     - conf/igenomes_ignored.config
+    # No pipeline-level MULTIQC process: the report is built by
+    # bin/eval_multiqc.py, which writes its own config. Software versions are
+    # deliberately not collected either.
+    - assets/multiqc_config.yml
+    - assets/methods_description_template.yml
     - CODE_OF_CONDUCT.md
     - assets/nf-core-domainbenchmark_logo_light.png
     - docs/images/nf-core-domainbenchmark_logo_light.png

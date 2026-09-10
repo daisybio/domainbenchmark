@@ -12,7 +12,13 @@ import argparse
 from pathlib import Path
 import json
 
-# from eval_multiqc_functions import *
+from eval_multiqc_functions import (
+    is_retired_block,
+    order_dataset_keys,
+    parse_dataset_order,
+    resolve_dataset_order,
+    sort_by_dataset,
+)
 import logging
 from enrichment_plots import combine_enrichment_blocks
 
@@ -52,16 +58,27 @@ def parse_arguments():
         "--out_dir", required=True, help="Output directory to store evaluation results."
     )
     p.add_argument(
+        "--mqc_order",
+        default=None,
+        help="Comma-separated dataset (run label) order, e.g. "
+             "'random_balanced,minimal_leakage_hcni_realistic,external_test'. "
+             "Drives the section order of the per-dataset blocks, the tab order "
+             "inside the combined ROC/PR and by-source plots, and the column "
+             "order of the AUC/AP heatmaps. A name that does not exist in the "
+             "data is a hard failure; a dataset missing from the list warns and "
+             "is appended alphabetically.",
+    )
+    p.add_argument(
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only).",
     )
     return p.parse_args()
 
 
-def write_multiqc_config(outdir) -> str:
+def write_multiqc_config(outdir, dataset_order=None) -> str:
     # Write MultiQC config file to specify module order
     # @outdir: output directory where MultiQC JSON files are located
-    # @old_report_path: path to old MultiQC report (for merging)
+    # @dataset_order: resolved --mqc_order, applied to the per-dataset blocks
 
     # Returns path to written multiqc_config.yaml
     json_ids = []
@@ -101,10 +118,12 @@ def write_multiqc_config(outdir) -> str:
     pr_heatmep_block = pick(r"model_performance_heatmap_pr$")
     pr_heatmap_ci = pick(r"model_performance_heatmap_pr_ci$")
 
+    source_block = pick(r"source_accuracy_by_ddi_source")
+
     db_blocks = pick(r"database_analysis")
-    degree_blocks = pick(r"_degree_distribution")
-    betweenness_blocks = pick(r"_betweenness_distribution")
-    clustering_blocks = pick(r"_clustering_distribution")
+    # degree_blocks = pick(r"_degree_distribution")
+    # betweenness_blocks = pick(r"_betweenness_distribution")
+    # clustering_blocks = pick(r"_clustering_distribution")
 
     enrichment_r2_barplot = pick(rf"^{ENRICHMENT_PREFIX}r2_adj_barplot$")
     enrichment_r2_heatmaps = pick(rf"^{ENRICHMENT_PREFIX}(partial_model_r2|single_feature_r2)_heatmap$")
@@ -115,12 +134,17 @@ def write_multiqc_config(outdir) -> str:
     # db_header = pick(r"db_header$")
     # models_header = pick(r"models_header$")
 
+    # `db_database_analysis_<dataset>` and `model_eval_metrics_<dataset>` exist
+    # once per dataset. `all_ids` is alphabetical, which puts them in an order
+    # nobody chose -- `--mqc_order` replaces it. Everything else stays a pure
+    # function of the file names, which is what keeps the report reproducible.
+    if dataset_order:
+        db_blocks = sort_by_dataset(db_blocks, dataset_order)
+        metric_blocks = sort_by_dataset(metric_blocks, dataset_order)
+
     ordered = (
         white_tbl
         + db_blocks
-        + degree_blocks
-        + betweenness_blocks
-        + clustering_blocks
         + metric_blocks
         + roc_heatmap_block
         + roc_heatmap_ci
@@ -133,6 +157,7 @@ def write_multiqc_config(outdir) -> str:
         + enrichment_feature_importance
         + enrichment_odds_ratios
         + enrichment_agreement
+        + source_block
     )
 
     # Now add old report blocks that are not already present
@@ -247,21 +272,280 @@ def get_db_name_from_dir(report_dir):
 
 
 def relabel_multiqc_block(block, db_name):
-    # Append db_name to id, section_name, and pconfig fields for uniqueness
+    # Append db_name to id, section_name, and pconfig fields for uniqueness.
+    # eval_multiqc.py already labels its database-analysis blocks with the run
+    # name, so skip blocks that carry it to avoid "… (random_balanced)
+    # (random_balanced)".
     suffix = f"_{db_name}"
+    parenthesised = f"({db_name})"
+
+    def add_id(value):
+        return value if value.endswith(suffix) else value + suffix
+
+    def add_title(value):
+        return value if value.endswith(parenthesised) else f"{value} {parenthesised}"
+
     if "id" in block:
-        block["id"] += suffix
+        block["id"] = add_id(block["id"])
     if "section_name" in block:
-        block["section_name"] += f" ({db_name})"
+        block["section_name"] = add_title(block["section_name"])
     if "pconfig" in block:
         if "id" in block["pconfig"]:
-            block["pconfig"]["id"] += suffix
+            block["pconfig"]["id"] = add_id(block["pconfig"]["id"])
         if "title" in block["pconfig"]:
-            block["pconfig"]["title"] += f" ({db_name})"
+            block["pconfig"]["title"] = add_title(block["pconfig"]["title"])
     return block
 
 
-def cross_db_comparison(all_blocks, outdir):
+#: Written by eval_multiqc.py, one per (database, test variant). Not a
+#: `*_mqc.json` block on purpose -- the per-source view only makes sense as one
+#: cross-dataset figure, which is assembled here.
+SOURCE_ACCURACY_SIDECAR = "source_accuracy.json"
+
+#: Baseline row: the whole test set, i.e. what the ordinary overview tables show.
+ALL_SOURCES = "ALL"
+
+#: Extra bar per source group: unweighted mean over the models in that group.
+AVERAGE_CAT = "Average"
+
+#: Extra tab: every dataset pooled. Exact, not an average of averages -- summed
+#: `correct` over summed `n_scored`.
+COMBINED_LABEL = "Combined"
+
+
+def read_source_accuracy(report_dir):
+    """Load one report's per-source sidecar, or None when it has none."""
+    path = os.path.join(report_dir, SOURCE_ACCURACY_SIDECAR)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as e:
+        logging.info(f"[WARN] Could not read {path}: {e}")
+        return None
+
+
+def _model_palette(models):
+    """Stable model -> colour map, so a bar keeps its colour across every tab."""
+    cmap = plt.get_cmap("tab20")
+    palette = {}
+    for i, model in enumerate(models):
+        rgb = cmap((i % 20) / 19.0)
+        palette[model] = "#{:02x}{:02x}{:02x}".format(
+            int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
+        )
+    return palette
+
+
+def _combine_datasets(sidecars):
+    """Pool every dataset into one synthetic `Combined` sidecar.
+
+    Accuracy is recomputed from summed `correct` / `n_scored` rather than
+    averaged, so a dataset with ten times the DDIs of another carries ten times
+    the weight -- which is what pooling the test sets would have given.
+    """
+    totals = {}
+    models = {}
+    for sidecar in sidecars:
+        for source, counts in sidecar.get("totals", {}).items():
+            acc = totals.setdefault(source, {"n": 0, "n_pos": 0, "n_neg": 0})
+            for key in ("n", "n_pos", "n_neg"):
+                acc[key] += int(counts.get(key, 0))
+        for model, by_source in sidecar.get("models", {}).items():
+            per_model = models.setdefault(model, {})
+            for source, stats in by_source.items():
+                acc = per_model.setdefault(source, {"n_scored": 0, "correct": 0})
+                acc["n_scored"] += int(stats.get("n_scored", 0))
+                acc["correct"] += int(stats.get("correct", 0))
+    for by_source in models.values():
+        for stats in by_source.values():
+            stats["accuracy"] = (
+                stats["correct"] / stats["n_scored"] if stats["n_scored"] else None
+            )
+    return {"db_name": COMBINED_LABEL, "test_split": COMBINED_LABEL,
+            "totals": totals, "models": models}
+
+
+def _source_order(totals):
+    """DDI count descending, `ALL` pinned to the bottom as the summary row."""
+    sources = sorted(
+        (s for s in totals if s != ALL_SOURCES),
+        key=lambda s: (-int(totals[s].get("n", 0)), s),
+    )
+    if ALL_SOURCES in totals:
+        sources.append(ALL_SOURCES)
+    return sources
+
+
+def _counts_table_html(sidecars, source_order):
+    """The DDI counts, as text above the plot rather than as bars.
+
+    Sources are mostly single-class -- `3did` is all positives, `sampled_negative`
+    all negatives -- so the positive/negative split is what tells you whether a
+    row's accuracy is a recall or a specificity in disguise.
+    """
+    head = "".join(f"<th style='text-align:right'>{sc['db_name']}</th>" for sc in sidecars)
+    rows = []
+    for source in source_order:
+        cells = []
+        for sidecar in sidecars:
+            counts = sidecar.get("totals", {}).get(source)
+            if not counts:
+                cells.append("<td style='text-align:right'>&ndash;</td>")
+                continue
+            cells.append(
+                "<td style='text-align:right'>{n:,} "
+                "<span style='color:#888'>({pos:,}&#8593;/{neg:,}&#8595;)</span></td>".format(
+                    n=int(counts.get("n", 0)),
+                    pos=int(counts.get("n_pos", 0)),
+                    neg=int(counts.get("n_neg", 0)),
+                )
+            )
+        label = f"<b>{source}</b>" if source == ALL_SOURCES else source
+        rows.append(f"<tr><td>{label}</td>{''.join(cells)}</tr>")
+    return (
+        "<p>DDIs per source in each test set, as "
+        "<code>total (positives&#8593;/negatives&#8595;)</code>. A DDI contributed by "
+        "several sources is counted under each of them, so the columns do not sum to "
+        f"<b>{ALL_SOURCES}</b>.</p>"
+        "<table class='table table-sm table-condensed' style='width:auto'>"
+        f"<thead><tr><th>Source</th>{head}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _coverage_notes(sidecars):
+    """Flag (dataset, model, source) cells scored on less than the full source.
+
+    Models do not all see the same DDIs: an ML model drops pairs whose domains
+    have no usable features, and a graph model only scores the pairs its network
+    reaches. Accuracy is computed over what each model actually scored, so a low
+    coverage cell is a weaker claim than its neighbours and has to say so.
+    """
+    notes = []
+    for sidecar in sidecars:
+        # The pooled tab has no coverage of its own -- it inherits whatever the
+        # real datasets already reported, so listing it again says nothing new.
+        if sidecar.get("db_name") == COMBINED_LABEL:
+            continue
+        for model in sorted(sidecar.get("models", {})):
+            partial = []
+            for source, stats in sorted(sidecar["models"][model].items()):
+                n = int(sidecar.get("totals", {}).get(source, {}).get("n", 0))
+                scored = int(stats.get("n_scored", 0))
+                if n and scored < n:
+                    partial.append(f"{source} {100.0 * scored / n:.1f}%")
+            if partial:
+                shown = ", ".join(partial[:6])
+                more = f", +{len(partial) - 6} more" if len(partial) > 6 else ""
+                notes.append(f"{sidecar['db_name']} / {model}: {shown}{more}")
+    if not notes:
+        return ""
+    return (
+        "<p><b>Partial coverage.</b> These models scored fewer DDIs than the source "
+        "contains; their accuracy is over the scored subset only.<br><small>"
+        + "<br>".join(notes)
+        + "</small></p>"
+    )
+
+
+def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
+    """One tabbed bar graph: bars = models, groups = sources, tabs = datasets.
+
+    A table would have been the natural shape here, but MultiQC 1.32 renders only
+    the first dataset of a custom-content `table` and ignores `data_labels`
+    (`custom_content.py`, the `PlotType.TABLE` branch), so there is no tabbed
+    table to be had. A bar graph switches datasets natively, and the counts that
+    do not belong on a value axis move into the section description.
+    """
+    sidecars = [sc for sc in sidecars if sc and sc.get("models")]
+    if not sidecars:
+        print("[INFO] No per-source sidecars found; skipping the by-source section.")
+        return
+
+    # Tabs are datasets, so `--mqc_order` is the tab order. `Combined` is
+    # appended after, never ordered: it is a pooled summary of the others.
+    sidecars = sort_by_dataset(
+        sidecars, dataset_order, key=lambda sc: sc.get("db_name", "")
+    )
+    if len(sidecars) > 1:
+        sidecars = sidecars + [_combine_datasets(sidecars)]
+
+    palette = _model_palette(sorted({m for sc in sidecars for m in sc["models"]}))
+
+    data, categories, data_labels = [], [], []
+    for sidecar in sidecars:
+        models = sorted(sidecar["models"])
+        order = _source_order(sidecar.get("totals", {})) or sorted(
+            {s for by_source in sidecar["models"].values() for s in by_source}
+        )
+
+        dataset = {}
+        for source in order:
+            cell, accuracies = {}, []
+            for model in models:
+                stats = sidecar["models"][model].get(source)
+                if not stats or not stats.get("n_scored"):
+                    continue
+                accuracy = 100.0 * stats["correct"] / stats["n_scored"]
+                cell[model] = round(accuracy, 2)
+                accuracies.append(accuracy)
+            if not accuracies:
+                continue
+            cell[AVERAGE_CAT] = round(sum(accuracies) / len(accuracies), 2)
+            dataset[source] = cell
+        if not dataset:
+            continue
+
+        present = [m for m in models if any(m in cell for cell in dataset.values())]
+        cats = {m: {"name": m, "color": palette[m]} for m in present}
+        cats[AVERAGE_CAT] = {"name": AVERAGE_CAT, "color": "#4d4d4d"}
+
+        data.append(dataset)
+        categories.append(cats)
+        data_labels.append({"name": sidecar["db_name"], "title": sidecar["db_name"]})
+
+    if not data:
+        print("[INFO] Per-source sidecars held no scored sources; skipping the section.")
+        return
+
+    block = {
+        "id": "source_accuracy_by_ddi_source",
+        "section_name": "Accuracy by DDI source",
+        "description": _counts_table_html(sidecars, _source_order(sidecars[-1]["totals"]))
+        + _coverage_notes(sidecars),
+        "plot_type": "bargraph",
+        "categories": categories,
+        "pconfig": {
+            "id": "source_accuracy_by_ddi_source",
+            "title": "Accuracy by DDI source",
+            "ylab": "Accuracy (%)",
+            "ymin": 0,
+            "ymax": 100,
+            # Grouped, not stacked: the bars are independent accuracies, and a
+            # stack of them would add up to a meaningless total.
+            "stacking": "group",
+            "cpswitch": False,
+            "hide_zero_cats": False,
+            "sort_samples": False,
+            "use_legend": True,
+            "tt_decimals": 1,
+            "tt_suffix": "%",
+            "data_labels": data_labels,
+        },
+        "data": data,
+    }
+    out_path = os.path.join(outdir, "source_accuracy_by_ddi_source_mqc.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(block, fh, indent=2)
+    print(
+        f"[INFO] Wrote {out_path} ({len(data)} datasets, "
+        f"{len(data_labels)} tabs incl. {COMBINED_LABEL if len(sidecars) > 1 else 'none'})"
+    )
+
+
+def cross_db_comparison(all_blocks, outdir, dataset_order=None):
 
     performance_data = {
         block["id"]: block
@@ -281,26 +565,30 @@ def cross_db_comparison(all_blocks, outdir):
     # model_eval_data = {block["id"]: block for block in all_blocks if block["id"].startswith("model_eval_metrics_")}
 
     # combined_metrics_heatmap(model_eval_data, outdir)
-    combined_roc_curves(roc_data, outdir)
-    combined_pr_curves(pr_data, outdir)
-    model_performance_heatmap(performance_data, outdir)
-    combine_db_analysis(
-        [block for block in all_blocks if block["id"].startswith("db_")], outdir
+    combined_roc_curves(roc_data, outdir, dataset_order)
+    combined_pr_curves(pr_data, outdir, dataset_order)
+    model_performance_heatmap(performance_data, outdir, dataset_order)
+    combine_curves_db_level(
+        roc_data, outdir, "roc", "False Positive Rate", "True Positive Rate",
+        dataset_order,
     )
     combine_curves_db_level(
-        roc_data, outdir, "roc", "False Positive Rate", "True Positive Rate"
+        pr_data, outdir, "pr", "Recall", "Precision", dataset_order
     )
-    combine_curves_db_level(pr_data, outdir, "pr", "Recall", "Precision")
 
 
-def combine_curves_db_level(curve_data, outdir, curve_type, xlabel, ylabel):
-    data = []
-    data_labels = []
+def combine_curves_db_level(
+    curve_data, outdir, curve_type, xlabel, ylabel, dataset_order=None
+):
+    # One tab per dataset, so `--mqc_order` is the tab order.
+    pairs = []
     for block_id, block in curve_data.items():
         db_name = block_id.replace(f"combined_{curve_type}_", "")
-        curve_data = block.get("data", {})
-        data.append(curve_data)
-        data_labels.append({"name": db_name, "title": db_name})
+        pairs.append((db_name, block.get("data", {})))
+    pairs = sort_by_dataset(pairs, dataset_order, key=lambda pair: pair[0])
+
+    data = [points for _, points in pairs]
+    data_labels = [{"name": db, "title": db} for db, _ in pairs]
 
     combined_block = {
         "id": f"combined_{curve_type}_curves_db_level",
@@ -322,7 +610,7 @@ def combine_curves_db_level(curve_data, outdir, curve_type, xlabel, ylabel):
         json.dump(combined_block, f, indent=2)
 
 
-def combined_roc_curves(roc_data, outdir):
+def combined_roc_curves(roc_data, outdir, dataset_order=None):
 
     data_tmp = []
     data_labels = []
@@ -336,12 +624,14 @@ def combined_roc_curves(roc_data, outdir):
             )
 
     data = []
-    for model in set(d["model"] for d in data_tmp):
+    for model in sorted({d["model"] for d in data_tmp}):
         model_curves = [d for d in data_tmp if d["model"] == model]
         tmp = {}
         for curve in model_curves:
             tmp[curve["db"]] = curve["points"]
-        data.append(tmp)
+        # One series per dataset inside each model's plot -- `--mqc_order` sets
+        # the series (and therefore legend) order.
+        data.append(order_dataset_keys(tmp, dataset_order))
         data_labels.append({"name": model, "title": model})
 
     # Order data by model_name
@@ -367,7 +657,7 @@ def combined_roc_curves(roc_data, outdir):
         json.dump(roc_block, f, indent=2)
 
 
-def combined_pr_curves(pr_data, outdir):
+def combined_pr_curves(pr_data, outdir, dataset_order=None):
 
     data = []
     data_tmp = []
@@ -380,13 +670,14 @@ def combined_pr_curves(pr_data, outdir):
                 {"name": model, "points": metrics[model], "model": model, "db": db_name}
             )
 
-    for model in set(d["model"] for d in data_tmp):
+    for model in sorted({d["model"] for d in data_tmp}):
         model_curves = [d for d in data_tmp if d["model"] == model]
         tmp = {}
         for curve in model_curves:
             # x : y for each curve, where x is fpr and y is tpr, and the key is the database name
             tmp[curve["db"]] = curve["points"]
-        data.append(tmp)
+        # Series order inside each model's plot; see combined_roc_curves.
+        data.append(order_dataset_keys(tmp, dataset_order))
         data_labels.append({"name": model, "title": model})
 
     # Order data by model_name
@@ -411,7 +702,7 @@ def combined_pr_curves(pr_data, outdir):
         json.dump(pr_block, f, indent=2)
 
 
-def model_performance_heatmap(combined_metrics, outdir):
+def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
     # Heatmap colour + clustering use the numeric mean (float). The
     # bootstrap CI lives in a sibling "<...> CI" string column emitted by
     # eval_multiqc.py and is rendered as a companion label-table next to the
@@ -449,11 +740,16 @@ def model_performance_heatmap(combined_metrics, outdir):
                 f"{pv:.3f} {pc}".strip() if pv is not None else (pc or "")
             )
 
-    # Sort rows
-    roc_mean = {m: roc_mean[m] for m in sorted(roc_mean)}
-    pr_mean = {m: pr_mean[m] for m in sorted(pr_mean)}
-    roc_ci = {m: roc_ci[m] for m in sorted(roc_ci)}
-    pr_ci = {m: pr_ci[m] for m in sorted(pr_ci)}
+    # Sort rows (models) alphabetically, columns (datasets) by --mqc_order.
+    def _rows(table):
+        return {
+            m: order_dataset_keys(table[m], dataset_order) for m in sorted(table)
+        }
+
+    roc_mean = _rows(roc_mean)
+    pr_mean = _rows(pr_mean)
+    roc_ci = _rows(roc_ci)
+    pr_ci = _rows(pr_ci)
 
     def _write_heatmap(block_id, title, data, fname):
         block = {
@@ -479,7 +775,9 @@ def model_performance_heatmap(combined_metrics, outdir):
     def _write_ci_table(block_id, title, data, fname):
         # Table sharing the same model/db grid; cells = "mean [lo, hi]" strings.
         # Acts as the CI label panel rendered directly below the heatmap.
-        db_cols = sorted({db for row in data.values() for db in row})
+        db_cols = sort_by_dataset(
+            {db for row in data.values() for db in row}, dataset_order
+        )
         headers = {
             db: {"title": db, "scale": False, "description": f"{title} ({db})"}
             for db in db_cols
@@ -528,95 +826,11 @@ def model_performance_heatmap(combined_metrics, outdir):
     )
 
 
-def combine_db_analysis(db_blocks, outdir):
-
-    # combine for ppi & ddi the degree distribution, betweenness distribution, and clustering distribution blocks into one block each, where the data is merged and relabeled by db_name
-
-    def combine_blocks(blocks, block_id, section_name, metric, name_suffix):
-        data = []
-        data_labels = []
-        for block in blocks:
-            db_name = block["id"].replace(
-                f"db_{block_id.replace('combined_', '').replace('_db', '')}_", ""
-            )
-            block_data = block.get("data", {})
-            # y must be a list of lists, order matches group_labels
-            # y = [block_data.get(group, []) for group in group_labels]
-            data.append(block_data)
-            data_labels.append({"name": db_name, "title": db_name})
-
-        combined_block = {
-            "id": block_id,
-            "section_name": section_name,
-            "plot_type": "box",
-            "pconfig": {
-                "id": block_id,
-                "title": section_name,
-                "xlab": "Database",
-                "ylab": metric,
-                "data_labels": data_labels,
-            },
-            "data": data,
-        }
-        with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
-            json.dump(combined_block, f, indent=2)
-
-    ddi_degree_blocks = [b for b in db_blocks if "ddi_degree_distribution" in b["id"]]
-    ppi_degree_blocks = [b for b in db_blocks if "ppi_degree_distribution" in b["id"]]
-    combine_blocks(
-        ddi_degree_blocks,
-        "combined_ddi_degree_distribution_db",
-        "Combined DDI Degree Distribution",
-        "Degree Distribution",
-        "ddi",
-    )
-    combine_blocks(
-        ppi_degree_blocks,
-        "combined_ppi_degree_distribution_db",
-        "Combined PPI Degree Distribution",
-        "Degree Distribution",
-        "ppi",
-    )
-    ddi_clustering_blocks = [
-        b for b in db_blocks if "ddi_clustering_distribution" in b["id"]
-    ]
-    ppi_clustering_blocks = [
-        b for b in db_blocks if "ppi_clustering_distribution" in b["id"]
-    ]
-    combine_blocks(
-        ddi_clustering_blocks,
-        "combined_ddi_clustering_distribution_db",
-        "Combined DDI Clustering Distribution",
-        "Clustering Coefficient",
-        "ddi",
-    )
-    combine_blocks(
-        ppi_clustering_blocks,
-        "combined_ppi_clustering_distribution_db",
-        "Combined PPI Clustering Distribution",
-        "Clustering Coefficient",
-        "ppi",
-    )
-    ddi_betweenness_blocks = [
-        b for b in db_blocks if "ddi_betweenness_distribution" in b["id"]
-    ]
-    ppi_betweenness_blocks = [
-        b for b in db_blocks if "ppi_betweenness_distribution" in b["id"]
-    ]
-    combine_blocks(
-        ddi_betweenness_blocks,
-        "combined_ddi_betweenness_distribution_db",
-        "Combined DDI Betweenness Distribution",
-        "Betweenness Centrality",
-        "ddi",
-    )
-    combine_blocks(
-        ppi_betweenness_blocks,
-        "combined_ppi_betweenness_distribution_db",
-        "Combined PPI Betweenness Distribution",
-        "Betweenness Centrality",
-        "ppi",
-    )
+# `combine_db_analysis()` lived here. It merged the per-dataset degree,
+# betweenness and clustering box plots into one tabbed block each. All three
+# series are gone (two were hardcoded [1..10] placeholders, the third duplicated
+# what `database_analysis` already reports), so there is nothing left to merge --
+# see `analyse_interaction_network` in eval_multiqc_functions.py.
 
 
 def main():
@@ -647,6 +861,7 @@ def main():
 
     all_blocks = []
     db_names = []
+    source_sidecars = []
     enrichment_blocks_by_db = {}
 
     # Collect and relabel all blocks from each report
@@ -656,8 +871,22 @@ def main():
         db_names.append(db_name)
         print(f"[INFO] Extracted db name: {db_name}")
 
+        # Per-source accuracy is rendered once, across every dataset, so it is
+        # collected here instead of copied through as a per-report block.
+        sidecar = read_source_accuracy(report_dir)
+        if sidecar:
+            sidecar.setdefault("db_name", db_name)
+            source_sidecars.append(sidecar)
+
         for fn in os.listdir(report_dir):
             if fn.endswith("_mqc.json"):
+                # A report written by an earlier version still carries the
+                # retired degree / betweenness / clustering blocks, and MultiQC
+                # renders every block it finds whether the config lists it or
+                # not. Drop them rather than let them reappear.
+                if is_retired_block(fn):
+                    print(f"[INFO] Skipping retired block: {fn}")
+                    continue
                 src = os.path.join(report_dir, fn)
                 with open(src, "r", encoding="utf-8") as f:
                     block = json.load(f)
@@ -675,16 +904,12 @@ def main():
                 fn_name = os.path.splitext(fn)[0]
                 fn_name = re.sub(r"_mqc$", "", fn_name)  # remove old suffix
                 out_fn = f"{fn_name}_{db_name}_mqc.json"
-                # If the block is a db block for the metrics, so all the distribution blocks, we don't need to copy them, because we will combine them later, so we skip them here
-                degree_names = [
-                    "degree_distribution",
-                    "betweenness_distribution",
-                    "clustering_distribution",
-                ]
+                # ROC/PR curve blocks and the per-dataset metrics tables are
+                # not copied through: cross_db_comparison() rebuilds them below
+                # as single cross-dataset blocks. (The degree / betweenness /
+                # clustering box plots used to be skipped here for the same
+                # reason; they no longer exist at all.)
                 if not (
-                    any(name in block["id"] for name in degree_names)
-                    and "db" in block["id"]
-                ) and not (
                     "roc" in block["id"]
                     or "pr" in block["id"]
                     or "combined_metrics_table_" in block["id"]
@@ -695,8 +920,21 @@ def main():
                         json.dump(block, out_f, indent=2)
                 all_blocks.append(block)
 
+    # Dataset ordering. This is the only stage that sees every dataset, so it
+    # is the one that can tell a typo in --mqc_order from a name that simply
+    # does not appear in this particular report -- hence strict here and lenient
+    # in eval_multiqc.py.
+    dataset_order = resolve_dataset_order(
+        parse_dataset_order(args.mqc_order),
+        db_names,
+        strict=True,
+        context="combined report",
+    )
+    print(f"[INFO] Dataset order: {', '.join(dataset_order) or '(none)'}")
+
     # Cross-database comparison
-    cross_db_comparison(all_blocks, outdir_json)
+    cross_db_comparison(all_blocks, outdir_json, dataset_order)
+    source_accuracy_bargraph(source_sidecars, outdir_json, dataset_order)
 
     # Enrichment: merge per-database Plotly blocks into one block per plot
     # family, adding a "database" selector (single-db reports fall through
@@ -709,7 +947,7 @@ def main():
     # create_section_header("db_header", "Database Results", outdir_json)
 
     # Write MultiQC config and run MultiQC as before
-    cfg_path = write_multiqc_config(outdir_json)
+    cfg_path = write_multiqc_config(outdir_json, dataset_order)
     final_report = run_multiqc(outdir_json, outdir, cfg_path)
     fix_trailing_punctuation_in_report(final_report)
 

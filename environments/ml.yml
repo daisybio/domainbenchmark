@@ -13,6 +13,7 @@ dependencies:
   - cuda-version=12.8
   - cudnn=9
   - pip=25.0
+  - pyarrow
   - pip:
       - --index-url https://download.pytorch.org/whl/cu128
       - --extra-index-url https://pypi.org/simple

@@ -27,11 +27,196 @@ from sklearn.metrics import (
 from eval_multiqc_functions import bootstrap_metric
 
 
+#: Row label for the whole test set, used as the per-source table's baseline.
+ALL_SOURCES = "ALL"
+
+#: Row label for DDIs whose `source` column is NULL/empty in the split database.
+#: That is real data -- a pair with no recorded provenance -- and is emitted only
+#: when it actually collects rows.
+#:
+#: It used to double as the bucket for scored pairs the split's
+#: `domain_domain_interaction` does not list at all. Those two are not the same
+#: thing: an unmatched pair is a *join failure*, and it is now fatal (see
+#: `_per_source_metrics`), so a surviving `unknown` row can only mean NULL
+#: provenance.
+UNKNOWN_SOURCE = "unknown"
+
+#: Internal sentinel for a scored pair with no row in `<split>_sources.csv`.
+#: Never reaches the report -- `_per_source_metrics` fails on it.
+UNMATCHED = "\x00unmatched"
+
+#: How many unmatched pairs the failure message names.
+UNMATCHED_EXAMPLES = 10
+
+
+def _pair_keys(domain_a, domain_b) -> np.ndarray:
+    """Order-independent join key for a domain pair (``"12\\t34"``).
+
+    Predictions and the source table both come from the same
+    `domain_domain_interaction` rows, so the two columns are already aligned --
+    but graph models rebuild their pair set from an undirected network and may
+    hand back the flipped orientation, so canonicalise rather than trust it.
+    """
+    a = np.asarray(domain_a, dtype=str)
+    b = np.asarray(domain_b, dtype=str)
+    lo = np.where(a <= b, a, b)
+    hi = np.where(a <= b, b, a)
+    return np.char.add(np.char.add(lo, "\t"), hi)
+
+
+def _read_sources(path: str) -> tuple:
+    """Read `<split>_sources.csv` into (exploded pair->source frame, totals).
+
+    `source` is a comma-joined provenance list, so a DDI contributed by several
+    sources is exploded into one row per source and therefore counts towards
+    each of their performance rows.
+
+    Returns ``(exploded, totals)`` where `exploded` has columns
+    ``pair``/``source`` and `totals` maps source -> ground-truth counts in this
+    test split (i.e. the denominator the model's coverage is measured against).
+    """
+    df = pd.read_csv(path, dtype={"domain_1": str, "domain_2": str, "source": str})
+    df["pair"] = _pair_keys(df["domain_1"], df["domain_2"])
+    df["interaction"] = df["interaction"].astype(np.int8)
+    df["source"] = df["source"].fillna("")
+
+    def _split(raw: str):
+        parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+        return parts or [UNKNOWN_SOURCE]
+
+    df["source"] = df["source"].map(_split)
+    exploded = df.explode("source", ignore_index=True)
+
+    totals = {}
+    for source, grp in exploded.groupby("source", sort=True):
+        n_pos = int(grp["interaction"].sum())
+        totals[source] = {
+            "n": int(len(grp)),
+            "n_pos": n_pos,
+            "n_neg": int(len(grp) - n_pos),
+        }
+    n_pos_all = int(df["interaction"].sum())
+    totals[ALL_SOURCES] = {
+        "n": int(len(df)),
+        "n_pos": n_pos_all,
+        "n_neg": int(len(df) - n_pos_all),
+    }
+    return exploded[["pair", "source"]], totals
+
+
+def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
+    """Accuracy per DDI source for one model's predictions.
+
+    Sources are usually single-class (`3did` is all positive, `sampled_negative`
+    all negative), so accuracy is the only metric that survives for most rows --
+    everything else would either be undefined or degenerate. `n_scored` is
+    reported next to the split's ground-truth `n` so partial coverage (a model
+    that could not score every DDI) is visible instead of silently inflating or
+    deflating the row.
+
+    Raises SystemExit when any scored pair has no row in the source table: that
+    is a key-space mismatch between the predictions and the CSVs, and a report
+    built on it is meaningless rather than merely incomplete.
+    """
+    if not sources_path or not os.path.isfile(sources_path):
+        print(f"[eval_one] no source table at {sources_path}; skipping per-source metrics")
+        return {}
+
+    exploded, totals = _read_sources(sources_path)
+
+    preds = pd.DataFrame(
+        {
+            "pair": _pair_keys(df["domain_a"], df["domain_b"]),
+            "correct": (
+                df["true_interaction"].to_numpy() == df["predicted_interaction"].to_numpy()
+            ).astype(np.int8),
+            "true_interaction": df["true_interaction"].to_numpy(),
+        }
+    )
+
+    merged = preds.merge(exploded, on="pair", how="left")
+    merged["source"] = merged["source"].fillna(UNMATCHED)
+
+    # A scored pair with no row in `<split>_sources.csv` is never data: both
+    # sides are built from the same split database's
+    # `domain_domain_interaction`, and `_pair_keys` canonicalises the
+    # orientation, so a miss means the two sides do not agree on what a domain
+    # is called. That was the standing state of the pipeline until
+    # DDI_EXTRACTION started reporting `pfam_id`: the graph models read the
+    # database directly through `bin/load_data_gm.py` and have always emitted
+    # Pfam accessions, while the CSVs carried `domain.id` surrogates, so *every*
+    # graph-model pair missed and the report showed one quiet `unknown` row
+    # holding the entire test set.
+    unmatched = merged.loc[merged["source"] == UNMATCHED, "pair"]
+    if len(unmatched):
+        n_unmatched = int(unmatched.nunique())
+        n_total = int(preds["pair"].nunique())
+        examples = ", ".join(
+            p.replace("\t", " <-> ") for p in sorted(unmatched.unique())[:UNMATCHED_EXAMPLES]
+        )
+        raise SystemExit(
+            f"[eval_one] {n_unmatched}/{n_total} scored domain pairs "
+            f"({n_unmatched / n_total:.1%}) have no row in {sources_path}.\n"
+            f"    e.g. {examples}\n"
+            "    Both sides come from the same split database's "
+            "domain_domain_interaction and the pair orientation is "
+            "canonicalised, so this is a key-space mismatch, not missing data. "
+            "Check that the predictions and DDI_EXTRACTION's CSVs are both keyed "
+            "by Pfam accession (`domain.pfam_id`) and not by the per-run "
+            "`domain.id` surrogate."
+        )
+
+    per_source = {}
+    for source, grp in merged.groupby("source", sort=True):
+        n_scored = int(len(grp))
+        n_pos = int((grp["true_interaction"] == 1).sum())
+        ground = totals.get(source, {})
+        per_source[source] = {
+            "n": int(ground.get("n", n_scored)),
+            "n_pos": int(ground.get("n_pos", n_pos)),
+            "n_neg": int(ground.get("n_neg", n_scored - n_pos)),
+            "n_scored": n_scored,
+            "correct": int(grp["correct"].sum()),
+            "accuracy": float(grp["correct"].sum()) / n_scored if n_scored else float("nan"),
+        }
+
+    n_all = int(len(preds))
+    correct_all = int(preds["correct"].sum())
+    ground_all = totals.get(ALL_SOURCES, {})
+    per_source[ALL_SOURCES] = {
+        "n": int(ground_all.get("n", n_all)),
+        "n_pos": int(ground_all.get("n_pos", int((preds["true_interaction"] == 1).sum()))),
+        "n_neg": int(ground_all.get("n_neg", 0)),
+        "n_scored": n_all,
+        "correct": correct_all,
+        "accuracy": float(correct_all) / n_all if n_all else float("nan"),
+    }
+
+    # `unknown` (NULL provenance) is a real bucket only when something landed
+    # in it. Unmatched pairs never get this far -- they raise above.
+    if per_source.get(UNKNOWN_SOURCE, {}).get("n_scored", 0) == 0:
+        per_source.pop(UNKNOWN_SOURCE, None)
+
+    return per_source
+
+
 def _read_predictions(path: str) -> pd.DataFrame:
     if path.endswith(".parquet") or path.endswith(".pq"):
         df = pd.read_parquet(path)
     else:
         df = pd.read_csv(path)
+    # A model that scored nothing writes a frame with no columns at all, and
+    # the bare KeyError that follows names the column rather than the file --
+    # useless when a dozen scatter tasks fail at once. Say which prediction
+    # file is malformed and how.
+    required = ("true_interaction", "predicted_interaction", "predicted_probability")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{path}: predictions are missing {missing} (columns present: "
+            f"{list(df.columns)}, {len(df)} rows). An empty frame here means the "
+            "model scored no domain pairs at all -- check that upstream task's log."
+        )
     df["true_interaction"] = df["true_interaction"].astype(np.int8)
     df["predicted_interaction"] = df["predicted_interaction"].astype(np.int8)
     df["predicted_probability"] = df["predicted_probability"].astype(np.float32)
@@ -98,10 +283,18 @@ def main():
     p.add_argument("--predictions", required=True)
     p.add_argument("--model_name", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--sources", default=None,
+        help="`<split>_sources.csv` from DDI_EXTRACTION (domain pair -> comma-joined "
+             "provenance list). Enables the per-source accuracy block; skipped when absent.",
+    )
     p.add_argument("--max_curve_points", type=int, default=600)
     p.add_argument("--bootstrap_n", type=int, default=1000,
                    help="Bootstrap resamples for ROC_AUC / PR_AP confidence intervals.")
-    p.add_argument("--bootstrap_seed", type=int, default=42)
+    # `--seed`, not `--bootstrap_seed`: the pipeline has exactly one RNG
+    # parameter (`params.seed`), and every entrypoint spells it the same way.
+    p.add_argument("--seed", type=int, default=42,
+                   help="Master RNG seed. Seeds the bootstrap resampling below.")
     p.add_argument(
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only)."
@@ -129,11 +322,11 @@ def main():
     # in the overview table.
     _, roc_lo, roc_hi, roc_samples = bootstrap_metric(
         y_true_clean, y_score_clean, roc_auc_score,
-        n_resamples=args.bootstrap_n, seed=args.bootstrap_seed,
+        n_resamples=args.bootstrap_n, seed=args.seed,
     )
     _, pr_lo, pr_hi, pr_samples = bootstrap_metric(
         y_true_clean, y_score_clean, average_precision_score,
-        n_resamples=args.bootstrap_n, seed=args.bootstrap_seed,
+        n_resamples=args.bootstrap_n, seed=args.seed,
     )
 
     fp_d, tp_d = _downsample_curve(fp.astype(np.float32), tp.astype(np.float32),
@@ -155,6 +348,10 @@ def main():
         # comparisons without re-reading predictions. ~8KB per metric per model.
         "roc_auc_samples": [float(v) for v in roc_samples],
         "pr_ap_samples": [float(v) for v in pr_samples],
+        # Per-DDI-source accuracy. Computed here because this is the only stage
+        # that holds the predictions themselves -- `eval_multiqc.py` sees only
+        # these sidecars (the scatter that fixed the 300 GB evaluation OOM).
+        "per_source": _per_source_metrics(df, args.sources),
     }
 
     out = Path(args.out)

@@ -190,8 +190,59 @@ def compute_group_ddi_chi2(
     ppi_interactions: set[tuple[str, str]],
     protein_domain_mapping: dict[str, set[str]],
 ):
-    """Compute chi2 for DDI patterns in each group."""
+    """Compute chi2 for DDI patterns in each group.
+
+    The contingency table for (group g, DDI d) is
+
+        A = PPIs in g whose domain cross-product contains d
+        B = PPIs outside g whose cross-product contains d
+        C = PPIs in g without d          = |g| - A
+        D = PPIs outside g without d     = (N - |g|) - B
+
+    `B` used to be counted by scanning the entire interactome once **per
+    (group, DDI)** -- rebuilding a list of the scanned PPI's domain pairs at
+    every step, and rebuilding `outside_ppis` from scratch for every DDI on top
+    of that. At `external_test` scale (1.78 M PPIs, ~120 k DDIs) that is upwards
+    of 1e11 Python iterations.
+
+    It is one precomputation instead. `total_ddi_counts[d]` counts, over the
+    whole deduplicated interactome, the PPIs whose cross-product contains `d`.
+    The union-find clusters partition that same set, so every PPI carrying `d`
+    is either in `g` or outside it, giving `B = total[d] - A`; and every group is
+    a subset of it, giving `|outside| = N - |g|`. Both are exact, not
+    approximations.
+
+    The result is bitwise identical to the scan: A, B, C, D are counts, and for
+    any realistic `N` every product and sum in `numerator`/`denominator` stays
+    below 2**53, so the float64 arithmetic is exact and only the final division
+    rounds -- on identical inputs.
+
+    Two things here look incidental and are not:
+
+    * `for ddi in group_ddi_set` iterates a *set*. `score_test_split` builds
+      `chi2_scores` as a dict comprehension, so for a DDI appearing in two
+      groups the last one written wins. Reordering this loop would silently
+      change the scores; `PYTHONHASHSEED=0` makes the current order
+      deterministic, so it is left exactly as it was.
+    * `missing_key_counter` still counts only in-group PPIs with an empty
+      domain set, as before -- it is a diagnostic about the groups, not about
+      the interactome.
+    """
     N = len(ppi_interactions)
+
+    # One pass over the whole interactome. `.get`, not `[...]`: the caller hands
+    # us a defaultdict(set), and subscripting it inserted an empty set for every
+    # protein without domains.
+    total_ddi_counts = Counter()
+    for p1, p2 in ppi_interactions:
+        d1s = protein_domain_mapping.get(p1)
+        d2s = protein_domain_mapping.get(p2)
+        if not d1s or not d2s:
+            continue
+        for d1 in d1s:
+            for d2 in d2s:
+                total_ddi_counts[(d1, d2)] += 1
+
     group_ddi_chi2 = []
     missing_key_counter = 0
     for group_name, group in connected_components.items():
@@ -208,30 +259,13 @@ def compute_group_ddi_chi2(
                 for d2 in d2s:
                     group_ddis[(d1, d2)] += 1
                     group_ddi_set.add((d1, d2))
+        n_outside = N - len(group)
         # For each DDI pattern in the group, compute chi-squared
         for ddi in group_ddi_set:
-            # A: PPIs in group with this DDI
             A = group_ddis[ddi]
-            # B: PPIs outside group with this DDI
-            B = 0
-            for p1, p2 in ppi_interactions:
-                if (p1, p2) not in group:
-                    try:
-                        if ddi in [
-                            (d1, d2)
-                            for d1 in protein_domain_mapping[p1]
-                            for d2 in protein_domain_mapping[p2]
-                        ]:
-                            B += 1
-                    except KeyError:
-                        continue
-            # C: PPIs in group without this DDI
+            B = total_ddi_counts[ddi] - A
             C = len(group) - A
-            # D: PPIs outside group without this DDI
-            outside_ppis = [
-                (p1, p2) for (p1, p2) in ppi_interactions if (p1, p2) not in group
-            ]
-            D = len(outside_ppis) - B
+            D = n_outside - B
             # Chi-squared calculation
             numerator = N * (A * D - C * B) ** 2
             denominator = (A + C) * (B + D) * (A + B) * (C + D)
@@ -248,9 +282,17 @@ def select_best_ddis_per_group(
     Select best DDIs per group using a quantile cutoff (chi_square_cutoff between 0 and 1).
     If chi_square_cutoff=0.75, selects top 25% by chi2. If 1.0, selects only max chi2, if 0.0, selects all.
     """
+    # Bucketed once instead of a full scan of `group_ddi_chi2` per group, which
+    # was O(groups x entries). Appending preserves each group's original
+    # within-group order, and the outer loop still walks
+    # `connected_components` in its own order, so the output is unchanged.
+    entries_by_group = defaultdict(list)
+    for entry in group_ddi_chi2:
+        entries_by_group[entry["group_name"]].append(entry)
+
     best_ddis_per_group = defaultdict(list)
     for group_name in connected_components.keys():
-        group_ddis = [x for x in group_ddi_chi2 if x["group_name"] == group_name]
+        group_ddis = entries_by_group.get(group_name, [])
         if group_ddis:
             chi2_values = np.array([x["chi2"] for x in group_ddis])
             if len(chi2_values) == 0:
