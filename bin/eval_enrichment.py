@@ -70,8 +70,10 @@ def _read_metadata(path: str) -> pd.DataFrame:
     else:
         df = pd.read_csv(path)
 
-    df['domain_a'] = df['domain_a'].astype(str)
-    df['domain_b'] = df['domain_b'].astype(str)
+    df['domain_a'] = df['pfam_id_a'].astype(str)
+    df['domain_b'] = df['pfam_id_b'].astype(str)
+    # Drop the original pfam_id_a and pfam_id_b columns, since we now have domain_a and domain_b
+    df = df.drop(columns=["pfam_id_a", "pfam_id_b"])
     return df
 
 
@@ -131,7 +133,7 @@ def prepare_data_for_regression(df: pd.DataFrame, column_types: dict, feature_na
         elif column_types[feature] == "ddi_metadata":
             X_cols.append(feature)
         else:
-            raise ValueError(f"[enrichment] Unknown feature type '{column_types[feature]}' for feature '{feature}'. Expected 'domain' or 'ddi'.")
+            raise ValueError(f"[enrichment] Unknown feature type '{column_types[feature]}' for feature '{feature}'. Expected 'domain_metadata' or 'ddi_metadata'.")
         feature_slices[feature] = slice(start, len(X_cols))
 
     if standardize:

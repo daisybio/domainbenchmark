@@ -49,8 +49,24 @@ def _warm_lazy_torch_imports():
     torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.1)
 
 
-_warm_lazy_torch_imports()
+def _warm_lazy_codec_imports() -> None:
+    """Force `encodings.unicode_escape` to import now, in the main process,
+    before RandomizedSearchCV forks worker processes.
 
+    skorch's PrintLog table (verbose>=1) calls str.encode("unicode_escape")
+    on every epoch. That codec is imported lazily on first use; in a
+    freshly-extracted Apptainer sandbox (see _warm_lazy_torch_imports) the
+    filesystem can still be mid-unpack when joblib workers race to import
+    it concurrently, and one loses the race with LookupError. Importing it
+    here, once, before n_jobs>1 workers are spawned, makes it already
+    resident in every forked worker's module cache.
+    """
+    import codecs
+    codecs.lookup("unicode_escape")
+
+
+_warm_lazy_torch_imports()
+_warm_lazy_codec_imports()
 
 class SeedFit(Callback):
     """Reseed every RNG at the start of each training loop.

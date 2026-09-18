@@ -1,0 +1,16 @@
+{
+    "model_name": "SVM",
+    "optimization": true,
+    "data": [],
+    "jobs": 5,
+    "search_parameters": {
+        "models_to_evaluate": 200,
+        "balance_positive_and_negative_interactions_opt_set": true
+    },
+    "model_parameters": {
+        "balance_method": ["downsample", "none"],
+        "C": [0.01, 0.1, 1, 10, 100],
+        "kernel": ["linear", "rbf"],
+        "gamma": ["scale", "auto", 0.001, 0.01, 0.1]
+    }
+}

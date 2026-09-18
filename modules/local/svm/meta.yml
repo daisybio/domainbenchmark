@@ -1,0 +1,55 @@
+name: svm
+description: |
+  Train a Support Vector Machine (SVM) DDI classifier (scikit-learn) on a
+  feature combination, run `RandomizedSearchCV` per the model JSON config,
+  and emit predictions for downstream evaluation.
+keywords:
+  - svm
+  - scikit-learn
+  - ddi
+  - classifier
+tools:
+  - scikit-learn:
+      description: SVM classifier and hyperparameter search.
+      homepage: https://scikit-learn.org
+      documentation: https://scikit-learn.org/stable/
+      licence:
+        - "BSD-3-Clause"
+input:
+  - - meta:
+        type: map
+        description: |
+          Groovy Map with database and feature-combo information,
+          e.g. [ id:'random_denoise', features:['aacomp'] ]
+    - ddi_dir:
+        type: directory
+        description: DDI tables from `DDI_EXTRACTION`.
+        pattern: "DDI"
+    - features_dir:
+        type: directory
+        description: Per-feature `.h5` files.
+        pattern: "features/*"
+    - config_json:
+        type: file
+        description: Model hyperparameter JSON from `assets/RandomForest.json`.
+        pattern: "*.json"
+output:
+  predictions:
+    - - meta:
+          type: map
+          description: Groovy Map with database and feature-combo info.
+      - "svm_*/predictions_*.parquet":
+          type: file
+          description: Per-prediction parquet table.
+          pattern: "*.parquet"
+  model:
+    - - meta:
+          type: map
+          description: Groovy Map with database and feature-combo info.
+      - "svm_*/model/":
+          type: directory
+          description: Trained model artefacts.
+authors:
+  - "@konstantinpelz"
+maintainers:
+  - "@konstantinpelz"

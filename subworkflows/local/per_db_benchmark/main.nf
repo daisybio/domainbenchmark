@@ -7,7 +7,7 @@
             ↓
         FEATURE_EXTRACTION  (scatter (db × feature × split))
             ↓
-        NEURAL_NETWORK + RANDOM_FOREST + GRAPH_MODEL    (per db × combo / model)
+        NEURAL_NETWORK + RANDOM_FOREST + SVM + GRAPH_MODEL    (per db × combo / model)
             ↓                 one predictions_<variant>.parquet per test split
         EVAL_ONE  (scatter — one tiny JSON per prediction)
             ↓
@@ -23,6 +23,7 @@ include { DDI_EXTRACTION                                } from '../../../modules
 include { FEATURE_EXTRACTION                            } from '../../../modules/local/feature_extraction/main.nf'
 include { NEURAL_NETWORK                                } from '../../../modules/local/neural_network/main.nf'
 include { RANDOM_FOREST                                 } from '../../../modules/local/random_forest/main.nf'
+include { SVM                                           } from '../../../modules/local/svm/main.nf'
 include { GRAPH_MODEL                                   } from '../../../modules/local/graph_model/main.nf'
 include { EVAL_ONE; METADATA; ENRICHMENT; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 include { VERIFY_EMBEDDINGS                             } from '../../../modules/local/verify_embeddings/main.nf'
@@ -157,6 +158,7 @@ workflow PER_DB_BENCHMARK {
         def ml_model_names       = all_ml_models.findAll { !skip_features.contains(it) }
         def nn_enabled           = ml_model_names.contains('neural_network')
         def rf_enabled           = ml_model_names.contains('random_forest')
+        def svm_enabled          = ml_model_names.contains('svm')
 
         // One run per feature (singleton) plus one all-feature concatenation
         // run when more than one feature is available.
@@ -165,6 +167,7 @@ workflow PER_DB_BENCHMARK {
 
         def ml_config = file(params.modeljson) / 'NeuralNetwork.json'
         def rf_config = file(params.modeljson) / 'RandomForest.json'
+        def svm_config = file(params.modeljson) / 'SVM.json'
 
         // ---------------------------------------------------------------
         // DDI + Feature extraction (per-DB)
@@ -259,6 +262,25 @@ workflow PER_DB_BENCHMARK {
             } : Channel.empty()
         RANDOM_FOREST(rf_input_ch)
 
+        svm_input_ch = svm_enabled ? ddi_keyed
+            .join(feature_files_per_db)
+            .combine(Channel.fromList(feature_combos.collect { [it] }))
+            .combine(Channel.value(svm_config))
+            .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
+                def combo_id = combo.size() == 1 ? combo[0] : 'all'
+                def m = [
+                    id      : "${meta.id}_svm_${combo_id}",
+                    db      : meta.db,
+                    model   : 'svm',
+                    features: combo,
+                    combo_id: combo_id,
+                    tests   : meta.tests
+                ]
+                tuple(m, ddi_dir, feature_files, cfg)
+            } : Channel.empty()
+        SVM(svm_input_ch)
+
+
         // ---------------------------------------------------------------
         // Graph models
         // ---------------------------------------------------------------
@@ -288,6 +310,7 @@ workflow PER_DB_BENCHMARK {
         all_predictions_ch = NEURAL_NETWORK.out.predictions
             .mix(RANDOM_FOREST.out.predictions)
             .mix(GRAPH_MODEL.out.predictions)
+            .mix(SVM.out.predictions)
             .flatMap { meta, pred ->
                 def files = pred instanceof java.util.List ? pred : [pred]
                 files.collect { f ->
@@ -321,86 +344,76 @@ workflow PER_DB_BENCHMARK {
         EVAL_ONE(eval_one_input_ch)
 
 
-        // ---------------------------------------------------------------
-        // If params.metadata is provided, first generate the metadata for each database
-        // Following run the enrichment analysis for each model and database combination
-        // This is needed as for each database type the corresponding metadata for the ddis needs to be aggregated accordingly
+                // ---------------------------------------------------------------
+        // If params.metadata is provided, first generate the metadata for
+        // each database. Enrichment then runs per (db x variant x model),
+        // mirroring the EVAL_ONE scatter above -- it reuses the same
+        // all_predictions_ch expansion instead of rebuilding a flattened,
+        // variant-blind version of it (which used to silently drop every
+        // test variant but the first).
         // ---------------------------------------------------------------
 
-        // params.metadata points to a directory containing two files: domain_metadata.csv and ddi_metadata.csv
         def metadata_input = params.metadata ? file(params.metadata) : null
+
+        // log.info("[metadata] ${metadata_input ? "using ${metadata_input}" : 'not provided; skipping enrichment'}")
 
         enrichment_output_ch = Channel.empty()
 
         if (metadata_input) {
-            // Only need ddi_keyes, there only the test set is actually needed for the enrichment analysis, as the evaluation is only performed on the test set.
-            def metadata_ch = ddi_keyed.map { _db_id, meta, ddi_dir ->
-                tuple(meta, metadata_input, ddi_dir)
+            // Each database has a balanced and a realistic test variant, and
+            // ddi_metadata differs per variant (it's keyed off that variant's
+            // test DDIs) -- so one metadata table is built per (db x variant),
+            // not one per database.
+            def metadata_ch = ddi_keyed.flatMap { _db_id, meta, ddi_dir ->
+                meta.tests.collect { variant, split ->
+                    def run_label = runLabel(meta.id, variant)
+                    def m = [
+                        id     : "${run_label}_metadata".toString(),
+                        db     : meta.id,
+                        variant: variant,
+                        split  : split
+                    ]
+                    tuple(m, metadata_input, ddi_dir)
+                }
             }
 
 
-            // def metadata_ch = db_ch.map { meta, db_path ->
-            //     m = [
-            //         id: "${meta.id}_metadata",
-            //         db: meta.id  // the db here is identical to meta_id in db channel and therefore to meta.db in the predictions channel
-            //     ]
-            //     tuple(m, metadata, db_path)
-            // }
 
             METADATA(metadata_ch)
 
-            // ---------------------------------------------------------------
-            // Per-model enrichment (scatter)
-            // ---------------------------------------------------------------
-
-
-            // key METADATA output by db id
             metadata_keyed_ch = METADATA.out.metadata
-                .map { meta, metadata_file -> tuple(meta.db, metadata_file) }
+                .map { meta, metadata_file -> tuple("${meta.db}::${meta.variant}".toString(), metadata_file) }
 
-            // key predictions by db id, then join with the metadata channel
-            all_predictions_ch = NEURAL_NETWORK.out.predictions
-                .mix(RANDOM_FOREST.out.predictions)
-                .mix(GRAPH_MODEL.out.predictions)
-                .map { meta, pred ->
-                    def f          = pred instanceof java.util.List ? pred[0] : pred
-                    def model_name = file(f).getParent().getName()
-                    def m_eval     = [
-                        id   : "${meta.db}_${model_name}",
-                        db   : meta.db,
-                        model: model_name
-                    ]
-                    tuple(meta.db, m_eval, f)
-                }
+            // Reuse the per-(db x variant x model) prediction expansion from
+            // above -- it already carries meta.db/variant/run_label/model, so
+            // enrichment fans out exactly like EVAL_ONE instead of collapsing
+            // every variant onto pred[0]. Keyed by db::variant now, to pair
+            // each prediction with the metadata table for its own test variant
+            // rather than a single database-wide one.
+            enrichment_input_ch = all_predictions_ch
+                .map { m, pf -> tuple("${m.db}::${m.variant}".toString(), m, pf) }
                 .combine(metadata_keyed_ch, by: 0)
-                .map { _db_id, m_eval, f, metadata_file ->
-                    tuple(m_eval, metadata_file, f)
+                .map { _key, m, pf, metadata_file ->
+                    tuple(m, metadata_file, pf)
                 }
 
-            ENRICHMENT(all_predictions_ch)
+
+            ENRICHMENT(enrichment_input_ch)
 
             enrichment_output_ch = ENRICHMENT.out.metrics
         }
 
-
-        
-        
-
         // ---------------------------------------------------------------
-        // Per-(DB, variant) MultiQC reduce. Group EVAL_ONE and ENRICHMENT outputs by
-        // (db, variant), then join back to the expanded db channel to recover
-        // (meta, db_path) for the EVALUATION call.
-        // Evaluation gets the JSONs from both the EVAL_ONE and ENRICHMENT processes, plus the old report path for comparison.
+        // Per-(DB, variant) MultiQC reduce. Group EVAL_ONE and ENRICHMENT
+        // outputs by (db, variant) -- both sides now use the identical
+        // "${db}::${variant}" key, so enrichment JSONs actually land in the
+        // same group as their eval JSONs instead of forming an orphan group
+        // keyed by db alone that the later join() silently drops.
         // ---------------------------------------------------------------
         per_model_jsons_ch = EVAL_ONE.out.metrics
             .map { meta, j -> tuple("${meta.db}::${meta.variant}".toString(), j) }
-            .mix(enrichment_output_ch.map { meta, j -> tuple(meta.db, j) })
+            .mix(enrichment_output_ch.map { meta, j -> tuple("${meta.db}::${meta.variant}".toString(), j) })
             .groupTuple()
-            // groupTuple() emits in task-completion order. That list becomes
-            // eval_multiqc.py's --per_model_metrics argument order, and MultiQC
-            // writes its JSON in the order it was fed -- so without this sort
-            // the report bytes flip between runs depending on which model
-            // finished first. It also stabilises the task hash for -resume.
             .map { key, jsons -> tuple(key, jsons.toSorted { a, b -> a.name <=> b.name }) }
 
         // One entry per (database, test variant). Train/validation splits are

@@ -95,15 +95,11 @@ process DDI_EXTRACTION {
                     )
                 ddi_df = pd.read_sql(DDI_QUERY, conn)
                 source_df = pd.read_sql(SOURCES_QUERY, conn)
-                mapping_df = pd.read_sql('''
-                        SELECT id as domain_id, pfam_id
-                        FROM domain;
-                ''', conn)
 
             os.makedirs("ddi_out/DDI/", exist_ok=True)
             ddi_df.to_csv("ddi_out/DDI/test.csv", index=False)
             source_df.to_csv("ddi_out/DDI/test_sources.csv", index=False)
-            mapping_df.to_csv(f"${meta.id}/DDI/mapping.csv", index=False)
+            # mapping_df.to_csv(f"${meta.id}/DDI/mapping.csv", index=False)
             PYEOF
             """
         } else {
@@ -197,7 +193,6 @@ process DDI_EXTRACTION {
                         pd.read_sql(INSTANCE_QUERY, conn).to_csv(
                             f"{out_dir}/{split}_instances.csv", index=False
                         )
-                    # TODO: add mapping file for test split
             PYEOF
             """
         }

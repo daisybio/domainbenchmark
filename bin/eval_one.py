@@ -12,6 +12,7 @@ predictions in memory; the reducer reads tiny JSONs.
 import argparse
 import json
 from pathlib import Path
+import os
 
 import numpy as np
 import pandas as pd

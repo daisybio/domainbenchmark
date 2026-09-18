@@ -51,24 +51,23 @@ process METADATA {
     label 'process_eval_metadata_creation'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
         tuple val(meta), path(metadata), path(ddi_dir)
 
     output:
-        tuple val(meta), path("metadata/${meta.id}.csv"), emit: metadata
+        tuple val(meta), path("metadata_tables/${meta.id}.csv"), emit: metadata
         path "versions.yml",                  emit: versions
 
     script:
         """
-        mkdir -p metadata
+        mkdir -p metadata_tables
 
         create_metadata.py \\
             --metadata ${metadata} \\
-            --ddi ${ddi_dir}/test.csv \\
-            --mapping ${ddi_dir}/mapping.csv \\
-            --out metadata/${meta.id}.csv
+            --ddi ${ddi_dir}/${meta.split}_instances.csv \\
+            --out metadata_tables/${meta.id}.csv
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":
@@ -77,8 +76,8 @@ process METADATA {
         """
     stub:
         """
-        mkdir -p metadata
-        echo '{}' > metadata/${meta.id}.csv
+        mkdir -p metadata_tables
+        echo '{}' > metadata_tables/${meta.id}.csv
         """
 }
 
@@ -87,7 +86,7 @@ process ENRICHMENT {
     label 'process_eval_enrichment'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker://konstantinpelz/domainbenchmark-general:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
         tuple val(meta), path(metadata), path(predictions)
@@ -106,6 +105,11 @@ process ENRICHMENT {
             --metadata ${metadata} \\
             --standardize \\
             --out per_model/${meta.model}.enrichment.json
+
+        cat <<-END_VERSIONS > versions.yml
+        "${task.process}":
+            python: \$(python --version 2>&1 | sed 's/Python //')
+        END_VERSIONS
         """
 
     stub:
