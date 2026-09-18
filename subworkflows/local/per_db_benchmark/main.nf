@@ -117,6 +117,27 @@ def runLabel(db_id, variant) {
     variant == 'test' ? "${db_id}".toString() : "${db_id}_${variant}".toString()
 }
 
+def expandFeatures(List requested, Map registry, List skip) {
+    def expanded = []
+
+    requested.each { key ->
+        def entry = registry[key]
+        if (entry == null) {
+            // No registry entry -> plain feature, name == module, no params.
+            expanded << [name: key, module: key, params: [:]]
+            return
+        }
+        entry.variants.each { v ->
+            def name = v.suffix ? "${key}_${v.suffix}" : key
+            expanded << [name: name, module: key, params: v.params ?: [:]]
+        }
+    }
+
+    // skip can match either the expanded name ('contacts_10A')
+    // or the whole module ('contacts', dropping every variant)
+    return expanded.findAll { f -> !(f.name in skip) && !(f.module in skip) }
+}
+
 workflow PER_DB_BENCHMARK {
 
     take:
@@ -160,6 +181,20 @@ workflow PER_DB_BENCHMARK {
         def rf_enabled           = ml_model_names.contains('random_forest')
         def svm_enabled          = ml_model_names.contains('svm')
 
+        // Print all features and feature registry entries for debugging. The registry is a map of feature_name → {variants: [{suffix, params}, ...]}.
+        println "[PER_DB_BENCHMARK] Feature registry: ${params.feature_registry}"
+        println "[PER_DB_BENCHMARK] Requested features: ${all_features}"
+
+        //NOTE: Rewrite features to take parameterized features
+        def expanded_features  = expandFeatures(all_features, params.feature_registry, skip_features)
+        // Print out all the features that will be run, including parameterized variants.
+        // println "[PER_DB_BENCHMARK] Running features: ${expanded_features*.name.join(', ')}"
+        // println "[PER_DB_BENCHMARK] Running modules: ${expanded_features*.module.join(', ')}"
+        // println "[PER_DB_BENCHMARK] Parameterized features: ${expanded_features.findAll { it.params }.collect { "${it.name}=${it.params}" }.join(', ')}"
+
+        def ml_features        = expanded_features.collect { it.name }
+
+
         // One run per feature (singleton) plus one all-feature concatenation
         // run when more than one feature is available.
         def feature_combos = ml_features.collect { [it] }
@@ -175,7 +210,8 @@ workflow PER_DB_BENCHMARK {
         DDI_EXTRACTION(db_ch) // in addition writes out mapping file to DDI dir for later use in metadata creation
         ddi_ch = DDI_EXTRACTION.out.ddi   // tuple(meta, ddi_dir)  
 
-        FEATURE_EXTRACTION(Channel.from(extracted_features), db_ch)
+        // NOTE: now takes expanded_features
+        FEATURE_EXTRACTION(Channel.from(expanded_features), db_ch)
 
         // Gate the published files against the databases they will be paired
         // with, and hand them on renamed to `<feature>.h5`. NN/RF consume this
@@ -309,6 +345,7 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         all_predictions_ch = NEURAL_NETWORK.out.predictions
             .mix(RANDOM_FOREST.out.predictions)
+            .mix(SVM.out.predictions)
             .mix(GRAPH_MODEL.out.predictions)
             .mix(SVM.out.predictions)
             .flatMap { meta, pred ->

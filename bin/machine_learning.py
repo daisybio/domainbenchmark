@@ -26,7 +26,7 @@ from typing import List
 from determinism import seed_everything
 
 
-interaction_encodings = ["protdcal"]
+interaction_encodings = ["protdcal", "aacomp_interface", "bsa_residue", "sasa_structure", "adjacency_matrix", "clash_heavy_atoms", "clash_backbone_atoms", "k_closest_distance", "struct2graph"]
 
 # B3 / A2: bounded cache (was unbounded dict — held every (features, dataset,
 # balance) variant of train/validation/test simultaneously, which on
@@ -340,7 +340,7 @@ def load_embedding_data(
                 else:
                     pair_found = False
             if not pair_found:
-                # print(f"Skipping pair ({domain_a}, {domain_b}) as one of the domains is missing in embeddings.")
+                print(f"Skipping pair ({domain_a}, {domain_b}) as one of the domains is missing in embeddings.")
                 continue
 
             # Candidate instance pairs for this DDI. Instance keys are opaque

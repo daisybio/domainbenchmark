@@ -146,6 +146,11 @@
                     "description": "Let GPU-only ML models fall back to a CPU implementation instead of failing.",
                     "help_text": "RANDOM_FOREST trains with cuML and normally exits with retry code 140 when its CUDA smoke test fails, so Nextflow reschedules the task onto a healthy GPU node. Set this on GPU-less machines (CI, laptops) to train with scikit-learn on the CPU instead. Leave it off for real runs: a CPU fit of the full grid is orders of magnitude slower, and the fallback would mask a broken GPU node.",
                     "fa_icon": "fas fa-microchip"
+                },
+                "feature_registry": {
+                    "type": "object",
+                    "description": "List containing additional params for each feature encoding. Schema: feature: [variants: [suffix : suffix_value, params: [param1 : value1, param2 : value2, ...]]]",
+                    "fa_icon": "fa fa-list"                
                 }
             }
         },

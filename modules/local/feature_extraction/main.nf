@@ -38,6 +38,8 @@ process FEATURE_EXTRACTION_ONE {
     script:
         def out          = "${meta.feature}__${meta.dataset}.h5"
         def feature_name = meta.feature
+        def module_name = meta.module
+        def feature_params = meta.params ?: [:]
         def dataset      = meta.dataset
 
         if (database_dir.isFile()) {
@@ -51,6 +53,8 @@ process FEATURE_EXTRACTION_ONE {
                 extract_features.py \\
                     --db ${database_dir} \\
                     --feature ${feature_name} \\
+                    --module ${module_name} \\
+                    --params '${groovy.json.JsonOutput.toJson(feature_params)}' \\
                     --out ${out} \\
                     --seed ${params.seed}
                 """
@@ -61,6 +65,8 @@ process FEATURE_EXTRACTION_ONE {
                 extract_features.py \\
                     --db ${database_dir}/${dataset}.sqlite3 \\
                     --feature ${feature_name} \\
+                    --module ${module_name} \\
+                    --params '${groovy.json.JsonOutput.toJson(feature_params)}' \\
                     --out ${out} \\
                     --seed ${params.seed}
             else
@@ -89,9 +95,11 @@ workflow FEATURE_EXTRACTION {
             .flatMap { db_meta, db_path, feat ->
                 (db_meta.splits ?: ['test']).collect { ds ->
                     def m = [
-                        id     : "${db_meta.id}_${feat}_${ds}",
+                        id     : "${db_meta.id}_${feat.name}_${ds}",
                         db     : db_meta.id,
-                        feature: feat,
+                        feature: feat.name,
+                    module : feat.module,
+                    params : groovy.json.JsonOutput.toJson(feat.params ?: [:]),
                         dataset: ds
                     ]
                     tuple(m, db_path)

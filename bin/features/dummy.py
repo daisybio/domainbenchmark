@@ -21,7 +21,10 @@ from features import embeddings
 DUMMY_DIM = 512
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, dim: int = 512, seed: int):
+
+    print(f"Calling feature extraction with parameters: dim={dim}")
+    
     domain_protein_df = pd.read_sql(
         f"""
         SELECT {embeddings.DOMAIN_KEY_SQL}, {embeddings.INSTANCE_KEY_SQL}
@@ -54,5 +57,5 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
 
     print(
         f"dummy: wrote {len(domain_protein_df)} (domain, instance) entries x "
-        f"{DUMMY_DIM}-dim random vectors"
+        f"{dim}-dim random vectors"
     )
