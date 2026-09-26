@@ -24,15 +24,17 @@ process FEATURE_EXTRACTION_ONE {
     label 'feature_extraction'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
+    container { def gpu_features = params.machine_learning_features_structure.split(',')*.trim()
+        meta.module in gpu_features
+        ? 'docker.io/konstantinpelz/domainbenchmark-gpu:1.0.1'
+        : 'docker.io/konstantinpelz/domainbenchmark-general:1.0.0' 
+    }
 
     input:
         tuple val(meta), path(database_dir)
+        path(structure_h5, stageAs: 'structures.h5')  // may be [] -- see FEATURE_EXTRACTION below
 
     output:
-        // optional: a split absent from this database produces no file at all.
-        // The previous zero-byte placeholder existed only so the stager could
-        // skip it; with no stager, an empty .h5 would just break h5py.
         tuple val(meta), path("${meta.feature}__${meta.dataset}.h5"), emit: h5, optional: true
 
     script:
@@ -41,9 +43,14 @@ process FEATURE_EXTRACTION_ONE {
         def module_name = meta.module
         def feature_params = meta.params ?: [:]
         def dataset      = meta.dataset
+        // structure_h5 is [] (empty list) when params.structures is unset --
+        // Nextflow stages nothing and the input list is empty, so we only add
+        // the flag when there is actually a file present.
+        def struct_arg   = (structure_h5 && !(structure_h5 instanceof List && structure_h5.isEmpty()))
+            ? "--struct-file ${structure_h5}"
+            : ""
 
         if (database_dir.isFile()) {
-            // Single-file db inputs only support a 'test' split.
             if (dataset != 'test') {
                 """
                 echo "Single-file database ${database_dir} has no '${dataset}' split — nothing to extract."
@@ -56,6 +63,7 @@ process FEATURE_EXTRACTION_ONE {
                     --module ${module_name} \\
                     --params '${groovy.json.JsonOutput.toJson(feature_params)}' \\
                     --out ${out} \\
+                    ${struct_arg} \\
                     --seed ${params.seed}
                 """
             }
@@ -68,6 +76,7 @@ process FEATURE_EXTRACTION_ONE {
                     --module ${module_name} \\
                     --params '${groovy.json.JsonOutput.toJson(feature_params)}' \\
                     --out ${out} \\
+                    ${struct_arg} \\
                     --seed ${params.seed}
             else
                 echo "Database ${database_dir} has no ${dataset}.sqlite3 — nothing to extract."
@@ -86,10 +95,9 @@ workflow FEATURE_EXTRACTION {
     take:
         feature_ch     // queue of feature names (String)
         db_ch          // channel: tuple(meta, db_path)  — multi-DB capable
+        struct_file_ch // value channel: single structures.h5 File, or Channel.value([]) if params.structures unset
 
     main:
-        // Build per-(db, feature, split) tasks. The split list is per-database
-        // (`meta.splits`), not a pipeline constant.
         per_task = db_ch
             .combine(feature_ch)
             .flatMap { db_meta, db_path, feat ->
@@ -106,10 +114,15 @@ workflow FEATURE_EXTRACTION {
                 }
             }
 
-        per_split = FEATURE_EXTRACTION_ONE(per_task)
+        // struct_file_ch is a single-value channel; .combine broadcasts it
+        // onto every task without changing the fan-out shape.
+        per_task_with_struct = per_task.combine(struct_file_ch)
+
+        per_split = FEATURE_EXTRACTION_ONE(
+            per_task_with_struct.map { m, db_path, _struct -> tuple(m, db_path) },
+            per_task_with_struct.map { _m, _db_path, struct -> struct }
+        )
 
     emit:
-        // tuple(db_id, h5) — one item per (db, feature, split). The caller
-        // groupTuple()s by db_id to get every feature file of one database.
         h5 = per_split.h5.map { meta, h5 -> tuple(meta.db, h5) }
 }

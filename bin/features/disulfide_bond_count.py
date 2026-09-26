@@ -7,26 +7,27 @@ from .structure_utils import bytes_to_pdb_structure
 from features import embeddings
 
 
-def salt_bridge_count(structure, threshold=5.5):
-    structA = structure[0]["A"]
-    structB = structure[0]["B"]
-    # Count the number of salt bridges between two protein structures.
-    # Salt bridges are typically defined as interactions between oppositely charged residues (e.g., Lys/Arg and Asp/Glu) within a certain distance threshold.
-    residuesA = list(structA.get_residues())
-    residuesB = list(structB.get_residues())
-    count = 0
-    for resA in residuesA:
-        for resB in residuesB:
-            if (resA.get_resname() in ['LYS', 'ARG'] and resB.get_resname() in ['ASP', 'GLU']) or \
-               (resA.get_resname() in ['ASP', 'GLU'] and resB.get_resname() in ['LYS', 'ARG']):
-                coord_resA = resA['CA'].get_coord() if 'CA' in resA else None
-                coord_resB = resB['CA'].get_coord() if 'CA' in resB else None
-                if coord_resA is not None and coord_resB is not None:
-                    dist = np.linalg.norm(coord_resA - coord_resB)
-                    if dist <= threshold:
-                        count += 1
-    return count
+DISULPHIDE_CUTOFFSQ = 5.0625
 
+def identify_ss_bonds(domain):
+    # Identify disulfide bonds in the domain structure
+    # If the distance between the SG atoms of two cysteine residues is less than 2.25 Å, we consider it a disulfide bond.
+    ss_bonds = []
+    cysteines = [residue for residue in domain.get_residues() if residue.get_resname() == 'CYS']
+    for i, res1 in enumerate(cysteines):
+        for j, res2 in enumerate(cysteines):
+            if i < j:  # Avoid double counting
+                sg1 = res1['SG']
+                sg2 = res2['SG']
+                distance_sq = (sg1 - sg2) ** 2
+                if distance_sq < DISULPHIDE_CUTOFFSQ:
+                    ss_bonds.append((res1.get_id(), res2.get_id()))
+    return ss_bonds
+
+
+def count_disulfide_bonds(domain):
+    ss_bonds = identify_ss_bonds(domain)
+    return len(ss_bonds)
 
 
 
@@ -59,10 +60,10 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
 
         structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}")  # pyright: ignore[reportAttributeAccessIssue]
 
-        count = salt_bridge_count(structure, threshold=5.5)
-        feature_vector = np.array([count], dtype=np.float32)
+        ssbond_count = count_disulfide_bonds(structure)
+        feature_vector = np.array([ssbond_count], dtype=np.float32)
 
         embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b, feature_vector)
         n_written += 1
-        
-    print(f"salt_bridge_count: wrote {n_written} entries")
+
+    print(f"disulfide_bond_count: wrote {n_written} entries")

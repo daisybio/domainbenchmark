@@ -1,26 +1,55 @@
-import os
-import tempfile
-
 import numpy as np
-from collections import defaultdict
 import gzip
 
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.SASA import ShrakeRupley
 
 
+def calculate_sasa_structure_level(domain):
+    sr = ShrakeRupley()
+    sr.compute(domain, level="C")  # Compute SASA at the structure level
+    return sum(atom.sasa for residue in domain for atom in residue)
 
 
 def calculate_sasa_residue_level(domain):
+    from collections import OrderedDict
     sr = ShrakeRupley()
     sr.compute(domain, level="R")  # Compute SASA at the residue level
-    sasa_values = {}
+    sasa_values = OrderedDict()
     for residue in domain.get_residues():
-        sasa_values[residue.get_id()] = residue.sasa
+        chain_id = residue.get_parent().get_id()
+        key = (chain_id, residue.get_id())  # Use chain ID and residue ID as key
+        sasa_values[key] = residue.sasa
     return sasa_values
 
 
+def calculate_sasa_values(domain):
+    """Compute SASA once per domain and return both residue-level and
+    structure-level results, instead of running ShrakeRupley twice
+    (once per aggregation level) on the same atoms.
+ 
+    Returns:
+        (residue_sasa, structure_sasa) where residue_sasa maps
+        residue.get_id() -> summed SASA over that residue's atoms, and
+        structure_sasa is the SASA summed over the whole domain.
+    """
+    sr = ShrakeRupley()
+    sr.compute(domain, level="A")  # atom-level is the finest; aggregate ourselves
+ 
+    residue_sasa = {}
+    structure_sasa = 0.0
+    for residue in domain.get_residues():
+        r_sasa = sum(atom.sasa for atom in residue.get_atoms())
+        chain_id = residue.get_parent().get_id()
+        key = (chain_id, residue.get_id())
+        residue_sasa[key] = r_sasa
+        structure_sasa += r_sasa
+ 
+    return residue_sasa, structure_sasa
+
+
 def calculate_rsa_residue_level(domain):
+    from collections import OrderedDict
     sasa_residue = calculate_sasa_residue_level(domain)
 
     # MAxSASA values by Tien et al. 2013, "Maximum allowed solvent accessibilities of residues in proteins" (https://doi.org/10.1002/prot.24286)
@@ -31,78 +60,80 @@ def calculate_rsa_residue_level(domain):
         'SER': 155.0, 'THR': 172.0, 'TRP': 285.0, 'TYR': 263.0, 'VAL': 174.0
     }
 
-    rsa_residue = {}
+    rsa_residue = OrderedDict()
     for residue in domain.get_residues():
         resname = residue.get_resname()
+        chain_id = residue.get_parent().get_id()
         rid = residue.get_id()
-        sasa_value = sasa_residue.get(rid, 0)
+        key = (chain_id, rid)
+        sasa_value = sasa_residue.get(key, 0)
         max_sasa = max_sasa_values.get(resname, None)
+        combined_key = (resname, chain_id, rid)
         if max_sasa is not None and max_sasa > 0:
-            rsa_residue[rid] = sasa_value / max_sasa
+            rsa_residue[combined_key] = sasa_value / max_sasa
         else:
-            rsa_residue[rid] = None
-
+            rsa_residue[combined_key] = None
     return rsa_residue
 
 
-def read_pdb(pdb_file):
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('structure', pdb_file)
-    return structure
+# def read_pdb(pdb_file):
+#     parser = PDBParser(QUIET=True)
+#     structure = parser.get_structure('structure', pdb_file)
+#     return structure
 
 
-def build_residue_graph(domain, distance_threshold=5.0):
-    # Build a graph where nodes are residues
-    # Edges exist if residues are within a certain distance threshold (e.g., 5 Å)
-    # Return 2D distance matrix
-    residues = list(domain.get_residues())
-    graph = [[0.0 for _ in residues] for _ in residues]
-    for i, res1 in enumerate(residues):
-        for j, res2 in enumerate(residues):
-            if i < j:  # Avoid double counting and self-comparison
-                dist = float('inf')
-                coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
-                coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
-                if coord_res1 is not None and coord_res2 is not None:
-                    dist = np.linalg.norm(coord_res1 - coord_res2)
-                if dist <= distance_threshold:
-                    graph[i][j] = 1
+# def build_residue_graph(domain, distance_threshold=5.0):
+#     # Build a graph where nodes are residues
+#     # Edges exist if residues are within a certain distance threshold (e.g., 5 Å)
+#     # Return 2D distance matrix
+#     residues = list(domain.get_residues())
+#     graph = [[0.0 for _ in residues] for _ in residues]
+#     for i, res1 in enumerate(residues):
+#         for j, res2 in enumerate(residues):
+#             if i < j:  # Avoid double counting and self-comparison
+#                 dist = float('inf')
+#                 coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
+#                 coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
+#                 if coord_res1 is not None and coord_res2 is not None:
+#                     dist = np.linalg.norm(coord_res1 - coord_res2)
+#                 if dist <= distance_threshold:
+#                     graph[i][j] = 1
 
-    return graph
-
-
-def build_adj_residue_graph(domain, distance_threshold=5.0):
-    # Same as build_residue_graph but with distance values instead of binary edges
-    residues = list(domain.get_residues())
-    graph = [[float('inf') for _ in residues] for _ in residues]
-    for i, res1 in enumerate(residues):
-        for j, res2 in enumerate(residues):
-            if i < j:  # Avoid double counting and self-comparison
-
-                coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
-                coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
-                if coord_res1 is not None and coord_res2 is not None:
-                    dist = np.linalg.norm(coord_res1 - coord_res2)
-                    if dist <= distance_threshold:
-                        graph[i][j] = float(dist)
-                        graph[j][i] = float(dist)  # Symmetric graph
-    return graph
+#     return graph
 
 
-def build_interchain_adjacency_graph(domain1, domain2, distance_threshold=5.0):
-    # Same as build_residue_graph but with distance values instead of binary edges
-    residues1 = list(domain1.get_residues())
-    residues2 = list(domain2.get_residues())
-    graph = [[float('inf') for _ in residues2] for _ in residues1]
-    for i, res1 in enumerate(residues1):
-        for j, res2 in enumerate(residues2):
-            coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
-            coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
-            if coord_res1 is not None and coord_res2 is not None:
-                dist = np.linalg.norm(coord_res1 - coord_res2)
-                if dist <= distance_threshold:
-                    graph[i][j] = float(dist)
-    return graph
+# def build_adj_residue_graph(domain, distance_threshold=5.0):
+#     # Same as build_residue_graph but with distance values instead of binary edges
+#     residues = list(domain.get_residues())
+#     graph = [[float('inf') for _ in residues] for _ in residues]
+#     for i, res1 in enumerate(residues):
+#         for j, res2 in enumerate(residues):
+#             if i < j:  # Avoid double counting and self-comparison
+
+#                 coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
+#                 coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
+#                 if coord_res1 is not None and coord_res2 is not None:
+#                     dist = np.linalg.norm(coord_res1 - coord_res2)
+#                     if dist <= distance_threshold:
+#                         graph[i][j] = float(dist)
+#                         graph[j][i] = float(dist)  # Symmetric graph
+#     return graph
+
+
+# def build_interchain_adjacency_graph(domain1, domain2, distance_threshold=5.0):
+#     # Same as build_residue_graph but with distance values instead of binary edges
+#     residues1 = list(domain1.get_residues())
+#     residues2 = list(domain2.get_residues())
+#     graph = [[float('inf') for _ in residues2] for _ in residues1]
+#     for i, res1 in enumerate(residues1):
+#         for j, res2 in enumerate(residues2):
+#             coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
+#             coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
+#             if coord_res1 is not None and coord_res2 is not None:
+#                 dist = np.linalg.norm(coord_res1 - coord_res2)
+#                 if dist <= distance_threshold:
+#                     graph[i][j] = float(dist)
+#     return graph
 
 
 def normalize_weighted_adjacency(adjacency_matrix):
@@ -129,99 +160,23 @@ def normalize_weighted_adjacency(adjacency_matrix):
     return normalized
 
 
-def create_node_fingerprints(adjacency_matrix, node_features=None, radius=1):
+def bytes_to_pdb_structure(pdb_gz: bytes, structure_id: str):
+    import io
+    """Inverse of utils_struct.ddi_pair_to_bytes.
+
+    `pdb_gz` is gzip-compressed PDB text, as stored in structures.h5 (see
+    the note on ddi_pair_to_bytes: already-compressed, so the dataset itself
+    uses compression=None). Decompress, then parse with the same PDBParser
+    settings used to build it (QUIET=True) so warnings are suppressed the
+    same way on the round trip.
+
+    `structure_id` is just Bio.PDB's internal label for the returned
+    Structure object -- purely cosmetic, doesn't affect parsing.
     """
-    Create r-radius fingerprints for each node in a weighted graph.
-    Similar to Weisfeiler-Lehman algorithm but for weighted graphs.
-    
-    Args:
-        adjacency_matrix: weighted adjacency matrix (n x n)
-        node_features: optional node feature vector (n,) or (n x f)
-        radius: neighborhood radius (1 = direct neighbors, 2 = neighbors of neighbors, etc.)
-    
-    Returns:
-        fingerprints: array of fingerprint IDs for each node
-    """
-    adjacency = np.array(adjacency_matrix, dtype=float)
-    n = adjacency.shape[0]
-    
-    # Initialize fingerprint dictionary for hashing
-    fingerprint_dict = defaultdict(lambda: len(fingerprint_dict))
-    
-    # Start with node features or node indices
-    if node_features is None:
-        current_features = np.arange(n)
-    else:
-        current_features = np.array(node_features)
-    
-    fingerprints = []
-    
-    # For each node, create a fingerprint based on neighborhood
-    for i in range(n):
-        # Get neighbors (non-zero adjacency)
-        neighbors_idx = np.where(adjacency[i] > 0.0001)[0]
-        neighbor_weights = adjacency[i][neighbors_idx]
-        
-        # Create signature: (node_feature, sorted_neighbor_features_with_weights)
-        if len(neighbors_idx) > 0:
-            # Sort neighbors by weight (descending) for consistent ordering
-            sorted_idx = np.argsort(-neighbor_weights)
-            neighbors_sorted = neighbors_idx[sorted_idx]
-            weights_sorted = neighbor_weights[sorted_idx]
-            
-            # Create tuple signature
-            neighbor_sig = tuple((int(n_idx), round(float(w), 4)) for n_idx, w in zip(neighbors_sorted, weights_sorted))
-            fingerprint = (int(current_features[i]), neighbor_sig)
-        else:
-            fingerprint = (int(current_features[i]),)
-        
-        fingerprints.append(fingerprint_dict[fingerprint])
-    
-    return np.array(fingerprints), fingerprint_dict
+    pdb_text = gzip.decompress(pdb_gz).decode("utf-8")
 
-
-def encode_weighted_graph(adjacency_matrix, node_features=None, radius=1, normalize=True):
-    """
-    Encode a weighted graph using struct2graph approach:
-    1. Create fingerprints (node identity + neighborhood)
-    2. Normalize adjacency matrix
-    
-    Args:
-        adjacency_matrix: weighted adjacency matrix (n x n)
-        node_features: optional node labels/features
-        radius: neighborhood radius for fingerprints
-        normalize: whether to apply normalization
-    
-    Returns:
-        fingerprints: array of fingerprint IDs
-        adjacency_normalized: normalized adjacency matrix
-        fingerprint_dict: mapping of fingerprints to IDs
-    """
-    fingerprints, fp_dict = create_node_fingerprints(adjacency_matrix, node_features, radius)
-    
-    if normalize:
-        adjacency_norm = normalize_weighted_adjacency(adjacency_matrix)
-    else:
-        adjacency_norm = np.array(adjacency_matrix, dtype=float)
-    
-    return fingerprints, adjacency_norm, fp_dict
-
-
-
-def bytes_to_pdb_structure(blob: bytes, name) -> object:
-    """
-    Decompress gzip-compressed and load into PDB structure object without writing to disk.
-    """
-
-    pdb_text = gzip.decompress(blob).decode("utf-8")
-    fd, path = tempfile.mkstemp(suffix=".pdb")
-    with os.fdopen(fd, "w") as fh:
-        fh.write(pdb_text)
-    structure = PDBParser(QUIET=True).get_structure(f"{name}", path)
-    os.unlink(path)  # Delete the temporary file
-
-    return structure
-
+    parser = PDBParser(QUIET=True)
+    return parser.get_structure(structure_id, io.StringIO(pdb_text))
 
 
 
@@ -237,12 +192,10 @@ MODEL_DEFAULTS = {
 }
 
 
-
-
-# device = torch.device('cpu')
-
 import torch
 import torch.nn as nn
+device = torch.device('cpu')
+
 class ProteinProteinInteractionPrediction(nn.Module):
     def __init__(self, n_fingerprint):
         super(ProteinProteinInteractionPrediction, self).__init__()
@@ -307,122 +260,66 @@ class ProteinProteinInteractionPrediction(nn.Module):
 
 
 
+def pool_residue_feature(values: np.ndarray) -> np.ndarray:
+    """Collapse a variable-length residue-wise feature vector into a fixed-size summary."""
+    if len(values) == 0:
+        return np.zeros(6, dtype=np.float32)
+    return np.array([
+        values.mean(),
+        values.std(),
+        values.min(),
+        values.max(),
+        np.median(values),
+        values.sum(),
+    ], dtype=np.float32)
 
-# # Single shared (untrained) encoder instance, reused across calls so
-# # repeated calls in a loop don't reinitialize random weights each time.
-# 
 
 
-
-# def embed_fingerprints_single(fingerprint, adjacency, n_fingerprint, dim=DIM, layer_gnn=LAYER_GNN):
+# def pad_vector(vector, max_length):
 #     """
-#     fingerprint: array-like of atom/residue indices, shape (n_nodes,)
-#     adjacency:   array-like adjacency matrix, shape (n_nodes, n_nodes)
-#     n_fingerprint: size of the fingerprint vocabulary (needed to size the
-#                    embedding table consistently across calls)
+#     Pads a 1D numpy array with zeros to ensure it has a specified maximum length.
 
-#     Returns: numpy array, shape (dim,)
+#     Parameters:
+#     vector (np.ndarray): The input 1D vector to be padded.
+#     max_length (int): The desired length of the output vector after padding.
+
+#     Returns:
+#     np.ndarray: A new array padded with zeros to the specified length.
 #     """
-#     key = (n_fingerprint, dim, layer_gnn)
-#     if key not in _encoder_cache:
-#         model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
-#         model.eval()
-#         _encoder_cache[key] = model
-#     model = _encoder_cache[key]
+#     vector = np.asarray(vector)
 
-#     # Self-pairing: treat the same fingerprint and adjacency as both inputs to the model.
-#     protein1 = torch.LongTensor(fingerprint)
-#     adjacency1 = torch.FloatTensor(adjacency)
-#     protein2 = torch.LongTensor(fingerprint)
-#     adjacency2 = torch.FloatTensor(adjacency)
+#     if vector.ndim != 1:
+#         raise ValueError(f"Expected a 1D vector, got shape {vector.shape}.")
 
-#     inputs = (protein1.to(device), adjacency1.to(device), protein2.to(device), adjacency2.to(device))
-#     y, att1, att2 = model.forward(inputs)
+#     if len(vector) > max_length:
+#         raise ValueError(f"Input vector length {len(vector)} exceeds the maximum length of {max_length}.")
 
-#     return y.detach().cpu().numpy()
+#     padding_length = max_length - len(vector)
+
+#     return np.pad(vector, (0, padding_length), mode='constant', constant_values=0)
 
 
-
-# DIM = 20
-# LAYER_GNN = 2
-
-# def embed_fingerprints(fingerprint1, fingerprint2, adjacency1, adjacency2, n_fingerprint, dim=DIM, layer_gnn=LAYER_GNN):
+# # Second possible padding, which puts vector in the middle of the padded vector, with zeros on both sides
+# def pad_vector_middle(vector, max_length):
 #     """
-#     fingerprint: array-like of atom/residue indices, shape (n_nodes,)
-#     adjacency:   array-like adjacency matrix, shape (n_nodes, n_nodes)
-#     n_fingerprint: size of the fingerprint vocabulary (needed to size the
-#                    embedding table consistently across calls)
-
-#     Returns: numpy array, shape (dim,)
+#     Pads a 1D vector with zeros to ensure it has a specified maximum length, centering the original vector.
+    
+#     Parameters:
+#     vector (list): The input 1D vector to be padded.
+#     max_length (int): The desired length of the output vector after padding.
+    
+#     Returns:
+#     list: A new vector that is padded with zeros to the specified length, with the original vector centered.
 #     """
-#     key = (n_fingerprint, dim, layer_gnn)
+#     if len(vector) > max_length:
+#         raise ValueError(f"Input vector length {len(vector)} exceeds the maximum length of {max_length}.")
     
-#     if key not in _encoder_cache:
-#         model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
-#         model.eval()
-#         _encoder_cache[key] = model
-#     model = _encoder_cache[key]
-
-#     protein1 = torch.LongTensor(fingerprint1)
-#     adjacency1 = torch.FloatTensor(adjacency1)
-#     protein2 = torch.LongTensor(fingerprint2)
-#     adjacency2 = torch.FloatTensor(adjacency2)
-
-#     inputs = (protein1.to(device), adjacency1.to(device), protein2.to(device), adjacency2.to(device))
-#     y, att1, att2 = model.forward(inputs)
-
-#     return y.detach().cpu().numpy()
-
-
-
-
-
-
-
-def pad_vector(vector, max_length):
-    """
-    Pads a 1D vector with zeros to ensure it has a specified maximum length.
+#     # Calculate the number of zeros needed for padding
+#     total_padding = max_length - len(vector)
+#     left_padding = total_padding // 2
+#     right_padding = total_padding - left_padding
     
-    Parameters:
-    vector (list): The input 1D vector to be padded.
-    max_length (int): The desired length of the output vector after padding.
+#     # Create a new vector with the original values centered and padded with zeros on both sides
+#     padded_vector = [0] * left_padding + vector + [0] * right_padding
     
-    Returns:
-    list: A new vector that is padded with zeros to the specified length.
-    """
-    if len(vector) > max_length:
-        raise ValueError(f"Input vector length {len(vector)} exceeds the maximum length of {max_length}.")
-    
-    # Calculate the number of zeros needed for padding
-    padding_length = max_length - len(vector)
-    
-    # Create a new vector with the original values followed by the required number of zeros
-    padded_vector = vector + [0] * padding_length
-    
-    return padded_vector
-
-
-# Second possible padding, which puts vector in the middle of the padded vector, with zeros on both sides
-def pad_vector_middle(vector, max_length):
-    """
-    Pads a 1D vector with zeros to ensure it has a specified maximum length, centering the original vector.
-    
-    Parameters:
-    vector (list): The input 1D vector to be padded.
-    max_length (int): The desired length of the output vector after padding.
-    
-    Returns:
-    list: A new vector that is padded with zeros to the specified length, with the original vector centered.
-    """
-    if len(vector) > max_length:
-        raise ValueError(f"Input vector length {len(vector)} exceeds the maximum length of {max_length}.")
-    
-    # Calculate the number of zeros needed for padding
-    total_padding = max_length - len(vector)
-    left_padding = total_padding // 2
-    right_padding = total_padding - left_padding
-    
-    # Create a new vector with the original values centered and padded with zeros on both sides
-    padded_vector = [0] * left_padding + vector + [0] * right_padding
-    
-    return padded_vector
+#     return padded_vector

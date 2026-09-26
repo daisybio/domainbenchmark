@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import h5py
 import importlib
+import inspect
 import json
 import sqlite3
 from pathlib import Path
@@ -29,6 +31,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--out", type=Path, required=True, help="Output file path")
     parser.add_argument(
+        "--struct-file", type=Path, default=None,
+        help="Optional path to the DDI structures HDF5 file (see "
+             "embeddings.interaction_group_name/interaction_dataset_name). "
+             "Passed to extract_features() as struct_file only for encoder "
+             "modules that declare that parameter -- see the inspect check "
+             "below. Structure-less encoders never see it, so this flag is "
+             "safe to pass unconditionally whenever params.structures is set."
+    )
+    parser.add_argument(
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only)."
     )
@@ -46,25 +57,43 @@ if __name__ == "__main__":
 
     seed_everything(args.seed)
 
-    # module_name = args.module or args.feature
     feature_params = json.loads(args.params)
 
     print("Opening database and output file...")
     with (
         sqlite3.connect(args.db) as connection,
         h5py.File(args.out, "w") as output_file,
+        contextlib.ExitStack() as struct_stack,
     ):
+        struct_file = None
+        if args.struct_file is not None:
+            struct_file = struct_stack.enter_context(h5py.File(args.struct_file, "r"))
+
         print(
             f"Extracting feature '{args.feature}' "
-            f"(module=features.{args.module}, params={feature_params})..."
+            f"(module=features.{args.module}, params={feature_params}, "
+            f"structures={'yes' if struct_file is not None else 'no'})..."
         )
-        
-        feature_module = importlib.import_module(f"features.{args.module}")  # TODO: check if it is args.module or args.module
-        # If feature params is empty, call without params, else call with params.
-        if not args.params or feature_params == {}:
-            # Every encoder takes the seed, whether or not it draws from it today:
-        # an encoder that samples must not be able to reach the global RNG.
-            feature_module.extract_features(connection, output_file, args.seed)
-        else:
-            feature_params = eval(feature_params) if isinstance(feature_params, str) else feature_params
-            feature_module.extract_features(connection, output_file, args.seed, **feature_params)
+
+        feature_module = importlib.import_module(f"features.{args.module}")
+
+        call_kwargs = feature_params if isinstance(feature_params, dict) else {}
+        if isinstance(feature_params, str):
+            call_kwargs = json.loads(feature_params)
+
+        # Only pass struct_file to encoders that actually declare that
+        # parameter -- e.g. aacomp_interface.extract_features(conn, out_file,
+        # seed, struct_file), but not aacomp.extract_features(conn, out_file,
+        # seed). This is what lets us stage the structures file into every
+        # task unconditionally instead of threading a per-feature
+        # "is this a structure encoder" flag through the Nextflow layer.
+        sig = inspect.signature(feature_module.extract_features)
+        if "struct_file" in sig.parameters:
+            if struct_file is None:
+                raise ValueError(
+                    f"Feature module '{args.module}' requires struct_file but "
+                    f"no --struct-file was given (is params.structures set?)."
+                )
+            call_kwargs["struct_file"] = struct_file
+
+        feature_module.extract_features(connection, output_file, args.seed, **call_kwargs)

@@ -3,32 +3,23 @@ import h5py
 import numpy as np
 import sqlite3
 
-from .structure_utils import bytes_to_pdb_structure
+from .structure_utils import bytes_to_pdb_structure, calculate_sasa_structure_level
 from features import embeddings
 
 
-def salt_bridge_count(structure, threshold=5.5):
-    structA = structure[0]["A"]
-    structB = structure[0]["B"]
-    # Count the number of salt bridges between two protein structures.
-    # Salt bridges are typically defined as interactions between oppositely charged residues (e.g., Lys/Arg and Asp/Glu) within a certain distance threshold.
-    residuesA = list(structA.get_residues())
-    residuesB = list(structB.get_residues())
-    count = 0
-    for resA in residuesA:
-        for resB in residuesB:
-            if (resA.get_resname() in ['LYS', 'ARG'] and resB.get_resname() in ['ASP', 'GLU']) or \
-               (resA.get_resname() in ['ASP', 'GLU'] and resB.get_resname() in ['LYS', 'ARG']):
-                coord_resA = resA['CA'].get_coord() if 'CA' in resA else None
-                coord_resB = resB['CA'].get_coord() if 'CA' in resB else None
-                if coord_resA is not None and coord_resB is not None:
-                    dist = np.linalg.norm(coord_resA - coord_resB)
-                    if dist <= threshold:
-                        count += 1
-    return count
+def calculate_interface_area_ratio(struct):
+    # StructA
+    
+    sasa_A = calculate_sasa_structure_level(struct[0]["A"])
+    sasa_B = calculate_sasa_structure_level(struct[0]["B"])
+    sasa_AB =  calculate_sasa_structure_level(struct)
 
+    interface_area = 0.5 * (sasa_A + sasa_B - sasa_AB)
 
-
+    min_sasa = min(sasa_A, sasa_B)
+    
+    return interface_area / min_sasa if min_sasa != 0 else 0.0
+    
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File):
     """Extract features from the database and write them to the HDF5 file.
@@ -59,10 +50,12 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
 
         structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}")  # pyright: ignore[reportAttributeAccessIssue]
 
-        count = salt_bridge_count(structure, threshold=5.5)
-        feature_vector = np.array([count], dtype=np.float32)
+        interface_area_ratio = calculate_interface_area_ratio(structure)
+        feature_vector = np.array([interface_area_ratio], dtype=np.float32)
 
-        embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b, feature_vector)
+        embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b,
+                                            instance_id_a, instance_id_b,
+                                            feature_vector)
         n_written += 1
-        
-    print(f"salt_bridge_count: wrote {n_written} entries")
+
+    print(f"interface_arearatio: wrote {n_written} entries")

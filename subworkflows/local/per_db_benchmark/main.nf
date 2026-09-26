@@ -117,7 +117,7 @@ def runLabel(db_id, variant) {
     variant == 'test' ? "${db_id}".toString() : "${db_id}_${variant}".toString()
 }
 
-def expandFeatures(List requested, Map registry, List skip) {
+def expandFeatures(List requested, Map registry) {
     def expanded = []
 
     requested.each { key ->
@@ -128,14 +128,16 @@ def expandFeatures(List requested, Map registry, List skip) {
             return
         }
         entry.variants.each { v ->
-            def name = v.suffix ? "${key}_${v.suffix}" : key
+            def name = v.suffix ? "${key}${v.suffix}" : key
             expanded << [name: name, module: key, params: v.params ?: [:]]
         }
     }
 
     // skip can match either the expanded name ('contacts_10A')
     // or the whole module ('contacts', dropping every variant)
-    return expanded.findAll { f -> !(f.name in skip) && !(f.module in skip) }
+    // NOTE: update, now either the complete feature with all variants is taken or the feature is not taken at all
+    // so there is nothing to do here anymore
+    return expanded // .findAll { f -> !(f.name in skip) && !(f.module in skip) }
 }
 
 workflow PER_DB_BENCHMARK {
@@ -150,6 +152,11 @@ workflow PER_DB_BENCHMARK {
 
         def skip_features        = csvToList(params.skip)
         def all_features         = csvToList(params.machine_learning_features)
+        // If structures is set add the structure-based features to the list of all features
+        if (params.structures) {
+            all_features += csvToList(params.machine_learning_features_structure)
+        }
+
         def ml_features          = all_features.findAll { !skip_features.contains(it) }
 
         // Split the feature list by where the h5 comes from.
@@ -186,13 +193,15 @@ workflow PER_DB_BENCHMARK {
         println "[PER_DB_BENCHMARK] Requested features: ${all_features}"
 
         //NOTE: Rewrite features to take parameterized features
-        def expanded_features  = expandFeatures(all_features, params.feature_registry, skip_features)
+        def expanded_features  = expandFeatures(extracted_features, params.feature_registry)
         // Print out all the features that will be run, including parameterized variants.
         // println "[PER_DB_BENCHMARK] Running features: ${expanded_features*.name.join(', ')}"
         // println "[PER_DB_BENCHMARK] Running modules: ${expanded_features*.module.join(', ')}"
         // println "[PER_DB_BENCHMARK] Parameterized features: ${expanded_features.findAll { it.params }.collect { "${it.name}=${it.params}" }.join(', ')}"
 
-        def ml_features        = expanded_features.collect { it.name }
+        ml_features        = expanded_features.collect { it.name }
+        // add published features to ml_features for downstream processing
+        ml_features       += published_features
 
 
         // One run per feature (singleton) plus one all-feature concatenation
@@ -210,8 +219,19 @@ workflow PER_DB_BENCHMARK {
         DDI_EXTRACTION(db_ch) // in addition writes out mapping file to DDI dir for later use in metadata creation
         ddi_ch = DDI_EXTRACTION.out.ddi   // tuple(meta, ddi_dir)  
 
+        // Structures file, if this run has one. Passed to every extraction
+        // task; extract_features.py only forwards it to encoder modules that
+        // declare a struct_file parameter (aacomp_interface and future
+        // interaction encoders), so non-structure features are unaffected.
+        // Channel.value([]) is the Nextflow idiom for "no file" on an
+        // optional path input -- FEATURE_EXTRACTION_ONE's struct_arg check
+        // treats that as absent.
+        def struct_file_ch = params.structures
+            ? Channel.value(file(params.structures, checkIfExists: true))
+            : Channel.value([])
+
         // NOTE: now takes expanded_features
-        FEATURE_EXTRACTION(Channel.from(expanded_features), db_ch)
+        FEATURE_EXTRACTION(Channel.from(expanded_features), db_ch, struct_file_ch)
 
         // Gate the published files against the databases they will be paired
         // with, and hand them on renamed to `<feature>.h5`. NN/RF consume this

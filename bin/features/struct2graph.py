@@ -1,44 +1,14 @@
 #!/usr/bin/env python3
-"""Template for adding a new feature encoding to the benchmark pipeline.
-
-Steps to add a new feature:
-1. Copy this file to bin/features/<your_feature>.py
-2. Implement extract_features() below
-3. Add '<your_feature>' to params.machine_learning_features in nextflow.config
-4. If your feature needs GPU or large memory, also add it to params.large_features
-
-
-CREATE TABLE IF NOT EXISTS domain_structure (
-    id         INTEGER PRIMARY KEY,
-    ddi_id     REFERENCES domain_domain_interaction ON DELETE CASCADE,
-    domain1    REFERENCES domain ON DELETE CASCADE,
-    domain2    REFERENCES domain ON DELETE CASCADE,
-    protein1   REFERENCES protein ON DELETE CASCADE,
-    protein2   REFERENCES protein ON DELETE CASCADE,
-    source     TEXT    NOT NULL,
-    pdb_gz     BLOB    NOT NULL,
-    z_score    REAL,
-    UNIQUE (ddi_id, protein1, protein2, source)
-);
-
-HDF5 output structure (required by downstream ML models):
-    /<domain_id_a _ domain_id_b>/<protein_id_a protein_id_b> = numpy array of shape (feature_dim,)
-
-Features are saved double, once for af, once for rf
-
-
-"""
 
 import h5py
 import numpy as np
-import pandas as pd
 import sqlite3
 from collections import defaultdict
-
 import torch
 
-
 from .structure_utils import ProteinProteinInteractionPrediction, bytes_to_pdb_structure
+from features import embeddings
+
 
 AMINO_ACIDS = ['ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE','LEU','LYS','MET','PHE','PRO','PYL','SER','SEC','THR','TRP','TYR','VAL','ASX','GLX','XAA','XLE']
 AA = ['A','R','N','D','C','Q','E','G','H','I','L','K','M','F','P','O','S','U','T','W','Y','V']
@@ -47,7 +17,6 @@ FINGERPRINT_DICT = defaultdict(lambda: len(FINGERPRINT_DICT))
 MAX_RESIDUES = 2000
 
 device = torch.device('cpu')
-
 
 
 
@@ -103,7 +72,7 @@ def create_amino_acids(acids):
     retval = [AA3_1_DICT[acid_name] if acid_name in AMINO_ACIDS else AA3_1_DICT['MET'] if acid_name=='FME' else AA3_1_DICT['TMP'] for acid_name in acids]
     retval = np.array(retval)
     
-    return(np.array(retval))
+    return retval
 
 
 
@@ -178,36 +147,35 @@ def get_graph_from_struct(group_coords, group_amino):
 
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File) -> None:
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File):
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
         conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
               optimization.sqlite3. Read-only — do not write.
-        out_file: Writable HDF5 file. Write one dataset per (domain, protein)
-                  pair, grouped by domain_id.
+        out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
+                  pair, grouped by ddi_id.
+        struct_file: Readable HDF5 file holding the DDI structures, keyed
+                     as embeddings.interaction_group_name /
+                     interaction_dataset_name describe.
     """
-    domain_structure = pd.read_sql(
-        """
-        SELECT id, domain1 as domain_id_a, domain2 as domain_id_b, protein1 as protein_id_a, protein2 as protein_id_b, pdb_gz
-        FROM domain_structure
-        """,
-        conn
-    )
+    ddi_df = embeddings.load_structure_data(conn)
+
+    if ddi_df.empty:
+        print("Warning: No entries found in ddi_split_membership. Skipping feature extraction.")
+        return
 
 
-    domain_structure["domain_id_a"] = domain_structure["domain_id_a"].astype(str)
-    domain_structure["domain_id_b"] = domain_structure["domain_id_b"].astype(str)
-    domain_structure["protein_id_a"] = domain_structure["protein_id_a"].astype(str)
-    domain_structure["protein_id_b"] = domain_structure["protein_id_b"].astype(str)
+    features = defaultdict(list)
 
-    results = defaultdict(list)
-
-    for id, domain_id_a, domain_id_b, protein_id_a, protein_id_b, pdb_gz in domain_structure.itertuples(index=False):
-        # Initialize feature vector with shape 20,
-        feature_vector = np.zeros(20, dtype=np.float32)
+    for ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b in ddi_df.itertuples(index=False):
         
-        structure = bytes_to_pdb_structure(pdb_gz, f"ds_{id}")
+        pdb_gz = embeddings.read_interaction_instance(struct_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)
+        if pdb_gz is None:
+            # No structure for this instance pair -- skip, per the
+            # documented behavior in embeddings.py.
+            continue
+        structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}") # pyright: ignore[reportAttributeAccessIssue]
 
         structA = structure[0]["A"]  # type: ignore[reportGeneralTypeIssues]
         structB = structure[0]["B"]  # type: ignore[reportGeneralTypeIssues]
@@ -221,7 +189,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File) -> None:
 
             fingerprints = create_fingerprints(np.array(group_amino), struct2graph, radius=1)
 
-            results[(domain_id_a, domain_id_b, protein_id_a, protein_id_b)].append((fingerprints, adjacency))
+            features[(pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)].append((fingerprints, adjacency))
 
 
     fingerprint_dict_length = len(FINGERPRINT_DICT)
@@ -230,30 +198,19 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File) -> None:
     model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
     model.eval()
 
-    for key, value in results.items():
-        domain_id_a, domain_id_b, protein_id_a, protein_id_b = key
+    n_written = 0
+    for key, value in features.items():
+        pfam_id_a, pfam_id_b, instance_id_a, instance_id_b = key
         # print(value)
         fingerpint_a, adjacency_a = value[0]
         fingerpint_b, adjacency_b = value[1]
         
         feature_vector = embed_fingerprints(fingerpint_a, fingerpint_b, adjacency_a, adjacency_b, model)
+        # Feature vector has doublev [[...]] shape, we need to flatten it
+        feature_vector = feature_vector.flatten()
 
-
-        def write_to_h5(domain_key, protein_key):
-        # create a group for each pfam_id and put uniprot_id as a subgroup
-            if domain_key not in out_file:
-                pfam_group = out_file.create_group(domain_key)
-            else:
-                pfam_group = out_file[domain_key]
-
-            if protein_key in pfam_group:
-                print(f"Warning: Duplicate entry for {protein_key} in {domain_key}.")
-            else:
-                pfam_group[protein_key] = feature_vector  # pyright: ignore[reportIndexIssue]
-
-        # write both directions
-        write_to_h5(f"{domain_id_a}_{domain_id_b}", f"{protein_id_a}_{protein_id_b}")
-        write_to_h5(f"{domain_id_b}_{domain_id_a}", f"{protein_id_b}_{protein_id_a}")
+        embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b, feature_vector)
+        n_written += 1
 
         
-    print(f"struct2graph: wrote {len(domain_structure)} entries")
+    print(f"struct2graph: wrote {n_written} entries")

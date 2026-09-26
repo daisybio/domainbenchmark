@@ -21,7 +21,8 @@ from features import embeddings
 DUMMY_DIM = 512
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File, dim: int = 512, seed: int):
+
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, dim: int = DUMMY_DIM):
 
     print(f"Calling feature extraction with parameters: dim={dim}")
     
@@ -51,7 +52,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, dim: int = 5
             # instance) pair instead: each pair gets the same vector regardless
             # of the order the rows arrive in, or of how many rows precede it.
             np.random.default_rng(derive_seed(seed, "dummy", domain_key, instance_key))
-            .standard_normal(DUMMY_DIM)
+            .standard_normal(dim)
             .astype(np.float32),
         )
 

@@ -92,7 +92,7 @@ process ENRICHMENT {
         tuple val(meta), path(metadata), path(predictions)
 
     output:
-        tuple val(meta), path("per_model/${meta.model}.enrichment.json"), emit: metrics
+        tuple val(meta), path("per_model/${meta.model}.${meta.variant}.enrichment.json"), emit: metrics
         path "versions.yml",                                    emit: versions
 
     script:
@@ -104,7 +104,7 @@ process ENRICHMENT {
             --model_name ${meta.model} \\
             --metadata ${metadata} \\
             --standardize \\
-            --out per_model/${meta.model}.enrichment.json
+            --out per_model/${meta.model}.${meta.variant}.enrichment.json
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":
@@ -115,7 +115,7 @@ process ENRICHMENT {
     stub:
         """
         mkdir -p per_model
-        echo '{}' > per_model/${meta.model}.enrichment.json
+        echo '{}' > per_model/${meta.model}.${meta.variant}.enrichment.json
         """
 }
 

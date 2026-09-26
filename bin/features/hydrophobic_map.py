@@ -1,48 +1,23 @@
 #!/usr/bin/env python3
-"""Template for adding a new feature encoding to the benchmark pipeline.
-
-Steps to add a new feature:
-1. Copy this file to bin/features/<your_feature>.py
-2. Implement extract_features() below
-3. Add '<your_feature>' to params.machine_learning_features in nextflow.config
-4. If your feature needs GPU or large memory, also add it to params.large_features
-
-The pipeline auto-discovers features by name: extract_features.py calls
-importlib.import_module(f"features.{feature_name}").extract_features(conn, out_file).
-
-Database schema (domain_protein_map table):
-    domain_id       TEXT    -- Pfam domain ID (e.g. PF00001)
-    protein_id      TEXT    -- UniProt protein ID (e.g. P12345)
-    domain_sequence TEXT    -- amino acid sequence of the domain
-    start_pos       INT    -- domain start position in protein sequence
-    end_pos         INT    -- domain end position in protein sequence
-    pdb_af_gz        BLOB    -- gzipped PDB file of the domain structure (from AlphaFold3)
-    pdb_rf_gz        BLOB    -- gzipped PDB file of the domain structure (from RoseTTAFold2)
-    (+ embedding columns like esm3_per_domain, esmc_per_residue, etc.)
-
-    CREATE TABLE IF NOT EXISTS domain_structure (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT, 
-        ddi_id INTEGER NOT NULL REFERENCES domain_domain_interaction(id),
-        protein1 INTEGER NOT NULL REFERENCES protein(id),
-        protein2 INTEGER NOT NULL REFERENCES protein(id),
-        source     TEXT    NOT NULL,
-        pdb_gz     BLOB    NOT NULL,
-        z_score    REAL,
-        UNIQUE (ddi_id, protein1, protein2, source)
-    );
-
-HDF5 output structure (required by downstream ML models):
-    /<domain_id>/<protein_id> = numpy array of shape (feature_dim,)
-
-
-"""
-
 import h5py
 import numpy as np
-import pandas as pd
 import sqlite3
+import torch
+from collections import defaultdict, OrderedDict
 
-from structure_utils import bytes_to_pdb_structure, calculate_rsa_residue_level, embed_fingerprints_single, encode_weighted_graph
+from .structure_utils import (
+    ProteinProteinInteractionPrediction,
+    bytes_to_pdb_structure,
+    calculate_rsa_residue_level,
+    normalize_weighted_adjacency,
+)
+from features import embeddings
+
+device = torch.device('cpu')
+
+# Shared across the whole extract_features() run -- see note above.
+FINGERPRINT_DICT = defaultdict(lambda: len(FINGERPRINT_DICT))
+
 
 hydrophobic_moments = {
     'ALA': 1.8, 'ARG': -4.5, 'ASN': -3.5, 'ASP': -3.5, 
@@ -53,89 +28,135 @@ hydrophobic_moments = {
 }
 
 
-def calculate_min_heavy_atom_distance(res1, res2):
-    min_dist = float('inf')
-    for atom1 in res1.get_atoms():
-        for atom2 in res2.get_atoms():
-            dist = atom1 - atom2
-            if dist < min_dist:
-                min_dist = dist
-    return min_dist
-
 def define_shell(domain, rsa_threshold=0.2):
     rsa_residue = calculate_rsa_residue_level(domain)
-    shell_residues = {rid for rid, rsa in rsa_residue.items() if rsa is not None and rsa > rsa_threshold}
+    shell_residues = OrderedDict()
+    for (resname, chain_id, rid), rsa in rsa_residue.items():
+        if rsa is not None and rsa > rsa_threshold:
+            shell_residues[(resname, chain_id, rid)] = rsa
     return shell_residues
-
-
 
 def build_shell_hci_graph(shell_residues):
     graph = [[0.0 for _ in shell_residues] for _ in shell_residues]
     for i, res1 in enumerate(shell_residues):
         for j, res2 in enumerate(shell_residues):
             if i <= j:
-                hm1 = hydrophobic_moments.get(res1.get_resname(), 0)
-                hm2 = hydrophobic_moments.get(res2.get_resname(), 0)
+                hm1 = hydrophobic_moments.get(res1[0], 0)
+                hm2 = hydrophobic_moments.get(res2[0], 0)
                 hci = 20 - abs((hm1 - hm2) * 19 / 10.6)
                 graph[i][j] = hci
                 graph[j][i] = hci  # Symmetric graph
     return graph
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File):
+def create_fingerprints(adjacency_matrix):
+    """Same neighborhood-hashing scheme as struct2graph.create_fingerprints /
+    structure_utils.create_node_fingerprints, but written against the
+    module-level, SHARED FINGERPRINT_DICT so identical local neighborhoods
+    get the same id everywhere in the run, not just within one call.
+    """
+    adjacency = np.array(adjacency_matrix, dtype=float)
+    n = adjacency.shape[0]
+
+    fingerprints = []
+    for i in range(n):
+        neighbors_idx = np.where(adjacency[i] > 0.0001)[0]
+        neighbor_weights = adjacency[i][neighbors_idx]
+
+        if len(neighbors_idx) > 0:
+            sorted_idx = np.argsort(-neighbor_weights)
+            neighbors_sorted = neighbors_idx[sorted_idx]
+            weights_sorted = neighbor_weights[sorted_idx]
+            neighbor_sig = tuple(
+                (int(idx), round(float(w), 4)) for idx, w in zip(neighbors_sorted, weights_sorted)
+            )
+            fingerprint = (i, neighbor_sig)
+        else:
+            fingerprint = (i,)
+
+        fingerprints.append(FINGERPRINT_DICT[fingerprint])
+
+    return np.array(fingerprints)
+
+
+def embed_graph_mean_pool(fingerprint, adjacency, model):
+    """Run the GNN message-passing layers only (no attention head, no
+    self-pairing) on one chain's shell graph, and mean-pool the resulting
+    node embeddings into a single dim-sized (20) vector.
+
+    fingerprint: array-like of node fingerprint ids, shape (n_nodes,)
+    adjacency:   normalized adjacency matrix, shape (n_nodes, n_nodes)
+    model:       the ONE shared ProteinProteinInteractionPrediction instance
+                 for this run (reused across every call, never rebuilt here)
+    """
+    x = model.embed_fingerprint(torch.LongTensor(fingerprint).to(device))
+    A = torch.FloatTensor(adjacency).to(device)
+
+    for layer in model.W_gnn:
+        h = torch.relu(layer(x))
+        x = torch.matmul(A, h)
+
+    return x.mean(dim=0).detach().cpu().numpy()
+
+
+
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File):
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
         conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
               optimization.sqlite3. Read-only — do not write.
-        out_file: Writable HDF5 file. Write one dataset per (domain, protein)
-                  pair, grouped by domain_id.
+        out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
+                  pair, grouped by ddi_id.
+        seed: unused here, kept for signature parity with struct2graph.py.
+        struct_file: Readable HDF5 file holding the DDI structures, keyed
+                     as embeddings.interaction_group_name /
+                     interaction_dataset_name describe.
     """
-    domain_protein_df = pd.read_sql(
-        """
-        SELECT domain_id, protein_id, pdb_af_gz, pdb_rf_gz
-        FROM domain_protein_map;
-        """,
-        conn,
-    )
+    ddi_df = embeddings.load_structure_data(conn)
+
+    if ddi_df.empty:
+        print("Warning: No entries found in ddi_split_membership. Skipping feature extraction.")
+        return
+
+    features = {}
+    for ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b in ddi_df.itertuples(index=False):
+            
+        pdb_gz = embeddings.read_interaction_instance(struct_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)
+        if pdb_gz is None:
+            # No structure for this instance pair -- skip, per the
+            # documented behavior in embeddings.py.
+            continue
+        structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}") # pyright: ignore[reportAttributeAccessIssue]
+
+        structA = structure[0]["A"]  # type: ignore[reportGeneralTypeIssues]
+        structB = structure[0]["B"]  # type: ignore[reportGeneralTypeIssues]
+
+        entries = []
+        for chain in(structA, structB):
+            shell_matrix = build_shell_hci_graph(define_shell(chain))
+            fingerprints = create_fingerprints(shell_matrix)
+            adjacency_norm = normalize_weighted_adjacency(shell_matrix)
+            entries.append((fingerprints, adjacency_norm))
+
+        features[(pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)] = entries
 
 
-    domain_protein_df["domain_id"] = domain_protein_df["domain_id"].astype(str)
-    domain_protein_df["protein_id"] = domain_protein_df["protein_id"].astype(str)
 
+    n_fingerprint = len(FINGERPRINT_DICT) + 100
+    model = ProteinProteinInteractionPrediction(n_fingerprint).to(device)
+    model.eval()
 
-    for domain_id, protein_id, pdb_af_gz, pdb_rf_gz in domain_protein_df.itertuples(index=False):
-        # Initialize feature vector with shape 20,
-        feature_vector = np.zeros(20, dtype=np.float32)
-        
-        pdb_files = (pdb_af_gz, pdb_rf_gz)
-        vector_list = []
+    n_written = 0
+    for key, entries in features.items():
+        pfam_id_a, pfam_id_b, instance_id_a, instance_id_b = key
+        (fp_a, adj_a), (fp_b, adj_b) = entries
 
-        for pdb_gz in pdb_files:
-            if pdb_gz is None:
-                print(f"Warning: Missing PDB file for domain {domain_id}, protein {protein_id}. Skipping.")
-                continue
-        
-            structure = bytes_to_pdb_structure(pdb_gz)
+        vec_a = embed_graph_mean_pool(fp_a, adj_a, model)
+        vec_b = embed_graph_mean_pool(fp_b, adj_b, model)
 
-            shell_matrix = build_shell_hci_graph(define_shell(structure))
+        feature_vector = np.concatenate([vec_a, vec_b])
+        embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b, feature_vector)
+        n_written += 1
 
-            # Call matrix encoding 
-            fingerprints, adjacency_norm, fp_dict = encode_weighted_graph(shell_matrix)
-
-            # Call fingerprint embedding
-            feature_vector = embed_fingerprints_single(fingerprints, adjacency_norm, n_fingerprint=len(fp_dict))
-            vector_list.append(feature_vector)
-
-        # Average the feature vectors from AF and RF if both are available
-        if vector_list:
-            feature_vector = np.mean(vector_list, axis=0)
-
-        if domain_id not in out_file:
-            pfam_group = out_file.create_group(domain_id)
-        else:
-            pfam_group = out_file[domain_id]
-
-        pfam_group[protein_id] = feature_vector # pyright: ignore[reportIndexIssue]
-
-    print(f"hydrophobic_map: wrote {len(domain_protein_df)} entries")
+    print(f"hydrophobic_map: wrote {n_written} entries")

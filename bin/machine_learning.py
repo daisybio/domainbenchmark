@@ -26,7 +26,31 @@ from typing import List
 from determinism import seed_everything
 
 
-interaction_encodings = ["protdcal", "aacomp_interface", "bsa_residue", "sasa_structure", "adjacency_matrix", "clash_heavy_atoms", "clash_backbone_atoms", "k_closest_distance", "struct2graph"]
+interaction_encodings = ["protdcal",   # sequence-based, per-interaction
+                                    "bsa_structure", "clash_backbone_atoms", "clash_heavy_atoms", "compactness", "disulfide_bond_count", "interface_arearatio", "interface_area", "polar_residue_fraction", "radius_of_gyration", "salt_bridge_count", "sasa_structure",  # scalar values, per-interaction
+                                    "k_closest_distance", "patch_mean_contacts", "patch_max_size",  # scalar values, per-interaction, parameterized
+                                    "aacomp_interface",  # vector values, set size, per-interaction
+                                    "bsa_residue", "angles", "depth_index", "protrusion_index", "rasa_residue", "sasa_residue",  # vector per-residue, pooled to one vector per-interaction
+                                    "adjacency_matrix", "charge_map", "contact_map", "hydrophobic_map", "struct2graph" # 2D matrix converted to 1D vector, per-interaction
+                                    ]
+
+
+def is_interaction_encoding(feature: str) -> bool:
+    """Whether `feature` is an interaction encoding, including parameterized variants.
+
+    `main1.nf`'s `expandFeatures` renders a parameterized feature as
+    `"${key}_${v.suffix}"` (see `feature_registry`), so a feature actually
+    passed via `--features` may carry a suffix the exact names in
+    `interaction_encodings` don't have (e.g. `k_closest_distance_5A`).
+    Matching on the base name being a prefix, followed by either nothing or
+    an underscore, avoids false positives such as `interface_area` matching
+    an unrelated `interface_area_ratio_x` feature that is not itself a
+    registered base name.
+    """
+    return any(
+        feature == base or feature.startswith(base + "_")
+        for base in interaction_encodings
+    )
 
 # B3 / A2: bounded cache (was unbounded dict — held every (features, dataset,
 # balance) variant of train/validation/test simultaneously, which on
@@ -234,7 +258,7 @@ def load_embedding_data(
     for row in ddi_df.itertuples(index=False):
         domain_a = str(row.domain_1)
         domain_b = str(row.domain_2)
-        interaction = int(row.interaction)
+        interaction = int(row.interaction) # pyright: ignore[reportArgumentType]
 
         labeled_domain_pairs.add((domain_a, domain_b, interaction))
         labeled_domain_pairs.add((domain_b, domain_a, interaction))
@@ -297,7 +321,7 @@ def load_embedding_data(
             embeddings_file = resolve_feature_file(features_path, feature, dataset)
             print(f"Loading feature file: {embeddings_file}")
             embeddings_file = stack.enter_context(h5py.File(embeddings_file, "r"))
-            if feature in interaction_encodings:
+            if is_interaction_encoding(feature):
                 interaction_encoding_files.append(embeddings_file)
                 interaction_encoding_names.append(feature)
             else:
@@ -432,10 +456,12 @@ def load_embedding_data(
         domain_widths = [
             int(np.prod(f[first_a][first_ia].shape)) for f in domain_encoding_files
         ]
+        print(f"Domain widths: {domain_widths}")
         interaction_widths = [
             int(np.prod(f[f"{first_a}_{first_b}"][f"{first_ia}_{first_ib}"].shape))
             for f in interaction_encoding_files
         ]
+        print(f"Interaction widths: {interaction_widths}")
         n_cols = 2 * sum(domain_widths) + sum(interaction_widths)
 
         # Upper bound: the NaN filter below only ever removes rows, so allocate
@@ -681,7 +707,7 @@ class DDIModelTrainer(ABC):
         for test_split in args.test_splits:
             variant = variant_of(test_split)
             print(f"Predicting on test data ({test_split})...")
-            x_test, y_test, ddi_pairs = load_embedding_data(
+            x_test, y_test, ddi_pairs = load_embedding_data( # pyright: ignore[reportAssignmentType]
                 args.features_path, args.features, args.ddi_path, test_split,
                 balance_classes=False, return_ddi_pairs=True, seed=args.seed,
             )
@@ -743,7 +769,7 @@ class DDIModelTrainer(ABC):
         )
 
         print(f"Loading {args.val_split} data...")
-        x_opt, y_opt = load_embedding_data(
+        x_opt, y_opt = load_embedding_data( # pyright: ignore[reportAssignmentType]
             args.features_path, args.features, args.ddi_path, args.val_split,
             balance_classes=balance_opt_set, seed=args.seed,
         )
@@ -791,7 +817,7 @@ class DDIModelTrainer(ABC):
             best_params, best_balance, args, config, num_features
         )
 
-        x_opt, y_opt, opt_ddi_pairs = load_embedding_data(
+        x_opt, y_opt, opt_ddi_pairs = load_embedding_data( # pyright: ignore[reportAssignmentType]
             args.features_path, args.features, args.ddi_path, args.val_split,
             balance_classes=balance_opt_set,
             return_ddi_pairs=True, seed=args.seed,
@@ -854,3 +880,4 @@ class DDIModelTrainer(ABC):
             )
 
         return classifier
+    
