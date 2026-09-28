@@ -537,7 +537,7 @@ ENRICHMENT_TARGET_LABELS = {
     "error": "Prediction error",
     "binary": "True interaction",
     "predicted": "Predicted interaction",
-    "combined": "Combined (TN/FN/FP/TP)",
+    "combined": "Combined (TN/FP/FN/TP)",
 }
 
 
@@ -622,45 +622,98 @@ def get_signed_effect(target_data: dict, feature: str):
     model_kind = target_data.get("model_kind")
     complete_model = target_data.get("complete_model", {})
     if model_kind in ("ols", "logit"):
-        return complete_model.get("coefficients", {}).get(feature)
- 
+        return _feature_effect(complete_model, feature)
+
     if model_kind == "mnlogit":
         per_class = complete_model.get("per_class", {})
         tp_eq = per_class.get("class_3_vs_baseline", {})
-        return tp_eq.get("coefficients", {}).get(feature)
- 
+        return _feature_effect(tp_eq, feature)
+
     return None
+
+
+def _feature_effect(eq: dict, feature: str):
+    """Signed effect of a *feature* from one equation's dicts.
+
+    Newer JSONs carry "feature_coefficients" keyed by feature name. Older ones
+    only have "coefficients" keyed by design-matrix column: a domain-level
+    feature 'length' lives under 'length_a' / 'length_b', so average those.
+    """
+    fc = eq.get("feature_coefficients")
+    if fc is not None and feature in fc:
+        return fc[feature]
+    coefs = eq.get("coefficients", {})
+    if feature in coefs:
+        return coefs[feature]
+    vals = [coefs[c] for c in (f"{feature}_a", f"{feature}_b")
+            if c in coefs and coefs[c] is not None and np.isfinite(coefs[c])]
+    return float(np.mean(vals)) if vals else None
+
+
+# MNLogit equation key -> readable label. Combined target = 2*true + predicted,
+# baseline class 0 = TN, so 1 = FP, 2 = FN, 3 = TP.
+CLASS_EQUATION_LABELS = {
+    "class_1_vs_baseline": "FP vs TN",
+    "class_2_vs_baseline": "FN vs TN",
+    "class_3_vs_baseline": "TP vs TN",
+}
+
+
+def _aggregate_ab(values: dict, geometric: bool = False) -> dict:
+    """Collapse per-design-column values ('length_a', 'length_b') to one value per
+    base feature ('length'). A pair is only merged when BOTH _a and _b exist, so a
+    single-column feature that merely ends in '_a' is left untouched.
+    geometric=True averages in log space (correct for odds ratios)."""
+    out, used = {}, set()
+    for k in values:
+        if k.endswith("_a") and (k[:-2] + "_b") in values:
+            base = k[:-2]
+            vs = [values[base + "_a"], values[base + "_b"]]
+            vs = [v for v in vs if v is not None and np.isfinite(v) and (v > 0 or not geometric)]
+            if vs:
+                out[base] = float(np.exp(np.mean(np.log(vs)))) if geometric else float(np.mean(vs))
+            else:
+                out[base] = None
+            used.update((base + "_a", base + "_b"))
+    for k, v in values.items():
+        if k not in used:
+            out[k] = v
+    return out
+
+
+def _odds_dicts(eq: dict):
+    """(odds_ratios, ci_lower, ci_upper) keyed by base feature. Uses the stored
+    feature-level odds ratios if present, else aggregates the per-column ones
+    (so previously generated JSONs work without refitting)."""
+    if eq.get("feature_odds_ratios") is not None:
+        ors = eq["feature_odds_ratios"]
+    else:
+        ors = _aggregate_ab(eq.get("odds_ratios", {}), geometric=True)
+    return ors, _aggregate_ab(eq.get("ci_lower", {})), _aggregate_ab(eq.get("ci_upper", {}))
 
 
 def get_odds_ratio_series(target_data: dict):
     """
-    Return a list of (label, odds_ratio_dict, ci_low_dict, ci_high_dict)
-    tuples for whichever odds ratios exist on this target's complete_model:
-    one series for a plain Logit target, or one series per non-baseline
-    equation for an MNLogit target. Empty list if the target has no odds
-    ratios (e.g. the "error" / OLS target).
+    Return a list of (label, odds_ratio_dict, ci_low_dict, ci_high_dict) tuples,
+    all keyed by *feature* (domain-level _a/_b columns already merged; odds ratio =
+    geometric mean, i.e. log-odds averaged). One series for a Logit target, or one
+    per non-baseline equation for MNLogit, labelled e.g. " (TP vs TN)".
+    CI dicts are per-column bounds averaged over a/b (approximate; unused by plots).
     """
     model_kind = target_data.get("model_kind")
     complete_model = target_data.get("complete_model", {})
     series = []
- 
+
     if model_kind == "logit" and "odds_ratios" in complete_model:
-        series.append((
-            "",
-            complete_model["odds_ratios"],
-            complete_model.get("ci_lower", {}),
-            complete_model.get("ci_upper", {}),
-        ))
- 
+        ors, lo, hi = _odds_dicts(complete_model)
+        series.append(("", ors, lo, hi))
+
     elif model_kind == "mnlogit" and "per_class" in complete_model:
         for eq_name, eq_data in complete_model["per_class"].items():
-            series.append((
-                f" ({eq_name})",
-                eq_data.get("odds_ratios", {}),
-                eq_data.get("ci_lower", {}),
-                eq_data.get("ci_upper", {}),
-            ))
- 
+            ors, lo, hi = _odds_dicts(eq_data)
+            label = CLASS_EQUATION_LABELS.get(eq_name, eq_name)
+            series.append((f" ({label})", ors, lo, hi))
+
     return series
 
 

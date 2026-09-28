@@ -31,7 +31,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--out", type=Path, required=True, help="Output file path")
     parser.add_argument(
-        "--struct-file", type=Path, default=None,
+        "--struct_file", type=Path, default=None,
         help="Optional path to the DDI structures HDF5 file (see "
              "embeddings.interaction_group_name/interaction_dataset_name). "
              "Passed to extract_features() as struct_file only for encoder "
@@ -66,6 +66,7 @@ if __name__ == "__main__":
         contextlib.ExitStack() as struct_stack,
     ):
         struct_file = None
+        print(args.struct_file)
         if args.struct_file is not None:
             struct_file = struct_stack.enter_context(h5py.File(args.struct_file, "r"))
 

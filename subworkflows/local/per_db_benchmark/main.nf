@@ -228,10 +228,13 @@ workflow PER_DB_BENCHMARK {
         // treats that as absent.
         def struct_file_ch = params.structures
             ? Channel.value(file(params.structures, checkIfExists: true))
-            : Channel.value([])
+            : Channel.value(file("${projectDir}/assets/NO_FILE"))
+
+        log.info("[PER_DB_BENCHMARK] Extracting features: ${expanded_features*.name.join(', ')}")
+        log.info("[PER_DB_BENCHMARK] Structures file: ${params.structures ? params.structures : 'none'}")
 
         // NOTE: now takes expanded_features
-        FEATURE_EXTRACTION(Channel.from(expanded_features), db_ch, struct_file_ch)
+        FEATURE_EXTRACTION(Channel.fromList(expanded_features), db_ch, struct_file_ch)
 
         // Gate the published files against the databases they will be paired
         // with, and hand them on renamed to `<feature>.h5`. NN/RF consume this

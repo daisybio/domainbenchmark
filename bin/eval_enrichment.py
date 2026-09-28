@@ -190,8 +190,8 @@ def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
     if kind == "ols":
         model = sm.OLS(y, Xc)
         res = model.fit()
-        res._used_fallback = False
-        res._converged = True
+        res._used_fallback = False # pyright: ignore[reportAttributeAccessIssue]
+        res._converged = True # pyright: ignore[reportAttributeAccessIssue]
         return res
 
     if kind == "logit":
@@ -200,15 +200,15 @@ def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
             warnings.simplefilter("ignore")
             try:
                 res = model.fit(disp=0)
-                res._used_fallback = False
-                res._converged = bool(res.mle_retvals.get("converged", True))
+                res._used_fallback = False # pyright: ignore[reportAttributeAccessIssue]
+                res._converged = bool(res.mle_retvals.get("converged", True)) # pyright: ignore[reportAttributeAccessIssue]
                 return res
             except np.linalg.LinAlgError:
                 print("[enrichment] Logit MLE failed to converge (singular Hessian) -> "
                       "falling back to L2-regularized fit.")
                 res = model.fit_regularized(alpha=1, disp=0)
-                res._used_fallback = True
-                res._converged = False
+                res._used_fallback = True # pyright: ignore[reportAttributeAccessIssue]
+                res._converged = False # pyright: ignore[reportAttributeAccessIssue]
                 return res
 
     if kind == "mnlogit":
@@ -232,15 +232,15 @@ def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
 
             try:
                 res = model.fit(disp=0)
-                res._used_fallback = False
-                res._converged = bool(res.mle_retvals.get("converged", True))
+                res._used_fallback = False # pyright: ignore[reportAttributeAccessIssue]
+                res._converged = bool(res.mle_retvals.get("converged", True)) # pyright: ignore[reportAttributeAccessIssue]
                 return res
             except np.linalg.LinAlgError:
                 print("[enrichment] MNLogit MLE failed to converge (singular Hessian) -> "
                       "falling back to L2-regularized fit.")
                 res = model.fit_regularized(alpha=1, disp=0)
-                res._used_fallback = True
-                res._converged = False
+                res._used_fallback = True # pyright: ignore[reportAttributeAccessIssue]
+                res._converged = False  # pyright: ignore[reportAttributeAccessIssue]
                 return res
 
     raise ValueError(f"[enrichment] Unknown model kind '{kind}'")
@@ -256,7 +256,22 @@ def _null_loglik(kind: str, y: np.ndarray) -> float:
     raise ValueError(f"[enrichment] _null_loglik not defined for kind '{kind}'")
 
 
-def _extract_stats(kind: str, res, column_names: list) -> dict:
+def _aggregate_to_features(per_column: dict, column_names: list, feature_slices: dict) -> dict:
+    """Reduce a dict keyed by design-matrix column ('length_a', 'length_b', 'ddi_feat')
+    to one keyed by base feature name ('length', 'ddi_feat'), averaging over the
+    _a/_b columns of domain-level features."""
+    out = {}
+    for feat, sl in feature_slices.items():
+        vals = []
+        for c in column_names[sl.start:sl.stop]:
+            v = per_column.get(c)
+            if v is not None and np.isfinite(v):
+                vals.append(v)
+        out[feat] = float(np.mean(vals)) if vals else None
+    return out
+
+
+def _extract_stats(kind: str, res, column_names: list, classes=None) -> dict:
     """Pull coefficients/pvalues/CIs out of a fitted statsmodels result in a
     kind-agnostic way. For MNLogit (multiple non-baseline outcome equations),
     coefficients are averaged in absolute value across equations per feature
@@ -336,7 +351,14 @@ def _extract_stats(kind: str, res, column_names: list) -> dict:
             pv_j = pvals[1:, j]
             ci_lo_j = conf[j, 1:, 0]
             ci_hi_j = conf[j, 1:, 1]
-            per_class[f"class_{j + 1}_vs_baseline"] = {
+            # MNLogit orders equations by sorted class label with the lowest as
+            # baseline. Label by the real class so "class_3" is always TP, even
+            # if some class (e.g. FP) is absent; positional j+1 mislabels then.
+            if classes is not None and len(classes) == n_classes_minus_1 + 1:
+                class_label = int(classes[j + 1])
+            else:
+                class_label = j + 1
+            per_class[f"class_{class_label}_vs_baseline"] = {
                 "coefficients": {name: float(c) for name, c in zip(column_names, coefs_j)},
                 "pvalues": {name: float(p) for name, p in zip(column_names, pv_j)},
                 "ci_lower": {name: float(c) for name, c in zip(column_names, ci_lo_j)},
@@ -366,10 +388,24 @@ def _extract_stats(kind: str, res, column_names: list) -> dict:
     raise ValueError(f"[enrichment] Unknown model kind '{kind}'")
 
 
-def fit_regression_models(X, y, column_names, target_name):
+def fit_regression_models(X, y, column_names, target_name, feature_slices=None):
     kind = MODEL_KIND[target_name]
     res = _fit_statsmodel(kind, X, y)
-    stats_dict = _extract_stats(kind, res, column_names)
+    stats_dict = _extract_stats(kind, res, column_names, classes=np.unique(np.asarray(y)))
+
+    if feature_slices:
+        stats_dict["feature_coefficients"] = _aggregate_to_features(
+            stats_dict["coefficients"], column_names, feature_slices)
+        if kind == "logit":
+            stats_dict["feature_odds_ratios"] = {
+                f: (float(np.exp(c)) if c is not None else None)
+                for f, c in stats_dict["feature_coefficients"].items()}
+        for eq in stats_dict.get("per_class", {}).values():
+            eq["feature_coefficients"] = _aggregate_to_features(
+                eq["coefficients"], column_names, feature_slices)
+            eq["feature_odds_ratios"] = {
+                f: (float(np.exp(c)) if c is not None else None)
+                for f, c in eq["feature_coefficients"].items()}
 
     n_samples = stats_dict["n_samples"]
     n_features = stats_dict["n_features"]
@@ -405,10 +441,12 @@ def fit_regression_models(X, y, column_names, target_name):
         "ci_upper": stats_dict["ci_upper"],
         "residuals": residuals,
         "intercept": stats_dict["intercept"],
-        # Kept around (not written to the JSON directly) so check_computations
-        # can inspect convergence / condition number / class balance below.
         "y": y,
     }
+    if "feature_coefficients" in stats_dict:
+        results["feature_coefficients"] = stats_dict["feature_coefficients"]
+    if "feature_odds_ratios" in stats_dict:
+        results["feature_odds_ratios"] = stats_dict["feature_odds_ratios"]
     if "odds_ratios" in stats_dict:
         results["odds_ratios"] = stats_dict["odds_ratios"]
     if "per_class" in stats_dict:
@@ -611,11 +649,12 @@ def check_computations(result_dict):
     return checks
 
 
+
 def write_results_to_json(results: dict, output_path: str, model_name: str):
     # Write r2 / pseudo-r2 values for all models and the checks to a JSON file
     output_data = {"model_name": model_name}
 
-    for target_var in results.keys():
+    for target_var in results.keys():        
         # Target may have been skipped (e.g. degenerate class distribution
         # for MNLogit) -- write a minimal error entry instead of crashing.
         if "error" in results[target_var]:
@@ -643,6 +682,10 @@ def write_results_to_json(results: dict, output_path: str, model_name: str):
             "single_feature_r2": results[target_var]["single_feature_r2"],
             "checks": results[target_var]["checks"],
         }
+        if "feature_coefficients" in complete_model:
+            entry["complete_model"]["feature_coefficients"] = complete_model["feature_coefficients"]
+        if "feature_odds_ratios" in complete_model:
+            entry["complete_model"]["feature_odds_ratios"] = complete_model["feature_odds_ratios"]
         if "odds_ratios" in complete_model:
             entry["complete_model"]["odds_ratios"] = complete_model["odds_ratios"]
         if "per_class" in complete_model:
@@ -684,12 +727,15 @@ def main():
     # Option 3: Use the predicted interaction as the target variable for regression (binary -> Logit)
     y_predicted = combined_df["predicted_interaction"].values
     # Option 4: Combine prediction and true interaction (nominal, 4 classes -> MNLogit)
-    # i.e. 0 = true negative, 1 = false negative, 2 = false positive, 3 = true positive
-    # NOTE: must end in .values like the other targets -- leaving this as a
-    # pandas Series was what triggered statsmodels' MNLogit.initialize() to
-    # misdetect the endog shape and crash with an AxisError.
-    y_combined = (2 * combined_df["true_interaction"].values
-                  + combined_df["predicted_interaction"].values).astype(int)
+    # = 2*true + predicted, i.e. 0 = true negative (TN), 1 = false positive (FP: true 0, pred 1),
+    # 2 = false negative (FN: true 1, pred 0), 3 = true positive (TP)
+    y_combined = (2 * combined_df["true_interaction"].astype(int).values
+                  + combined_df["predicted_interaction"].astype(int).values).astype(int)
+    # Print out first 10 values of y_binary, y_predicted, and y_combined for sanity check
+    print("[enrichment] First 10 values of y_binary:", y_binary[:10])
+    print("[enrichment] First 10 values of y_predicted:", y_predicted[:10])
+    print("[enrichment] First 10 values of y_combined:", y_combined[:10])
+    
 
     y_dict = {
         "error": y_error,
@@ -701,7 +747,7 @@ def main():
     for target_name, y in y_dict.items():
         print(f"[enrichment] Fitting {MODEL_KIND[target_name]} model for target '{target_name}'...")
         try:
-            complete_model = fit_regression_models(X, y, X_cols, target_name)
+            complete_model = fit_regression_models(X, y, X_cols, target_name, feature_slices=feature_slices)
             partial_model_r2 = compute_partial_correlation(
                 X, y, feature_names, feature_slices, target_name, method=args.partial_method
             )

@@ -20,12 +20,12 @@ from eval_multiqc_functions import (
     sort_by_dataset,
 )
 import logging
-from enrichment_plots import combine_enrichment_blocks
+from enrichment_plots import combine_enrichment_blocks, write_enrichment_data_csvs
 
 import matplotlib.pyplot as plt
 
 # Get YlOrRd colormap from matplotlib
-cmap = plt.get_cmap("YlOrRd")
+cmap = plt.get_cmap("YlOrRd") # pyright: ignore[reportAttributeAccessIssue]
 colstops = []
 n_stops = 9  # Number of stops (adjust as needed)
 
@@ -328,7 +328,7 @@ def read_source_accuracy(report_dir):
 
 def _model_palette(models):
     """Stable model -> colour map, so a bar keeps its colour across every tab."""
-    cmap = plt.get_cmap("tab20")
+    cmap = plt.get_cmap("tab20") # pyright: ignore[reportAttributeAccessIssue]
     palette = {}
     for i, model in enumerate(models):
         rgb = cmap((i % 20) / 19.0)
@@ -894,8 +894,19 @@ def main():
                 # Enrichment blocks (Plotly-in-MultiQC, from enrichment_plots.py) carry
                 # their own raw per-database trace data and are merged separately,
                 # with a "database" axis added, instead of being copied per-db-suffixed.
+                # if block["id"].startswith(ENRICHMENT_PREFIX):
+                #     enrichment_blocks_by_db.setdefault(db_name, {})[block["id"]] = block
+                #     continue
                 if block["id"].startswith(ENRICHMENT_PREFIX):
-                    enrichment_blocks_by_db.setdefault(db_name, {})[block["id"]] = block
+                    embedded = list(block.get("raw_entries", block.get("raw_summary", {})).keys())
+                    effective_db_name = embedded[0] if len(embedded) == 1 else db_name
+                    if effective_db_name != db_name:
+                        logging.info(
+                            f"[WARN] db_name mismatch for {report_dir}: "
+                            f"dir-derived='{db_name}' vs embedded='{effective_db_name}'; "
+                            "using the embedded name so enrichment merging stays consistent."
+                        )
+                    enrichment_blocks_by_db.setdefault(effective_db_name, {})[block["id"]] = block
                     continue
 
                 block = relabel_multiqc_block(block, db_name)
@@ -942,6 +953,13 @@ def main():
     enrichment_ids = combine_enrichment_blocks(enrichment_blocks_by_db, outdir_json)
     if enrichment_ids:
         logging.info(f"[OK] Combined {len(enrichment_ids)} enrichment block(s) across {len(enrichment_blocks_by_db)} database(s).")
+
+    enrichment_csv_paths = write_enrichment_data_csvs(enrichment_blocks_by_db, outdir)
+    if enrichment_csv_paths:
+        logging.info(
+            f"[OK] Wrote {len(enrichment_csv_paths)} enrichment data CSV(s) to {outdir}: "
+            + ", ".join(os.path.basename(p) for p in enrichment_csv_paths)
+        )
 
     # create_section_header("models_header", "Models Results", outdir_json)
     # create_section_header("db_header", "Database Results", outdir_json)

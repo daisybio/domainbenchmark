@@ -30,6 +30,7 @@ Plotly globally in <head> for its own native plots, so every custom HTML block
 here just calls the page-global `Plotly` object directly.
 """
 
+import csv
 import json
 import os
 from typing import Any
@@ -80,7 +81,7 @@ def render_switchable_plot(
     div_id: str,
     axes: list[dict[str, Any]],
     entries: dict[tuple, dict[str, Any]],
-    base_layout: dict | None = None,
+    base_layout: dict[str, Any] | None = None, # pyright: ignore[reportGeneralTypeIssues]
     height: int = 550,
 ) -> str:
     """
@@ -131,7 +132,14 @@ def render_switchable_plot(
     html.append(f'<div data-mqc-root="{div_id}">')
     if controls_parts:
         html.append(f'<div style="margin-bottom:10px;">{"".join(controls_parts)}</div>')
-    html.append(f'<div id="{div_id}" style="width:100%;"></div>')
+    # Scroll wrapper: the inner plot div gets an explicit pixel width in JS
+    # (scaled to however many x-categories the current trace has) instead of
+    # being squeezed into a fixed 100% container. With many models/features
+    # that squeeze made bars sub-pixel-thin (looking like missing data) and
+    # forced long tick labels to overlap/get cut off.
+    html.append(f'<div style="width:100%;overflow-x:auto;">')
+    html.append(f'<div id="{div_id}" style="min-width:100%;"></div>')
+    html.append("</div>")
     html.append("</div>")
     html.append("<script>")
     html.append(
@@ -140,6 +148,7 @@ def render_switchable_plot(
         f"var AXES={json.dumps(axes_js)};"
         f"var divId={json.dumps(div_id)};"
         f"var baseLayout={json.dumps(base_layout)};"
+        "var PX_PER_CATEGORY=60;"  # min width per x-category so bars/labels have room
         "var state={};"
         "AXES.forEach(function(a){state[a.key]=a.values[0];});"
         "function currentKey(){return AXES.map(function(a){return state[a.key];}).join('||');}"
@@ -147,7 +156,36 @@ def render_switchable_plot(
         "var entry=DATA[currentKey()];"
         "if(!entry){return;}"
         "var layout=Object.assign({},baseLayout,entry.layout||{});"
-        "Plotly.react(divId,entry.traces,layout,{responsive:true,displaylogo:false});"
+        "var root=document.querySelector('[data-mqc-root=\"'+divId+'\"]');"
+        "var containerWidth=root?root.clientWidth:0;"
+        "var nCats=0;"
+        "(entry.traces||[]).forEach(function(t){"
+        "var n=(t.x&&t.x.length)?t.x.length:((t.y&&t.y.length)?t.y.length:0);"
+        "if(n>nCats){nCats=n;}"
+        "});"
+        "var plotWidth=Math.max(containerWidth,nCats*PX_PER_CATEGORY);"
+        "var el=document.getElementById(divId);"
+        "el.style.width=plotWidth+'px';"
+        "layout.autosize=false;"
+        "layout.width=plotWidth;"
+        "layout.xaxis=Object.assign({automargin:true,tickangle:-45},layout.xaxis||{});"
+        "layout.yaxis=Object.assign({automargin:true},layout.yaxis||{});"
+        # Heatmaps: Plotly silently skips category tick labels when they do not
+        # fit the fixed height, so features looked like they were missing even
+        # though every row was drawn. Grow the height per row and label every tick.
+        "var nRows=0,nCols=0;"
+        "(entry.traces||[]).forEach(function(t){"
+        "if(t.type==='heatmap'){"
+        "if(t.y&&t.y.length>nRows){nRows=t.y.length;}"
+        "if(t.x&&t.x.length>nCols){nCols=t.x.length;}"
+        "}"
+        "});"
+        "if(nRows>0){"
+        "layout.height=Math.max(layout.height||560,nRows*22+180);"
+        "layout.yaxis.dtick=1;"
+        "layout.xaxis.dtick=1;"
+        "}"
+        "Plotly.react(divId,entry.traces,layout,{displaylogo:false});"
         "}"
         "AXES.forEach(function(a){"
         "if(a.control==='buttons'){"
@@ -170,6 +208,7 @@ def render_switchable_plot(
         "}"
         "});"
         "redraw();"
+        "window.addEventListener('resize',redraw);"
         "})();"
     )
     html.append("</script>")
@@ -650,6 +689,174 @@ def _combine_agreement_detail(block_id, per_db_blocks, outdir):
     div_id = f"{block_id}_plot"
     body_html = render_switchable_plot(div_id, axes, entries, height=560)
     _write_block(outdir, block_id, "Feature-effect agreement across targets \u2014 detail", body_html)
+
+
+# ---------------------------------------------------------------------------
+# Plain-data export: the numbers behind every enrichment plot, as tidy CSVs.
+#
+# combine_enrichment_blocks() merges the per-database blocks into one block
+# per plot family and, for every family except the single-database passthrough,
+# drops the `raw_entries`/`raw_summary` payload (the merged block only keeps
+# the rendered HTML/Plotly JS). So this has to run BEFORE that merge, over
+# `enrichment_blocks_by_db` (still per-database, still carrying the raw
+# trace data build_*_blocks() stashed on each block).
+#
+# Output is one long-format CSV per plot family, independent of any particular
+# model/target/database selection -- exactly the shape a standalone plotting
+# script (or a quick pandas groupby) wants.
+# ---------------------------------------------------------------------------
+def _write_csv(outdir, filename, fieldnames, rows):
+    path = os.path.join(outdir, filename)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames)
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+    return path
+
+
+def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefix="enrichment_") -> list[str]:
+    """Flatten every enrichment block's raw trace data into tidy CSVs.
+
+    enrichment_blocks_by_db: {db_name: {block_id: block_dict, ...}, ...}, the
+    same structure combine_eval.py passes to combine_enrichment_blocks().
+
+    Writes (only the files for which data actually exists):
+        enrichment_r2_heatmap_data.csv          database,kind,target,feature,model,r2
+        enrichment_r2_adj_barplot_data.csv       database,target,model,r2_adj
+        enrichment_feature_importance_data.csv   database,target,model,feature,partial_r2
+        enrichment_odds_ratios_data.csv          database,target,model,feature,log2_odds_ratio
+        enrichment_agreement_summary_data.csv    database,model,sign_consistent_pct
+        enrichment_agreement_detail_data.csv     database,model,target,feature,sign
+
+    Returns the list of file paths actually written.
+    """
+    written = []
+
+    # --- 1) R^2 heatmaps (partial_model_r2 / single_feature_r2) ---
+    heatmap_rows = []
+    for db_name, blocks in enrichment_blocks_by_db.items():
+        for kind, block_id in (
+            ("partial_model_r2", f"{prefix}partial_model_r2_heatmap"),
+            ("single_feature_r2", f"{prefix}single_feature_r2_heatmap"),
+        ):
+            block = blocks.get(block_id)
+            if not block:
+                continue
+            entries = block.get("raw_entries", {}).get(db_name, {})
+            for target, entry in entries.items():
+                trace = entry["traces"][0]
+                models_x, features_y, z = trace["x"], trace["y"], trace["z"]
+                for fi, feat in enumerate(features_y):
+                    for mi, model in enumerate(models_x):
+                        val = z[fi][mi]
+                        if val is None:
+                            continue
+                        heatmap_rows.append({
+                            "database": db_name, "kind": kind, "target": target,
+                            "feature": feat, "model": model, "r2": val,
+                        })
+    if heatmap_rows:
+        written.append(_write_csv(
+            outdir, f"{prefix}r2_heatmap_data.csv",
+            ["database", "kind", "target", "feature", "model", "r2"], heatmap_rows,
+        ))
+
+    # --- 2) R^2 / pseudo-R^2 barplot (per model, series=target) ---
+    bar_rows = []
+    for db_name, blocks in enrichment_blocks_by_db.items():
+        block = blocks.get(f"{prefix}r2_adj_barplot")
+        if not block:
+            continue
+        entry = block.get("raw_entries", {}).get(db_name)
+        if not entry:
+            continue
+        for trace in entry["traces"]:
+            target = trace["name"]
+            for model, val in zip(trace["x"], trace["y"]):
+                if val is None:
+                    continue
+                bar_rows.append({"database": db_name, "target": target, "model": model, "r2_adj": val})
+    if bar_rows:
+        written.append(_write_csv(
+            outdir, f"{prefix}r2_adj_barplot_data.csv",
+            ["database", "target", "model", "r2_adj"], bar_rows,
+        ))
+
+    # --- 3) feature importance & odds ratios (the "_grouped" block already
+    #        carries every target for a given model in one entry) ---
+    for family, block_suffix, value_col in (
+        ("feature_importance", f"{prefix}feature_importance_grouped", "partial_r2"),
+        ("odds_ratios", f"{prefix}odds_ratios_grouped", "log2_odds_ratio"),
+    ):
+        rows = []
+        for db_name, blocks in enrichment_blocks_by_db.items():
+            block = blocks.get(block_suffix)
+            if not block:
+                continue
+            entries = block.get("raw_entries", {}).get(db_name, {})
+            for combo_str, entry in entries.items():
+                (model,) = combo_str.split("||")
+                for trace in entry["traces"]:
+                    target = trace["name"]
+                    for feat, val in zip(trace["x"], trace["y"]):
+                        if val is None:
+                            continue
+                        rows.append({
+                            "database": db_name, "target": target, "model": model,
+                            "feature": feat, value_col: val,
+                        })
+        if rows:
+            written.append(_write_csv(
+                outdir, f"{prefix}{family}_data.csv",
+                ["database", "target", "model", "feature", value_col], rows,
+            ))
+
+    # --- 4) agreement summary (native table data) ---
+    summary_rows = []
+    for db_name, blocks in enrichment_blocks_by_db.items():
+        block = blocks.get(f"{prefix}agreement_summary")
+        if not block:
+            continue
+        data = block.get("raw_summary", {}).get(db_name, {})
+        for model, row in data.items():
+            summary_rows.append({
+                "database": db_name, "model": model,
+                "sign_consistent_pct": row.get("Sign-consistent features (%)"),
+            })
+    if summary_rows:
+        written.append(_write_csv(
+            outdir, f"{prefix}agreement_summary_data.csv",
+            ["database", "model", "sign_consistent_pct"], summary_rows,
+        ))
+
+    # --- 5) agreement detail (sign heatmap: feature x target, per model) ---
+    detail_rows = []
+    for db_name, blocks in enrichment_blocks_by_db.items():
+        block = blocks.get(f"{prefix}agreement_detail")
+        if not block:
+            continue
+        entries = block.get("raw_entries", {}).get(db_name, {})
+        for combo_str, entry in entries.items():
+            (model,) = combo_str.split("||")
+            trace = entry["traces"][0]
+            targets_x, features_y, z = trace["x"], trace["y"], trace["z"]
+            for fi, feat in enumerate(features_y):
+                for ti, target in enumerate(targets_x):
+                    val = z[fi][ti]
+                    if val is None:
+                        continue
+                    detail_rows.append({
+                        "database": db_name, "model": model, "target": target,
+                        "feature": feat, "sign": val,
+                    })
+    if detail_rows:
+        written.append(_write_csv(
+            outdir, f"{prefix}agreement_detail_data.csv",
+            ["database", "model", "target", "feature", "sign"], detail_rows,
+        ))
+
+    return written
 
 
 # ---------------------------------------------------------------------------

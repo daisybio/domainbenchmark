@@ -46,9 +46,7 @@ process FEATURE_EXTRACTION_ONE {
         // structure_h5 is [] (empty list) when params.structures is unset --
         // Nextflow stages nothing and the input list is empty, so we only add
         // the flag when there is actually a file present.
-        def struct_arg   = (structure_h5 && !(structure_h5 instanceof List && structure_h5.isEmpty()))
-            ? "--struct-file ${structure_h5}"
-            : ""
+        def struct_arg = (structure_h5.size() > 0) ? "--struct_file ${structure_h5}" : ""
 
         if (database_dir.isFile()) {
             if (dataset != 'test') {
@@ -116,7 +114,7 @@ workflow FEATURE_EXTRACTION {
 
         // struct_file_ch is a single-value channel; .combine broadcasts it
         // onto every task without changing the fan-out shape.
-        per_task_with_struct = per_task.combine(struct_file_ch)
+        per_task_with_struct = per_task.combine(struct_file_ch) //.view { "PER_TASK_WITH_STRUCT: $it" }
 
         per_split = FEATURE_EXTRACTION_ONE(
             per_task_with_struct.map { m, db_path, _struct -> tuple(m, db_path) },
