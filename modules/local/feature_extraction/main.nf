@@ -18,6 +18,54 @@
 // more `test*` — so a database shipping both `test_balanced` and
 // `test_realistic` produces an h5 for each while training data is extracted
 // once.
+//
+// SASA cache: when a structures file is given (params.structures) AND
+// params.machine_learning_features_structure is non-empty, SASA_CACHE runs ONCE
+// over every split of every database and writes `sasa_cache.h5`. Structure
+// features then read per-residue SASA from it (via $SASA_CACHE_H5) instead of
+// each re-parsing the PDB and re-running Shrake-Rupley. Only the structure
+// features wait for the cache; all other features start immediately.
+
+// Splits to extract for one database. With --train_only only `train` is kept
+// (e.g. for mRMR, which never looks at validation/test), so everything keyed on
+// the other splits -- feature tasks and the SASA cache -- is skipped. Task
+// metadata for the train splits is unchanged, so -resume still hits the cache
+// of an earlier full run.
+def splitsFor(db_meta) {
+    def splits = db_meta.splits ?: ['test']
+    params.train_only ? splits.findAll { it == 'train' } : splits
+}
+
+process SASA_CACHE {
+    tag "sasa_cache"
+    label 'sasa_cache'
+
+    conda "${projectDir}/environments/general.yml"
+    // Same image the structure features run in (Bio.PDB + the `features` package).
+    container 'docker.io/konstantinpelz/domainbenchmark-gpu:1.0.1'
+
+    input:
+        path(dbs, stageAs: 'db?/*')   // every split sqlite3 file, each in its own dbN/ (avoids name clashes)
+        path(structure_h5, stageAs: 'structures.h5')
+
+    output:
+        path('sasa_cache.h5'), emit: cache
+
+    script:
+        """
+        build_sasa_cache.py \\
+            --db db*/* \\
+            --struct structures.h5 \\
+            --out sasa_cache.h5 \\
+            --procs ${task.cpus}
+        """
+
+    stub:
+        """
+        touch sasa_cache.h5
+        """
+}
+
 
 process FEATURE_EXTRACTION_ONE {
     tag "${meta.id}"
@@ -33,6 +81,7 @@ process FEATURE_EXTRACTION_ONE {
     input:
         tuple val(meta), path(database_dir)
         path(structure_h5, stageAs: 'structures.h5')  // may be [] -- see FEATURE_EXTRACTION below
+        path(sasa_cache, stageAs: 'sasa_cache.h5')    // [] for non-structure features / when no cache is built
 
     output:
         tuple val(meta), path("${meta.feature}__${meta.dataset}.h5"), emit: h5, optional: true
@@ -47,6 +96,12 @@ process FEATURE_EXTRACTION_ONE {
         // Nextflow stages nothing and the input list is empty, so we only add
         // the flag when there is actually a file present.
         def struct_arg = (structure_h5.size() > 0) ? "--struct_file ${structure_h5}" : ""
+        // Same trick for the SASA cache: only export the path when it was staged.
+        // File locking is disabled because many tasks open the same file read-only
+        // on a shared filesystem.
+        def cache_env = (sasa_cache.size() > 0)
+            ? "export SASA_CACHE_H5=\"\$PWD/sasa_cache.h5\"; export HDF5_USE_FILE_LOCKING=FALSE"
+            : ""
 
         if (database_dir.isFile()) {
             if (dataset != 'test') {
@@ -55,6 +110,7 @@ process FEATURE_EXTRACTION_ONE {
                 """
             } else {
                 """
+                ${cache_env}
                 extract_features.py \\
                     --db ${database_dir} \\
                     --feature ${feature_name} \\
@@ -67,6 +123,7 @@ process FEATURE_EXTRACTION_ONE {
             }
         } else {
             """
+            ${cache_env}
             if [ -f "${database_dir}/${dataset}.sqlite3" ]; then
                 extract_features.py \\
                     --db ${database_dir}/${dataset}.sqlite3 \\
@@ -96,10 +153,16 @@ workflow FEATURE_EXTRACTION {
         struct_file_ch // value channel: single structures.h5 File, or Channel.value([]) if params.structures unset
 
     main:
+        // Structure features = the ones the container selection already treats
+        // as structure features.
+        def struct_modules = (params.machine_learning_features_structure ?: '')
+            .toString().split(',')*.trim().findAll { it }
+        def build_cache = params.structures && struct_modules
+
         per_task = db_ch
             .combine(feature_ch)
             .flatMap { db_meta, db_path, feat ->
-                (db_meta.splits ?: ['test']).collect { ds ->
+                splitsFor(db_meta).collect { ds ->
                     def m = [
                         id     : "${db_meta.id}_${feat.name}_${ds}",
                         db     : db_meta.id,
@@ -116,9 +179,40 @@ workflow FEATURE_EXTRACTION {
         // onto every task without changing the fan-out shape.
         per_task_with_struct = per_task.combine(struct_file_ch) //.view { "PER_TASK_WITH_STRUCT: $it" }
 
+        if (build_cache) {
+            // Every split sqlite3 file of every database, collected into one list.
+            // Single-file databases are passed as-is.
+            sasa_dbs = db_ch
+                .flatMap { db_meta, db_path ->
+                    def p = file(db_path)
+                    p.isFile()
+                        ? [p]
+                        : splitsFor(db_meta).collect { ds -> file("${p}/${ds}.sqlite3") }.findAll { it.exists() }
+                }
+                .toSortedList { a, b -> a.toString() <=> b.toString() }
+
+            SASA_CACHE(sasa_dbs, struct_file_ch)
+            sasa_cache_ch = SASA_CACHE.out.cache.first()
+
+            // Structure features wait for the cache ...
+            with_cache = per_task_with_struct
+                .filter { it[0].module in struct_modules }
+                .combine(sasa_cache_ch)
+            // ... everything else carries an empty placeholder and starts right away.
+            without_cache = per_task_with_struct
+                .filter { !(it[0].module in struct_modules) }
+                .map { m, db_path, struct -> tuple(m, db_path, struct, []) }
+
+            per_task_full = with_cache.mix(without_cache)
+        } else {
+            per_task_full = per_task_with_struct
+                .map { m, db_path, struct -> tuple(m, db_path, struct, []) }
+        }
+
         per_split = FEATURE_EXTRACTION_ONE(
-            per_task_with_struct.map { m, db_path, _struct -> tuple(m, db_path) },
-            per_task_with_struct.map { _m, _db_path, struct -> struct }
+            per_task_full.map { m, db_path, _struct, _cache -> tuple(m, db_path) },
+            per_task_full.map { _m, _db_path, struct, _cache -> struct },
+            per_task_full.map { _m, _db_path, _struct, cache -> cache }
         )
 
     emit:

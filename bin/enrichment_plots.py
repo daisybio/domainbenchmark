@@ -225,7 +225,7 @@ def _write_block(outdir, block_id, section_name, body_html, extra=None):
     if extra:
         block.update(extra)
     with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
-        json.dump(block, f)
+        json.dump(block, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +599,7 @@ def build_agreement_blocks(enrichment_by_model, models, targets, features, outdi
         "raw_summary": {db_name: summary_data},
     }
     with open(os.path.join(outdir, f"{summary_id}_mqc.json"), "w") as f:
-        json.dump(summary_block, f)
+        json.dump(summary_block, f, indent=2)
 
     # --- detail heatmap (Plotly, model dropdown [+ db dropdown when combined]) ---
     target_labels = [ENRICHMENT_TARGET_LABELS.get(t, t) for t in targets]
@@ -666,7 +666,7 @@ def _combine_agreement_summary(block_id, per_db_blocks, outdir):
         "data": merged,
     }
     with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
-        json.dump(block, f)
+        json.dump(block, f, indent=2)
 
 
 def _combine_agreement_detail(block_id, per_db_blocks, outdir):
@@ -923,7 +923,7 @@ def combine_enrichment_blocks(enrichment_blocks_by_db: dict[str, dict[str, dict]
         if len(per_db_blocks) == 1:
             block = next(iter(per_db_blocks.values()))
             with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
-                json.dump(block, f)
+                json.dump(block, f, indent=2)
             written.append(block_id)
             continue
 

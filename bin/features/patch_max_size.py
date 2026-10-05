@@ -2,78 +2,57 @@
 import h5py
 import numpy as np
 import sqlite3
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
 from .structure_utils import bytes_to_pdb_structure
 from features import embeddings
 
 
-class UnionFind:
-    def __init__(self, size):
-        self.parent = list(range(size))
-        self.rank = [1] * size
-        self.source = list(range(size))  # Track the source domain for each residue (0 for structA, 1 for structB)
-
-    def find(self, u):
-        if self.parent[u] != u:
-            self.parent[u] = self.find(self.parent[u])  # Path compression
-        return self.parent[u]
-
-    def union(self, u, v):
-        root_u = self.find(u)
-        root_v = self.find(v)
-
-        if root_u != root_v:
-            # Union by rank
-            if self.rank[root_u] > self.rank[root_v]:
-                self.parent[root_v] = root_u
-            elif self.rank[root_u] < self.rank[root_v]:
-                self.parent[root_u] = root_v
-            else:
-                self.parent[root_v] = root_u
-                self.rank[root_u] += 1
+def _ca_coords(chain):
+    """CA coordinates of all residues in a chain that have a CA atom, shape (n, 3)."""
+    coords = [res['CA'].get_coord() for res in chain.get_residues() if 'CA' in res]
+    if not coords:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.asarray(coords, dtype=np.float64)
 
 
-def build_interchain_patches(structure, threshold):
-    structA = structure[0]["A"]
-    structB = structure[0]["B"]
-    all_residues = list(structA.get_residues()) + list(structB.get_residues())
-    uf = UnionFind(len(all_residues))
-    # Mark source for each residue by its index in `all_residues` (0..n-1).
-    structA_count = len(list(structA.get_residues()))
-    for idx in range(len(all_residues)):
-        uf.source[idx] = 0 if idx < structA_count else 1
+def largest_patch_both(structure, threshold):
+    """Size of the largest connected patch (residues linked by CA-CA <= threshold,
+    within or between chains) that contains residues from both chain A and chain B.
+    Residues without a CA can never be part of a patch with both chains."""
+    coords_a = _ca_coords(structure[0]["A"])
+    coords_b = _ca_coords(structure[0]["B"])
+    n_a, n_b = len(coords_a), len(coords_b)
+    if n_a == 0 or n_b == 0:
+        return 0
 
-    # Build Union Find strucutre for all possible contacts within & between domains
-    for i, res in enumerate(all_residues):
-        for j in range(i + 1, len(all_residues)):
-            coord_i = res['CA'].get_coord() if 'CA' in res else None
-            coord_j = all_residues[j]['CA'].get_coord() if 'CA' in all_residues[j] else None
-            if coord_i is not None and coord_j is not None:
-                dist = np.linalg.norm(coord_i - coord_j)
-                if dist <= threshold:
-                    uf.union(i, j)
+    coords = np.vstack((coords_a, coords_b))
+    n = n_a + n_b
 
-    return uf, all_residues
+    pairs = cKDTree(coords).query_pairs(threshold, output_type="ndarray")  # d <= threshold
+    if len(pairs) == 0:
+        return 0
 
+    graph = coo_matrix(
+        (np.ones(len(pairs), dtype=np.int8), (pairs[:, 0], pairs[:, 1])),
+        shape=(n, n),
+    )
+    _, labels = connected_components(graph, directed=False)
 
-def calculate_largest_patch(uf, all_residues):
-    patch_sizes = {}
-    for i in range(len(all_residues)):
-        root = uf.find(i)
-        if root not in patch_sizes:
-            patch_sizes[root] = {'size': 0, 'source': set()}
-        patch_sizes[root]['size'] += 1
-        patch_sizes[root]['source'].add(uf.source[i])
+    is_b = np.arange(n) >= n_a
+    sizes = np.bincount(labels)
+    count_b = np.bincount(labels, weights=is_b.astype(np.float64), minlength=len(sizes))
+    count_a = sizes - count_b
+    both = (count_a > 0) & (count_b > 0)
 
-    largest_patch_both = max((size['size'] for size in patch_sizes.values() if size['source'] == {0, 1}), default=0)
-
-    return largest_patch_both
-
+    return int(sizes[both].max()) if both.any() else 0
 
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File, threshold_distance: float = 5.0):
     """Extract features from the database and write them to the HDF5 file.
-    
+
         Args:
             conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
                   optimization.sqlite3. Read-only — do not write.
@@ -85,13 +64,13 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
             threshold_distance: Distance threshold for counting contacts.
         """
     ddi_df = embeddings.load_structure_data(conn)
-    
+
     if ddi_df.empty:
         print("Warning: No entries found in ddi_split_membership. Skipping feature extraction.")
         return
 
-
     n_written = 0
+    n_skipped = 0
     for (ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b) in ddi_df.itertuples(index=False):
 
         pdb_gz = embeddings.read_interaction_instance(struct_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)
@@ -101,12 +80,15 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
             continue
 
         structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}")  # pyright: ignore[reportAttributeAccessIssue]
+        if len(structure[0]) < 2: # pyright: ignore[reportOptionalSubscript]
+            print(f"Warning: Structure for ddi_id {ddi_id} has less than 2 chains. Skipping. (instance_id_a: {instance_id_a}, instance_id_b: {instance_id_b}, pfam_id_a: {pfam_id_a}, pfam_id_b: {pfam_id_b})")
+            n_skipped += 1
+            continue
 
-        uf, all_residues = build_interchain_patches(structure, threshold_distance)
-        largest_patch = calculate_largest_patch(uf, all_residues)
+        largest_patch = largest_patch_both(structure, threshold_distance)
         feature_vector = np.array([largest_patch], dtype=np.float32)
 
         embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b, feature_vector)
         n_written += 1
 
-    print(f"patch_max_size_{threshold_distance}: wrote {n_written} entries")
+    print(f"patch_max_size_{threshold_distance}: wrote {n_written} entries, skipped {n_skipped} entries")

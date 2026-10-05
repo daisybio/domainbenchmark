@@ -10,6 +10,10 @@ from features import embeddings
 vdw_radii = {'C': 1.70, 'N': 1.55, 'O': 1.52, 'S': 1.80, 'P': 1.80}
 
 def calculate_clash_heavy_atoms(structure, overlap_tolerance=0.4):
+    # # Debug print: print chain ids
+    # print(f"Calculating clashes for structure with chains: {[chain.id for chain in structure[0]]}")
+    # # Also print th
+    
     chain_a_atoms = [a for a in structure[0]['A'].get_atoms() if a.element.strip() != 'H']
     chain_b_atoms = [a for a in structure[0]['B'].get_atoms() if a.element.strip() != 'H']
 
@@ -49,6 +53,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
         return
 
     n_written = 0
+    n_skipped = 0
     
     for (ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b) in ddi_df.itertuples(index=False):
 
@@ -59,6 +64,11 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
             continue
 
         structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}")  # pyright: ignore[reportAttributeAccessIssue]
+        # If there is only one chain, print out ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b
+        if len(structure[0]) < 2:
+            print(f"Warning: Structure for ddi_id {ddi_id} has less than 2 chains. Skipping. (instance_id_a: {instance_id_a}, instance_id_b: {instance_id_b}, pfam_id_a: {pfam_id_a}, pfam_id_b: {pfam_id_b})")
+            n_skipped += 1
+            continue
 
         clashes = calculate_clash_heavy_atoms(structure, 0.5)
         feature_vector = np.array([clashes], dtype=np.float32)
@@ -66,4 +76,4 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
         embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b, feature_vector)
         n_written += 1
         
-    print(f"clash_heavy_atoms: wrote {n_written} entries")
+    print(f"clash_heavy_atoms: wrote {n_written} entries, skipped {n_skipped} entries")

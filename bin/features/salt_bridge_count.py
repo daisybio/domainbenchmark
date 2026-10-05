@@ -49,6 +49,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
         return
 
     n_written = 0
+    n_skipped = 0
     for (ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b) in ddi_df.itertuples(index=False):
 
         pdb_gz = embeddings.read_interaction_instance(struct_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)
@@ -58,6 +59,12 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
             continue
 
         structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}")  # pyright: ignore[reportAttributeAccessIssue]
+        if len(structure[0]) < 2:
+            print(f"Warning: Structure for ddi_id {ddi_id} has less than 2 chains. Skipping. (instance_id_a: {instance_id_a}, instance_id_b: {instance_id_b}, pfam_id_a: {pfam_id_a}, pfam_id_b: {pfam_id_b})")
+            n_skipped += 1
+            continue
+
+
 
         count = salt_bridge_count(structure, threshold=5.5)
         feature_vector = np.array([count], dtype=np.float32)
@@ -65,4 +72,4 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
         embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b, feature_vector)
         n_written += 1
         
-    print(f"salt_bridge_count: wrote {n_written} entries")
+    print(f"salt_bridge_count: wrote {n_written} entries, skipped {n_skipped} entries")

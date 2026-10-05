@@ -103,8 +103,9 @@ process ENRICHMENT {
             --predictions ${predictions} \\
             --model_name ${meta.model} \\
             --metadata ${metadata} \\
-            --standardize \\
-            --out per_model/${meta.model}.${meta.variant}.enrichment.json
+            --threads ${task.cpus} \\
+            --out per_model/${meta.model}.${meta.variant}.enrichment.json \\
+            --standardize
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":

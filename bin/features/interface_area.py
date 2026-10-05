@@ -1,58 +1,52 @@
 #!/usr/bin/env python3
+import os
+import sqlite3
 import h5py
 import numpy as np
-import sqlite3
 
-from .structure_utils import bytes_to_pdb_structure, calculate_sasa_structure_level
 from features import embeddings
+from .sasa_cache import SasaCache
 
 
-
-def calculate_interface_area(struct):
-    sasa_A = calculate_sasa_structure_level(struct[0]["A"])
-    sasa_B = calculate_sasa_structure_level(struct[0]["B"])
-    sasa_AB =  calculate_sasa_structure_level(struct)
-
-    interface_area = 0.5 * (sasa_A + sasa_B - sasa_AB)
-    return interface_area
-    
+def calculate_interface_area(b):
+    return 0.5 * (b["total_A"] + b["total_B"] - b["total_AB"])
 
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File):
     """Extract features from the database and write them to the HDF5 file.
-    
+
     Args:
         conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
-                optimization.sqlite3. Read-only — do not write.
+              optimization.sqlite3. Read-only — do not write.
         out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
-                    pair, grouped by ddi_id.
-        struct_file: Readable HDF5 file holding the DDI structures, keyed
-                        as embeddings.interaction_group_name /
-                        interaction_dataset_name describe.
+                  pair, grouped by ddi_id.
+        struct_file: Unused (structures are read via the SASA cache); kept
+                     for the common extract_features interface.
     """
-    ddi_df = embeddings.load_structure_data(conn)
+    path = os.environ.get("SASA_CACHE_H5")
+    if not path:
+        raise RuntimeError("Set SASA_CACHE_H5 to the file written by features.sasa_cache")
+    cache = SasaCache(path)
 
+    ddi_df = embeddings.load_structure_data(conn)
     if ddi_df.empty:
         print("Warning: No entries found in ddi_split_membership. Skipping feature extraction.")
         return
 
-    n_written = 0
-    for (ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b) in ddi_df.itertuples(index=False):
+    n_written = n_skipped = 0
+    for (_ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b) in ddi_df.itertuples(index=False):
 
-        pdb_gz = embeddings.read_interaction_instance(struct_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)
-        if pdb_gz is None:
-            # No structure for this instance pair -- skip, per the
-            # documented behavior in embeddings.py.
+        b = cache.get(pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)
+        if b is None:
+            # No structure, or < 2 chains (skipped when the cache was built)
+            n_skipped += 1
             continue
 
-        structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}")  # pyright: ignore[reportAttributeAccessIssue]
-
-        interface_area = calculate_interface_area(structure)
-        feature_vector = np.array([interface_area], dtype=np.float32)
+        feature_vector = np.array([calculate_interface_area(b)], dtype=np.float32)
 
         embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b,
-                                            instance_id_a, instance_id_b,
-                                            feature_vector)
+                                              instance_id_a, instance_id_b,
+                                              feature_vector)
         n_written += 1
 
-    print(f"interface_area: wrote {n_written} entries")
+    print(f"interface_area: wrote {n_written} entries, skipped {n_skipped} entries")

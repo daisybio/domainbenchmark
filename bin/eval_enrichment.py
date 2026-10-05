@@ -33,6 +33,7 @@ remains appropriate there.
 
 import argparse as ap
 import json
+import time
 import warnings
 import pandas as pd
 import numpy as np
@@ -41,6 +42,12 @@ from scipy import stats
 
 import statsmodels.api as sm
 from sklearn.preprocessing import StandardScaler
+from joblib import Parallel, delayed
+
+try:  # limit BLAS threads inside workers to avoid oversubscribing the cores
+    from threadpoolctl import threadpool_limits
+except ImportError:  # pragma: no cover
+    threadpool_limits = None
 
 # Which statsmodels model class to fit for each target
 MODEL_KIND = {
@@ -150,7 +157,31 @@ def prepare_data_for_regression(df: pd.DataFrame, column_types: dict, feature_na
     return X, feature_names, X_cols, feature_slices
 
 
-def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
+def _mle_fit(model, start_params=None, light=False):
+    """Run model.fit() for Logit/MNLogit.
+
+    start_params: warm start (e.g. the full-model coefficients with the dropped
+        columns removed). Falls back to a cold start if the warm start fails.
+    light: skip the final Hessian inversion (not needed when we only want the
+        log-likelihood, as for drop-one / single-feature fits).
+    A LinAlgError is always re-raised so the caller's regularized fallback runs.
+    """
+    if start_params is not None or light:
+        try:
+            kw = {"disp": 0}
+            if start_params is not None:
+                kw["start_params"] = start_params
+            if light:
+                kw["skip_hessian"] = True
+            return model.fit(**kw)
+        except np.linalg.LinAlgError:
+            raise
+        except Exception:
+            pass  # unsupported kwarg / bad warm start -> plain cold fit below
+    return model.fit(disp=0)
+
+
+def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray, start_params=None, light=False):
     """Fit the appropriate statsmodels model (with intercept) for `kind`.
 
     Returns the fitted results object. Uses regularized/robust fallbacks
@@ -164,17 +195,12 @@ def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
       - `_used_fallback` (bool): True if we had to use fit_regularized.
       - `_converged` (bool): statsmodels' own convergence flag from
         mle_retvals, when available (always False on the fallback path).
+
+    start_params / light: speed-ups for the many auxiliary fits (see _mle_fit).
+    Do NOT use light=True for the complete model: it needs SEs/p-values.
     """
-    # Guard against a pandas Series slipping through here instead of a plain
-    # ndarray -- Series vs ndarray shape/dtype handling differs subtly inside
-    # statsmodels' endog processing (this was the direct cause of an
-    # AxisError inside MNLogit.initialize() previously).
     y = np.asarray(y)
 
-    # MNLogit needs at least 2 distinct classes present to build its internal
-    # dummy encoding. With 0 or 1 classes present it degenerates and raises a
-    # cryptic numpy AxisError deep in initialize() instead of a clear
-    # message -- catch it here with an actionable error.
     if kind == "mnlogit":
         n_classes = len(np.unique(y))
         if n_classes < 2:
@@ -199,7 +225,7 @@ def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
-                res = model.fit(disp=0)
+                res = _mle_fit(model, start_params, light)
                 res._used_fallback = False # pyright: ignore[reportAttributeAccessIssue]
                 res._converged = bool(res.mle_retvals.get("converged", True)) # pyright: ignore[reportAttributeAccessIssue]
                 return res
@@ -214,11 +240,6 @@ def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
     if kind == "mnlogit":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # MNLogit's constructor (initialize()) can itself raise on
-            # degenerate/edge-case endog shapes (e.g. AxisError) before
-            # fitting even starts. That's not a LinAlgError, so it used to
-            # propagate uncaught as a bare numpy traceback -- wrap it with
-            # a clear, actionable error instead.
             try:
                 model = sm.MNLogit(y, Xc)
             except np.linalg.LinAlgError:
@@ -231,7 +252,7 @@ def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
                 ) from e
 
             try:
-                res = model.fit(disp=0)
+                res = _mle_fit(model, start_params, light)
                 res._used_fallback = False # pyright: ignore[reportAttributeAccessIssue]
                 res._converged = bool(res.mle_retvals.get("converged", True)) # pyright: ignore[reportAttributeAccessIssue]
                 return res
@@ -247,13 +268,27 @@ def _fit_statsmodel(kind: str, X: np.ndarray, y: np.ndarray):
 
 
 def _null_loglik(kind: str, y: np.ndarray) -> float:
-    """Log-likelihood of the intercept-only model, for McFadden's pseudo-R^2."""
-    const = np.ones((len(y), 1))
-    if kind == "logit":
-        return sm.Logit(y, const).fit(disp=0).llf
-    if kind == "mnlogit":
-        return sm.MNLogit(y, const).fit(disp=0).llf
-    raise ValueError(f"[enrichment] _null_loglik not defined for kind '{kind}'")
+    """Log-likelihood of the intercept-only model, for McFadden's pseudo-R^2.
+
+    Closed form (the intercept-only MLE is just the class frequencies), so no
+    model fit is needed. Compute it ONCE per target and pass it around.
+    It is exactly 0.0 when y has a single class; the old fitted version returned
+    a tiny negative number (~-1e-10) there, which blew the pseudo-R^2 up to ~1e10.
+    """
+    if kind not in ("logit", "mnlogit"):
+        raise ValueError(f"[enrichment] _null_loglik not defined for kind '{kind}'")
+    y = np.asarray(y)
+    _, counts = np.unique(y, return_counts=True)
+    return float(np.sum(counts * np.log(counts / counts.sum())))
+
+
+def _mcfadden(llf: float, llnull: float, n_params: int = 0) -> float:
+    """McFadden's pseudo-R^2 (n_params=0) or its adjusted version (n_params>0).
+    NaN if the null model is degenerate (single class) or anything is non-finite."""
+    if not np.isfinite(llnull) or llnull == 0 or not np.isfinite(llf):
+        return float("nan")
+    val = 1 - ((llf - n_params) / llnull)
+    return float(val) if np.isfinite(val) else float("nan")
 
 
 def _aggregate_to_features(per_column: dict, column_names: list, feature_slices: dict) -> dict:
@@ -388,7 +423,7 @@ def _extract_stats(kind: str, res, column_names: list, classes=None) -> dict:
     raise ValueError(f"[enrichment] Unknown model kind '{kind}'")
 
 
-def fit_regression_models(X, y, column_names, target_name, feature_slices=None):
+def fit_regression_models(X, y, column_names, target_name, feature_slices=None, llnull=None):
     kind = MODEL_KIND[target_name]
     res = _fit_statsmodel(kind, X, y)
     stats_dict = _extract_stats(kind, res, column_names, classes=np.unique(np.asarray(y)))
@@ -418,10 +453,12 @@ def fit_regression_models(X, y, column_names, target_name, feature_slices=None):
         fit_stat_adj_name = "r2_adj"
     else:
         # McFadden's pseudo-R^2 as the classification analogue of R^2
-        llnull = _null_loglik(kind, y)
-        r2 = float(1 - (res.llf / llnull)) if llnull != 0 else float("nan")
-        # McFadden's adjusted pseudo-R^2 penalizes for the number of predictors
-        r2_adj = float(1 - ((res.llf - n_features) / llnull)) if llnull != 0 else float("nan")
+        if llnull is None:
+            llnull = _null_loglik(kind, y)
+        r2 = _mcfadden(res.llf, llnull)
+        # McFadden's adjusted pseudo-R^2 penalizes for the number of predictors.
+        # NaN (not a huge number) for degenerate targets, e.g. a constant prediction.
+        r2_adj = _mcfadden(res.llf, llnull, n_features)
         residuals = None  # not meaningful / not normally-distributed for these models; skip
         fit_stat_name = "pseudo_r2_mcfadden"
         fit_stat_adj_name = "pseudo_r2_mcfadden_adj"
@@ -454,44 +491,86 @@ def fit_regression_models(X, y, column_names, target_name, feature_slices=None):
     return results
 
 
-def _pseudo_or_real_r2(kind: str, y: np.ndarray, res) -> float:
+def _pseudo_or_real_r2(kind: str, y: np.ndarray, res, llnull=None) -> float:
     """R^2 (OLS) or McFadden's pseudo-R^2 (logit/mnlogit) for a fitted model,
     used consistently by the single-feature and drop-one comparisons below."""
     if kind == "ols":
         return float(res.rsquared)
-    llnull = _null_loglik(kind, y)
-    return float(1 - (res.llf / llnull)) if llnull != 0 else float("nan")
+    if llnull is None:
+        llnull = _null_loglik(kind, y)
+    return _mcfadden(res.llf, llnull)
 
 
-def compute_single_feature_correlations(X, y, feature_names, feature_slices, target_name):
+def _warm_start_without(full_res, kind, sl):
+    """Full-model coefficients with the columns of feature slice `sl` removed
+    (+1 because row 0 is the intercept), as a start_params vector."""
+    if kind not in ("logit", "mnlogit") or getattr(full_res, "_used_fallback", False):
+        return None
+    params = np.asarray(full_res.params)
+    keep = np.ones(params.shape[0], dtype=bool)
+    keep[1 + sl.start:1 + sl.stop] = False
+    reduced = params[keep]
+    # MNLogit flattens its (K, J-1) parameter matrix in Fortran order
+    return reduced.ravel(order="F") if reduced.ndim == 2 else reduced
+
+
+def _score_task(kind, X, y, llnull, drop_slice=None, keep_slice=None, start_params=None):
+    """One auxiliary fit -> R^2/pseudo-R^2. Runs inside a joblib worker."""
+    def _run():
+        if keep_slice is not None:
+            Xs = X[:, keep_slice]
+        else:
+            Xs = np.delete(X, slice(drop_slice.start, drop_slice.stop), axis=1)
+        res = _fit_statsmodel(kind, Xs, y, start_params=start_params, light=True)
+        return _pseudo_or_real_r2(kind, y, res, llnull)
+
+    if threadpool_limits is not None:
+        with threadpool_limits(limits=1):
+            return _run()
+    return _run()
+
+
+def compute_single_feature_correlations(X, y, feature_names, feature_slices, target_name,
+                                        llnull=None, n_jobs=1):
     kind = MODEL_KIND[target_name]
-    single_feature_r2 = {}
-    for feature in feature_names:
-        s1 = feature_slices[feature]
-        X_single = X[:, s1]
-        res = _fit_statsmodel(kind, X_single, y)
-        r2 = _pseudo_or_real_r2(kind, y, res)
-        single_feature_r2[feature] = float(np.clip(r2, 0, 1)) if not np.isnan(r2) else float("nan")
-    return single_feature_r2
+    if kind != "ols" and llnull is None:
+        llnull = _null_loglik(kind, y)
+    feats = list(feature_names)
+    scores = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(_score_task)(kind, X, y, llnull, keep_slice=feature_slices[f]) for f in feats
+    )
+    return {
+        f: float(np.clip(r2, 0, 1)) if not np.isnan(r2) else float("nan")
+        for f, r2 in zip(feats, scores)
+    }
 
 
-def compute_partial_correlation(X, y, feature_names, feature_slices, target_name, method="drop_one"):
+def compute_partial_correlation(X, y, feature_names, feature_slices, target_name,
+                                method="drop_one", full_res=None, llnull=None, n_jobs=1):
     # 2 methods: "drop_one" or "permutation"
     kind = MODEL_KIND[target_name]
+    if kind != "ols" and llnull is None:
+        llnull = _null_loglik(kind, y)
 
-    full_res = _fit_statsmodel(kind, X, y)
-    r2_full = _pseudo_or_real_r2(kind, y, full_res)
+    # Reuse the complete-model fit from fit_regression_models() when provided
+    if full_res is None:
+        full_res = _fit_statsmodel(kind, X, y)
+    r2_full = _pseudo_or_real_r2(kind, y, full_res, llnull)
+    r2_full_clipped = np.clip(r2_full, 0, 1) if not np.isnan(r2_full) else 0.0
 
     partial_corr_results = {}
     if method == "drop_one":
-        for feature in feature_names:
-            s1 = feature_slices[feature]
-            X_reduced = np.delete(X, slice(s1.start, s1.stop), axis=1)
-            reduced_res = _fit_statsmodel(kind, X_reduced, y)
-            r2_reduced = _pseudo_or_real_r2(kind, y, reduced_res)
+        feats = list(feature_names)
+        scores = Parallel(n_jobs=n_jobs, backend="loky")(
+            delayed(_score_task)(
+                kind, X, y, llnull, drop_slice=feature_slices[f],
+                start_params=_warm_start_without(full_res, kind, feature_slices[f]),
+            )
+            for f in feats
+        )
+        for f, r2_reduced in zip(feats, scores):
             r2_reduced_clipped = np.clip(r2_reduced, 0, 1) if not np.isnan(r2_reduced) else 0.0
-            r2_full_clipped = np.clip(r2_full, 0, 1) if not np.isnan(r2_full) else 0.0
-            partial_corr_results[feature] = float(np.clip(r2_full_clipped - r2_reduced_clipped, 0, 1))
+            partial_corr_results[f] = float(np.clip(r2_full_clipped - r2_reduced_clipped, 0, 1))
 
     elif method == "permutation":
         rng = np.random.default_rng()
@@ -501,7 +580,6 @@ def compute_partial_correlation(X, y, feature_names, feature_slices, target_name
             rng.shuffle(X_permuted[:, s1], axis=0)  # Shuffle both _a and _b columns for the feature
             Xc_permuted = sm.add_constant(X_permuted, has_constant="add")
             if kind == "mnlogit":
-                # predict() returns class probabilities; use them to recompute log-likelihood
                 probs = full_res.predict(Xc_permuted)
                 y_idx = y.astype(int)
                 ll_permuted = float(np.sum(np.log(np.clip(probs[np.arange(len(y_idx)), y_idx], 1e-12, 1.0))))
@@ -515,10 +593,8 @@ def compute_partial_correlation(X, y, feature_names, feature_slices, target_name
                 partial_corr_results[feature] = float(np.clip(r2_full - r2_permuted, 0, 1))
                 continue
 
-            llnull = _null_loglik(kind, y)
-            r2_permuted = float(1 - (ll_permuted / llnull)) if llnull != 0 else float("nan")
+            r2_permuted = _mcfadden(ll_permuted, llnull)
             r2_permuted_clipped = np.clip(r2_permuted, 0, 1) if not np.isnan(r2_permuted) else 0.0
-            r2_full_clipped = np.clip(r2_full, 0, 1) if not np.isnan(r2_full) else 0.0
             partial_corr_results[feature] = float(np.clip(r2_full_clipped - r2_permuted_clipped, 0, 1))
     else:
         raise ValueError(f"[enrichment] Invalid method {method} for partial correlation. Choose 'drop_one' or 'permutation'.")
@@ -707,6 +783,8 @@ def main():
     parser.add_argument("--standardize", action="store_true", default=False, help="Standardize features before regression.")
     parser.add_argument("--partial_method", choices=["drop_one", "permutation"], default="drop_one",
                          help="Method for computing partial (feature-dropped) explanatory power.")
+    parser.add_argument("--threads", type=int, default=1,
+                         help="Parallel workers for the drop-one / single-feature fits (use ${task.cpus}).")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -746,12 +824,21 @@ def main():
 
     for target_name, y in y_dict.items():
         print(f"[enrichment] Fitting {MODEL_KIND[target_name]} model for target '{target_name}'...")
+        t0 = time.perf_counter()
         try:
-            complete_model = fit_regression_models(X, y, X_cols, target_name, feature_slices=feature_slices)
+            kind = MODEL_KIND[target_name]
+            llnull = _null_loglik(kind, y) if kind != "ols" else None
+            complete_model = fit_regression_models(
+                X, y, X_cols, target_name, feature_slices=feature_slices, llnull=llnull)
+            print(f"[enrichment]   complete model: {time.perf_counter() - t0:.1f}s")
             partial_model_r2 = compute_partial_correlation(
-                X, y, feature_names, feature_slices, target_name, method=args.partial_method
+                X, y, feature_names, feature_slices, target_name, method=args.partial_method,
+                full_res=complete_model["model"], llnull=llnull, n_jobs=args.threads,
             )
-            single_feature_r2 = compute_single_feature_correlations(X, y, feature_names, feature_slices, target_name)
+            print(f"[enrichment]   + partial R2:   {time.perf_counter() - t0:.1f}s")
+            single_feature_r2 = compute_single_feature_correlations(
+                X, y, feature_names, feature_slices, target_name, llnull=llnull, n_jobs=args.threads)
+            print(f"[enrichment]   + single-feat:  {time.perf_counter() - t0:.1f}s")
         except ValueError as e:
             # Degenerate target (e.g. too few classes present for MNLogit) --
             # skip this target instead of crashing the whole pipeline run.

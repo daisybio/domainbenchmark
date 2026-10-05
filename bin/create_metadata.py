@@ -37,6 +37,8 @@ def read_metadata(metadata_dir):
 
     domain_metadata_df = pd.read_csv(domain_metadata_path)  # instance_id, pfam_id, uniprot_id, ...
     ddi_metadata_df = pd.read_csv(ddi_metadata_path)  # pfam_id_a, pfam_id_b, uniprot_id_a, uniprot_id_b, instance_id_a, instance_id_b, source, ...
+    # For now drop columns af_n0chn, af_n_contacts
+    ddi_metadata_df = ddi_metadata_df.drop(columns=["af_n0chn", "af_n_contacts"], errors="ignore")
 
     return domain_metadata_df, ddi_metadata_df
 
@@ -166,7 +168,7 @@ def aggregate_metadata_to_ddi_level(ddi_metadata, key_cols=("pfam_id_a", "pfam_i
         print(f"Aggregating DDI-level metadata: {n_rows_before} rows -> {n_pairs} unique domain pairs "
               f"(method='{method}')")
 
-    agg_ddi_metadata = ddi_metadata.groupby("_pair_key")[ddi_numerical_features].agg(method).reset_index()
+    agg_ddi_metadata = ddi_metadata.groupby("_pair_key")[ddi_numerical_features].agg(method).fillna(0).reset_index()
 
     # In addition, for column source, which contains values downlloaded/inferred, calculate the percent of downloaded instances per ddi pair and add as column source_downloaded_fraction
     if "source" in ddi_metadata.columns:

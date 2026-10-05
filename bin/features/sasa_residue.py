@@ -1,55 +1,60 @@
 #!/usr/bin/env python3
-import h5py
+import os
 import sqlite3
-import numpy as np
-from features import embeddings
 
-from .structure_utils import bytes_to_pdb_structure, calculate_sasa_residue_level, pool_residue_feature
+import h5py
+import numpy as np
+
+from features import embeddings
+from .sasa_cache import SasaCache
+from .structure_utils import pool_residue_feature
 
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File, complex: bool = False):
     """Extract features from the database and write them to the HDF5 file.
-    
-        Args:
-            conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
-                  optimization.sqlite3. Read-only — do not write.
-            out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
-                      pair, grouped by ddi_id.
-            struct_file: Readable HDF5 file holding the DDI structures, keyed
-                         as embeddings.interaction_group_name /
-                         interaction_dataset_name describe.
-        """
+
+    Args:
+        conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
+              optimization.sqlite3. Read-only — do not write.
+        out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
+                  pair, grouped by ddi_id.
+        struct_file: Unused (structures are read via the SASA cache); kept
+                     for the common extract_features interface.
+        complex: If True, pool residue SASA inside the A+B complex over all
+                 residues. If False, pool each chain's isolated residue SASA
+                 separately and concatenate [A, B].
+    """
+    path = os.environ.get("SASA_CACHE_H5")
+    if not path:
+        raise RuntimeError("Set SASA_CACHE_H5 to the file written by features.sasa_cache")
+    cache = SasaCache(path)
+
     ddi_df = embeddings.load_structure_data(conn)
-
-
     if ddi_df.empty:
         print("Warning: No entries found in ddi_split_membership. Skipping feature extraction.")
         return
 
-    n_written = 0
-    for ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b in ddi_df.itertuples(index=False):
-
-        # Initialize empty vector of length 0
-        feature_vector = np.zeros(0, dtype=np.float32)
-        pdb_gz = embeddings.read_interaction_instance(struct_file, pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)
-        if pdb_gz is None:
-            # No structure for this instance pair -- skip, per the
-            # documented behavior in embeddings.py.
+    n_written = n_skipped = 0
+    for (_ddi_id, instance_id_a, instance_id_b, pfam_id_a, pfam_id_b) in ddi_df.itertuples(index=False):
+        b = cache.get(pfam_id_a, pfam_id_b, instance_id_a, instance_id_b)
+        if b is None:
+            # No structure, or < 2 chains (skipped when the cache was built)
+            n_skipped += 1
             continue
-        structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}") # pyright: ignore[reportAttributeAccessIssue]
 
         if complex:
-            sasa_residue = calculate_sasa_residue_level(structure)
-            feature_vector = pool_residue_feature(np.array(list(sasa_residue.values()), dtype=np.float32))
+            feature_vector = pool_residue_feature(b["sasa_cplx"].astype(np.float32))
         else:
-            sasa_residue_A = calculate_sasa_residue_level(structure[0]["A"]) # pyright: ignore[reportOptionalSubscript]
-            sasa_residue_B = calculate_sasa_residue_level(structure[0]["B"]) # pyright: ignore[reportOptionalSubscript]
-            feature_vector_A = pool_residue_feature(np.array(list(sasa_residue_A.values()), dtype=np.float32))
-            feature_vector_B = pool_residue_feature(np.array(list(sasa_residue_B.values()), dtype=np.float32))
-            feature_vector = np.concatenate([feature_vector_A, feature_vector_B])
+            is_a = b["chain"] == "A"
+            is_b = b["chain"] == "B"
+            feature_vector = np.concatenate([
+                pool_residue_feature(b["sasa_iso"][is_a].astype(np.float32)),
+                pool_residue_feature(b["sasa_iso"][is_b].astype(np.float32)),
+            ])
+
         embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b,
-                                            instance_id_a, instance_id_b,
-                                            feature_vector)
+                                              instance_id_a, instance_id_b,
+                                              feature_vector)
         n_written += 1
 
-    print(f"sasa_residue: wrote {n_written} entries")
+    print(f"sasa_residue: wrote {n_written} entries, skipped {n_skipped} entries")

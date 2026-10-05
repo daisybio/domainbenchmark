@@ -76,64 +76,115 @@ def calculate_rsa_residue_level(domain):
     return rsa_residue
 
 
-# def read_pdb(pdb_file):
-#     parser = PDBParser(QUIET=True)
-#     structure = parser.get_structure('structure', pdb_file)
-#     return structure
+"""Fixed-size, per-entry encoding of ONE variable-size 2D matrix.
+
+Independent of every other entry (no vocabulary, no fitted state, no model),
+so it can be called inside the extraction loop and written out immediately.
+numpy only; the pooling follows the semantics of torch's AdaptiveAvgPool2d /
+AdaptiveMaxPool2d (cell i spans [floor(i*n/k), ceil((i+1)*n/k)) ).
+
+Output layout (N_FEATURES = 56 floats):
+    6   scalars      log1p(rows), log1p(cols), mean, std, max, density (>0)
+    21  avg pyramid  adaptive average pooling to 1x1, 2x2, 4x4
+    4   max pooling  adaptive max pooling to 2x2
+    12  marginals    mean/std/min/max/median/sum of row sums and of column sums
+    7   band profile mean value per sequence-separation band |i-j| (square
+                     "intra-chain" matrices only; zeros if banded=False/non-square)
+"""
 
 
-# def build_residue_graph(domain, distance_threshold=5.0):
-#     # Build a graph where nodes are residues
-#     # Edges exist if residues are within a certain distance threshold (e.g., 5 Å)
-#     # Return 2D distance matrix
-#     residues = list(domain.get_residues())
-#     graph = [[0.0 for _ in residues] for _ in residues]
-#     for i, res1 in enumerate(residues):
-#         for j, res2 in enumerate(residues):
-#             if i < j:  # Avoid double counting and self-comparison
-#                 dist = float('inf')
-#                 coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
-#                 coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
-#                 if coord_res1 is not None and coord_res2 is not None:
-#                     dist = np.linalg.norm(coord_res1 - coord_res2)
-#                 if dist <= distance_threshold:
-#                     graph[i][j] = 1
+import numpy as np
 
-#     return graph
+AVG_LEVELS = (2, 4)   # k=1 dropped: it is M.mean(), derivable from the row-sum mean
+MAX_LEVELS = (2,)
+SEP_EDGES = (1, 3, 5, 9, 17, 33, 65)  # bands [1,3) [3,5) [5,9) ... [65,inf)
 
 
-# def build_adj_residue_graph(domain, distance_threshold=5.0):
-#     # Same as build_residue_graph but with distance values instead of binary edges
-#     residues = list(domain.get_residues())
-#     graph = [[float('inf') for _ in residues] for _ in residues]
-#     for i, res1 in enumerate(residues):
-#         for j, res2 in enumerate(residues):
-#             if i < j:  # Avoid double counting and self-comparison
-
-#                 coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
-#                 coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
-#                 if coord_res1 is not None and coord_res2 is not None:
-#                     dist = np.linalg.norm(coord_res1 - coord_res2)
-#                     if dist <= distance_threshold:
-#                         graph[i][j] = float(dist)
-#                         graph[j][i] = float(dist)  # Symmetric graph
-#     return graph
+def n_features(symmetric, banded=False):
+    core = 9 if symmetric else 14
+    levels = list(AVG_LEVELS) + list(MAX_LEVELS)
+    grids = sum(k * (k + 1) // 2 if symmetric else k * k for k in levels)
+    return core + grids + (len(SEP_EDGES) if banded else 0)
 
 
-# def build_interchain_adjacency_graph(domain1, domain2, distance_threshold=5.0):
-#     # Same as build_residue_graph but with distance values instead of binary edges
-#     residues1 = list(domain1.get_residues())
-#     residues2 = list(domain2.get_residues())
-#     graph = [[float('inf') for _ in residues2] for _ in residues1]
-#     for i, res1 in enumerate(residues1):
-#         for j, res2 in enumerate(residues2):
-#             coord_res1 = res1['CA'].get_coord() if 'CA' in res1 else None
-#             coord_res2 = res2['CA'].get_coord() if 'CA' in res2 else None
-#             if coord_res1 is not None and coord_res2 is not None:
-#                 dist = np.linalg.norm(coord_res1 - coord_res2)
-#                 if dist <= distance_threshold:
-#                     graph[i][j] = float(dist)
-#     return graph
+def _adaptive_pool(M, k, reduce, upper_only):
+    r, c = M.shape
+    P = np.empty((k, k))
+    for i in range(k):
+        r0, r1 = (i * r) // k, -((-(i + 1) * r) // k)
+        for j in range(k):
+            c0, c1 = (j * c) // k, -((-(j + 1) * c) // k)
+            P[i, j] = reduce(M[r0:r1, c0:c1])
+    return P[np.triu_indices(k)] if upper_only else P.ravel()
+
+
+def _stats5(v):
+    return np.array([v.mean(), v.std(), v.min(), v.max(), np.median(v)])
+
+
+def _stats4(v):
+    return np.array([v.std(), v.min(), v.max(), np.median(v)])
+
+
+def encode_matrix(M, symmetric, banded=False, fill=0.0):
+    """Encode a 2D matrix into n_features(symmetric, banded) floats.
+
+    symmetric: True  -> square symmetric matrices (one row-sum pool, upper-triangle grids)
+               False -> rectangular / non-symmetric matrices (row- and column-sum pools)
+               Must be constant per feature.
+    banded:    add the |i-j| band profile; only for symmetric intra-chain maps.
+    fill:      replacement for NaN/inf.
+    """
+    if banded and not symmetric:
+        raise ValueError("banded=True requires symmetric=True")
+    nf = n_features(symmetric, banded)
+
+    M = np.asarray(M, dtype=np.float64)
+    if M.ndim != 2:
+        raise ValueError(f"expected a 2D matrix, got shape {M.shape}")
+    if symmetric and M.shape[0] != M.shape[1]:
+        raise ValueError(f"symmetric=True needs a square matrix, got {M.shape}")
+    if M.size == 0:
+        return np.zeros(nf, dtype=np.float32)
+    M = np.nan_to_num(M, nan=fill, posinf=fill, neginf=fill)
+    r, c = M.shape
+
+    rs = M.sum(axis=1)
+    if symmetric:
+        # col sums == row sums, log1p(c) == log1p(r)
+        core = np.concatenate([
+            [np.log1p(r), M.std(), M.max(), (M > 0).mean()],
+            _stats5(rs),
+        ])
+    else:
+        cs = M.sum(axis=0)
+        core = np.concatenate([
+            [np.log1p(r), np.log1p(c), M.std(), M.max(), (M > 0).mean()],
+            _stats5(rs),
+            _stats4(cs),  # col mean derivable from rs.mean(), r, c
+        ])
+
+    parts = [core]
+    for k in AVG_LEVELS:
+        parts.append(_adaptive_pool(M, k, np.mean, symmetric))
+    for k in MAX_LEVELS:
+        parts.append(_adaptive_pool(M, k, np.max, symmetric))
+
+    if banded:
+        band = np.zeros(len(SEP_EDGES))
+        idx = np.arange(r)
+        D = np.abs(idx[:, None] - idx[None, :])
+        edges = list(SEP_EDGES) + [np.inf]
+        for b in range(len(SEP_EDGES)):
+            mask = (D >= edges[b]) & (D < edges[b + 1])
+            if mask.any():
+                band[b] = M[mask].mean()
+        parts.append(band)
+
+    out = np.concatenate(parts).astype(np.float32)
+    # assert out.shape[0] == nf, (out.shape[0], nf)
+    return out
+
 
 
 def normalize_weighted_adjacency(adjacency_matrix):
@@ -176,6 +227,7 @@ def bytes_to_pdb_structure(pdb_gz: bytes, structure_id: str):
     pdb_text = gzip.decompress(pdb_gz).decode("utf-8")
 
     parser = PDBParser(QUIET=True)
+    
     return parser.get_structure(structure_id, io.StringIO(pdb_text))
 
 

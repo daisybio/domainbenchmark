@@ -179,14 +179,16 @@ workflow PER_DB_BENCHMARK {
             publishedEmbeddingFile(embeddings_dir, it)
         }
 
+        def train_only           = params.train_only as boolean
+
         def all_graph_models     = csvToList(params.graph_models)
         def graph_model_names    = all_graph_models.findAll { !skip_features.contains(it) }
 
         def all_ml_models        = csvToList(params.machine_learning_models)
         def ml_model_names       = all_ml_models.findAll { !skip_features.contains(it) }
-        def nn_enabled           = ml_model_names.contains('neural_network')
-        def rf_enabled           = ml_model_names.contains('random_forest')
-        def svm_enabled          = ml_model_names.contains('svm')
+        def nn_enabled           = !train_only && ml_model_names.contains('neural_network')
+        def rf_enabled           = !train_only && ml_model_names.contains('random_forest')
+        def svm_enabled          = !train_only && ml_model_names.contains('svm')
 
         // Print all features and feature registry entries for debugging. The registry is a map of feature_name → {variants: [{suffix, params}, ...]}.
         println "[PER_DB_BENCHMARK] Feature registry: ${params.feature_registry}"
@@ -419,7 +421,7 @@ workflow PER_DB_BENCHMARK {
 
         enrichment_output_ch = Channel.empty()
 
-        if (metadata_input) {
+        if (metadata_input && !train_only) {
             // Each database has a balanced and a realistic test variant, and
             // ddi_metadata differs per variant (it's keyed off that variant's
             // test DDIs) -- so one metadata table is built per (db x variant),

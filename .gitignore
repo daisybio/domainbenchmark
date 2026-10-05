@@ -225,3 +225,4 @@ daisybio.config
 invalidate_cache.sh
 metadata/ddi_metadata.csv
 metadata/domain_metadata.csv
+sandbox.config
