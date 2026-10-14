@@ -81,6 +81,7 @@ process METADATA {
         """
 }
 
+
 process ENRICHMENT {
     tag "${meta.id}"
     label 'process_eval_enrichment'

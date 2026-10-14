@@ -89,7 +89,7 @@
                     "type": "string",
                     "default": "neural_network,random_forest",
                     "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
-                    "description": "Comma-separated list of machine-learning models to run (subset of: neural_network, random_forest). Pass 'none' to disable all ML models.",
+                    "description": "Comma-separated list of machine-learning models to run (subset of: neural_network, random_forest, svm). Pass 'none' to disable all ML models.",
                     "fa_icon": "fas fa-brain"
                 },
                 "machine_learning_features": {
@@ -97,6 +97,13 @@
                     "default": "dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of feature encodings to compute and feed into the ML / RF classifiers.",
+                    "fa_icon": "fas fa-vector-square"
+                },
+                "machine_learning_features_structure": {
+                    "type": "string",
+                    "default": "angles,aacomp_interface,bsa_structure,clash_backbone_atoms,clash_heavy_atoms,compactness,depth_index,disulfide_bond_count,interface_area,interface_arearatio,k_closest_distance,patch_mean_contacts,patch_max_size,polar_residue_fraction,protrusion_index,radius_of_gyration,rasa_residue,salt_bridge_count,sasa_residue,sasa_structure,contact_map,bsa_residue,hydrophobic_map,charge_map",
+                    "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
+                    "description": "Comma-separated list of structure feature encodings to compute and feed into the ML / RF classifiers.",
                     "fa_icon": "fas fa-vector-square"
                 },
                 "large_features": {
@@ -151,6 +158,20 @@
                     "type": "object",
                     "description": "List containing additional params for each feature encoding. Schema: feature: [variants: [suffix : suffix_value, params: [param1 : value1, param2 : value2, ...]]]",
                     "fa_icon": "fa fa-list"                
+                },
+                "train_only": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Only compute encodings for training data, used for external feature selection.",
+                    "fa_icon": "fas fa-dumbbell"
+                },
+                "metadata": {
+                    "type": "string",
+                    "format": "path",
+                    "exists": true,
+                    "description": "Path to a directory containining ddi_metadata.csv and domain_metadata.csv files.",
+                    "help_text": "Metadadata files needed for the enrichment analysis. The ddi_metadata.csv file should contain columns: pfam_id_a,pfam_id_b,uniprot_id_a,uniprot_id_b,instance_id_a,instance_id_b,source and the domain_metadata.csv file should contain columns: instance_id,pfam_id.",
+                    "fa_icon": "fas fa-info-circle"
                 }
             }
         },

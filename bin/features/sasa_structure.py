@@ -9,7 +9,8 @@ from features import embeddings
 from .sasa_cache import SasaCache
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File):
+
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, normalize: bool = False):
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
@@ -17,8 +18,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
               optimization.sqlite3. Read-only — do not write.
         out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
                   pair, grouped by ddi_id.
-        struct_file: Unused (structures are read via the SASA cache); kept
-                     for the common extract_features interface.
+        normalize: If True, normalize the total SASA by the number of residues
     """
     path = os.environ.get("SASA_CACHE_H5")
     if not path:
@@ -38,7 +38,11 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
             n_skipped += 1
             continue
 
-        feature_vector = np.array([b["total_AB"]], dtype=np.float32)
+        if normalize:
+            # Normalize the feature vector by the number of residues
+            feature_vector = np.array([b["total_AB"] / b["num_res_AB"]], dtype=np.float32)
+        else:
+            feature_vector = np.array([b["total_AB"]], dtype=np.float32)
         embeddings.write_interaction_instance(out_file, pfam_id_a, pfam_id_b,
                                               instance_id_a, instance_id_b,
                                               feature_vector)

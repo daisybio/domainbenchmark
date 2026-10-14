@@ -1,8 +1,6 @@
 process SVM {
     tag "${meta.id}"
-    label 'process_gpu'  // TODO: Adapt as SVM is not GPU-accelerated -> first ask!
-    // label 'process_high_memory'
-    // label 'process_long'
+    label 'process_gpu'
 
     conda "${projectDir}/environments/ml.yml"
     container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.1"

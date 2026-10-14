@@ -5,12 +5,6 @@ from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.SASA import ShrakeRupley
 
 
-def calculate_sasa_structure_level(domain):
-    sr = ShrakeRupley()
-    sr.compute(domain, level="C")  # Compute SASA at the structure level
-    return sum(atom.sasa for residue in domain for atom in residue)
-
-
 def calculate_sasa_residue_level(domain):
     from collections import OrderedDict
     sr = ShrakeRupley()
@@ -21,31 +15,6 @@ def calculate_sasa_residue_level(domain):
         key = (chain_id, residue.get_id())  # Use chain ID and residue ID as key
         sasa_values[key] = residue.sasa
     return sasa_values
-
-
-def calculate_sasa_values(domain):
-    """Compute SASA once per domain and return both residue-level and
-    structure-level results, instead of running ShrakeRupley twice
-    (once per aggregation level) on the same atoms.
- 
-    Returns:
-        (residue_sasa, structure_sasa) where residue_sasa maps
-        residue.get_id() -> summed SASA over that residue's atoms, and
-        structure_sasa is the SASA summed over the whole domain.
-    """
-    sr = ShrakeRupley()
-    sr.compute(domain, level="A")  # atom-level is the finest; aggregate ourselves
- 
-    residue_sasa = {}
-    structure_sasa = 0.0
-    for residue in domain.get_residues():
-        r_sasa = sum(atom.sasa for atom in residue.get_atoms())
-        chain_id = residue.get_parent().get_id()
-        key = (chain_id, residue.get_id())
-        residue_sasa[key] = r_sasa
-        structure_sasa += r_sasa
- 
-    return residue_sasa, structure_sasa
 
 
 def calculate_rsa_residue_level(domain):
@@ -76,24 +45,7 @@ def calculate_rsa_residue_level(domain):
     return rsa_residue
 
 
-"""Fixed-size, per-entry encoding of ONE variable-size 2D matrix.
-
-Independent of every other entry (no vocabulary, no fitted state, no model),
-so it can be called inside the extraction loop and written out immediately.
-numpy only; the pooling follows the semantics of torch's AdaptiveAvgPool2d /
-AdaptiveMaxPool2d (cell i spans [floor(i*n/k), ceil((i+1)*n/k)) ).
-
-Output layout (N_FEATURES = 56 floats):
-    6   scalars      log1p(rows), log1p(cols), mean, std, max, density (>0)
-    21  avg pyramid  adaptive average pooling to 1x1, 2x2, 4x4
-    4   max pooling  adaptive max pooling to 2x2
-    12  marginals    mean/std/min/max/median/sum of row sums and of column sums
-    7   band profile mean value per sequence-separation band |i-j| (square
-                     "intra-chain" matrices only; zeros if banded=False/non-square)
-"""
-
-
-import numpy as np
+"""Fixed-size, per-entry encoding of ONE variable-size 2D matrix."""
 
 AVG_LEVELS = (2, 4)   # k=1 dropped: it is M.mean(), derivable from the row-sum mean
 MAX_LEVELS = (2,)
@@ -185,30 +137,6 @@ def encode_matrix(M, symmetric, banded=False, fill=0.0):
     # assert out.shape[0] == nf, (out.shape[0], nf)
     return out
 
-
-
-def normalize_weighted_adjacency(adjacency_matrix):
-    """
-    Normalize weighted adjacency matrix using degree matrix normalization.
-    Formula: A_norm = D^(-1/2) * A * D^(-1/2)
-    where D is the degree matrix (sum of weights per node)
-    """
-    adjacency = np.array(adjacency_matrix, dtype=float)
-    n = adjacency.shape[0]
-    
-    # Calculate degree (sum of weights for each node)
-    degree = np.sum(adjacency, axis=1)
-    
-    # Avoid division by zero
-    degree = np.where(degree == 0, 1, degree)
-    d_half = np.sqrt(degree)
-    d_half_inv = 1.0 / d_half
-    d_half_inv = np.diag(d_half_inv)
-    
-    # Apply normalization: D^(-1/2) * A * D^(-1/2)
-    normalized = np.matmul(d_half_inv, np.matmul(adjacency, d_half_inv))
-    
-    return normalized
 
 
 def bytes_to_pdb_structure(pdb_gz: bytes, structure_id: str):
@@ -325,53 +253,3 @@ def pool_residue_feature(values: np.ndarray) -> np.ndarray:
         values.sum(),
     ], dtype=np.float32)
 
-
-
-# def pad_vector(vector, max_length):
-#     """
-#     Pads a 1D numpy array with zeros to ensure it has a specified maximum length.
-
-#     Parameters:
-#     vector (np.ndarray): The input 1D vector to be padded.
-#     max_length (int): The desired length of the output vector after padding.
-
-#     Returns:
-#     np.ndarray: A new array padded with zeros to the specified length.
-#     """
-#     vector = np.asarray(vector)
-
-#     if vector.ndim != 1:
-#         raise ValueError(f"Expected a 1D vector, got shape {vector.shape}.")
-
-#     if len(vector) > max_length:
-#         raise ValueError(f"Input vector length {len(vector)} exceeds the maximum length of {max_length}.")
-
-#     padding_length = max_length - len(vector)
-
-#     return np.pad(vector, (0, padding_length), mode='constant', constant_values=0)
-
-
-# # Second possible padding, which puts vector in the middle of the padded vector, with zeros on both sides
-# def pad_vector_middle(vector, max_length):
-#     """
-#     Pads a 1D vector with zeros to ensure it has a specified maximum length, centering the original vector.
-    
-#     Parameters:
-#     vector (list): The input 1D vector to be padded.
-#     max_length (int): The desired length of the output vector after padding.
-    
-#     Returns:
-#     list: A new vector that is padded with zeros to the specified length, with the original vector centered.
-#     """
-#     if len(vector) > max_length:
-#         raise ValueError(f"Input vector length {len(vector)} exceeds the maximum length of {max_length}.")
-    
-#     # Calculate the number of zeros needed for padding
-#     total_padding = max_length - len(vector)
-#     left_padding = total_padding // 2
-#     right_padding = total_padding - left_padding
-    
-#     # Create a new vector with the original values centered and padded with zeros on both sides
-#     padded_vector = [0] * left_padding + vector + [0] * right_padding
-    
-#     return padded_vector

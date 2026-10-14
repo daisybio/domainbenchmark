@@ -23,7 +23,7 @@ def calculate_rasa_residue_level(resnames, sasa_residue):
     return rsa_residue
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File, complex: bool = False):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, complex: bool = False):
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
@@ -31,8 +31,6 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
               optimization.sqlite3. Read-only — do not write.
         out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
                   pair, grouped by ddi_id.
-        struct_file: Unused (structures are read via the SASA cache); kept
-                     for the common extract_features interface.
         complex: If True, RSA is computed from the residue SASA inside the
                  A+B complex and pooled over all residues. If False, RSA is
                  computed from each chain's isolated SASA, pooled per chain,

@@ -63,7 +63,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
             continue
 
         structure = bytes_to_pdb_structure(pdb_gz.tobytes(), f"ddi_{ddi_id}")  # pyright: ignore[reportAttributeAccessIssue]
-        if len(structure[0]) < 2:
+        if len(structure[0]) < 2: # pyright: ignore[reportOptionalSubscript]
             print(f"Warning: Structure for ddi_id {ddi_id} has less than 2 chains. Skipping. (instance_id_a: {instance_id_a}, instance_id_b: {instance_id_b}, pfam_id_a: {pfam_id_a}, pfam_id_b: {pfam_id_b})")
             n_skipped += 1
             continue

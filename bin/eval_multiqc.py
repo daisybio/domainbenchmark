@@ -15,9 +15,7 @@ import subprocess
 import argparse
 from pathlib import Path
 import json
-import multiqc
 import shutil
-import numpy as np
 from eval_multiqc_functions import (
     process_models,
     calc_curves_roc_pr,

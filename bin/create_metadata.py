@@ -7,16 +7,6 @@ Based on the complete metadata sets, containing metadata for all domains/ddis, t
 Prevents redundancy in metadata management.
 
 Gets path to metadata directory, the ddis of the test set of the current database and the output file
-
-NOTE: domain_1 / domain_2 in the ddi instances file are now already pfam ids
-directly (no separate domain_id -> pfam_id mapping step is needed anymore).
-Internally, metadata is still aggregated at the pfam_id level (that's the
-level the source metadata lives at) using a *sorted* (pfam_id_a, pfam_id_b)
-key, since the same unordered domain pair can appear in different orders
-across different protein-pair instances. The final output is re-keyed back
-to the ORIGINAL (unsorted) pfam_id_a / pfam_id_b orientation from the
-test-set ddi instances, so both the id columns and the domain-level feature
-columns stay consistent with each other.
 """
 
 
@@ -48,7 +38,7 @@ def read_ddi_instances(ddi_instances_path):
         raise FileNotFoundError(f"DDI instances file not found at {ddi_instances_path}")
 
     ddi_instances_df = pd.read_csv(ddi_instances_path)
-    #  INstance df has columns domain_1, domain_2, instance_1, instance_2, interaction
+    # Instance df has columns domain_1, domain_2, instance_1, instance_2, interaction
     first_two_cols = ddi_instances_df.columns[:2].tolist()
     if first_two_cols != ['pfam_id_a', 'pfam_id_b']:
         ddi_instances_df.rename(columns={'domain_1': 'pfam_id_a', 'domain_2': 'pfam_id_b'}, inplace=True)
@@ -57,10 +47,8 @@ def read_ddi_instances(ddi_instances_path):
 
 def create_database_specific_metadata(domain_metadata_df, ddi_metadata_df, ddi_instances_df):
 
-    # all_pfam_ids = set(ddi_instances_df['pfam_id_a'].dropna()).union(set(ddi_instances_df['pfam_id_b'].dropna()))
     all_instance_ids = set(ddi_instances_df['instance_1'].dropna()).union(set(ddi_instances_df['instance_2'].dropna()))
 
-    # print(f"Found {len(all_pfam_ids)} unique pfam ids in the DDI instances for the current database")
     print(f"Found {len(all_instance_ids)} unique instance ids in the DDI instances for the current database")
 
     # Check if there are any instance ids in the DDI instances that are not present in the domain metadata
@@ -171,10 +159,10 @@ def aggregate_metadata_to_ddi_level(ddi_metadata, key_cols=("pfam_id_a", "pfam_i
     agg_ddi_metadata = ddi_metadata.groupby("_pair_key")[ddi_numerical_features].agg(method).fillna(0).reset_index()
 
     # In addition, for column source, which contains values downlloaded/inferred, calculate the percent of downloaded instances per ddi pair and add as column source_downloaded_fraction
-    if "source" in ddi_metadata.columns:
-        source_downloaded_fraction = ddi_metadata.groupby("_pair_key")["source"].apply(lambda x: (x == "downloaded").mean()).reset_index(name="source_downloaded_fraction")
-        agg_ddi_metadata = agg_ddi_metadata.merge(source_downloaded_fraction, on="_pair_key", how="left")
-        ddi_numerical_features.append("source_downloaded_fraction")
+    # if "source" in ddi_metadata.columns:
+    #     source_downloaded_fraction = ddi_metadata.groupby("_pair_key")["source"].apply(lambda x: (x == "downloaded").mean()).reset_index(name="source_downloaded_fraction")
+    #     agg_ddi_metadata = agg_ddi_metadata.merge(source_downloaded_fraction, on="_pair_key", how="left")
+    #     ddi_numerical_features.append("source_downloaded_fraction")
 
     return agg_ddi_metadata, ddi_numerical_features
 

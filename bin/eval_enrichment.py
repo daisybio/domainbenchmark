@@ -8,7 +8,7 @@ generating a small JSON sidecar consumed by `eval_multiqc.py`.
 
 Model selection per target type
 --------------------------------
-- "error"     (continuous, |true - predicted_probability| in [0,1]) -> OLS  (statsmodels)
+- "error"     (continuous, |true - predicted_probability| in [0,1])  -> OLS  (statsmodels)
 - "binary"    (true_interaction, 0/1)                                -> Logit (statsmodels)
 - "predicted" (predicted_interaction, 0/1)                           -> Logit (statsmodels)
 - "combined"  (0/1/2/3 nominal: TN/FN/FP/TP)                         -> MNLogit (statsmodels)
@@ -19,16 +19,10 @@ classification targets because:
     (the "linear probability model") gives unbounded predictions and
     heteroscedastic, non-normal residuals; logistic/multinomial-logit
     models the probabilities correctly.
-  * statsmodels gives us proper SEs, p-values and CIs from the MLE
-    covariance matrix (via the observed information / sandwich
-    estimator) instead of the OLS-formula-based SEs we were
-    hand-rolling before, which were not valid for a 0/1 target anyway.
-  * McFadden's pseudo-R^2 (1 - loglik/loglik_null) replaces the OLS R^2
-    as the "how much variance is explained" analogue for these models.
-
-The "error" target stays a genuine continuous quantity, so OLS (now via
-statsmodels, so all four targets share the same reporting code path)
-remains appropriate there.
+  * statsmodels gives proper SEs, p-values and CIs from the MLE
+    covariance matrix 
+  * McFadden's pseudo-R^2 (1 - loglik/loglik_null) is used as replacement for
+    the OLS R^2
 """
 
 import argparse as ap

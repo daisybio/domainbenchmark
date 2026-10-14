@@ -38,7 +38,7 @@ def build_shell_cci_matrix(pi):
     return 11.0 - np.abs(d[:, None] * d[None, :] * 19.0 / 33.8)
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
@@ -46,9 +46,6 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
               optimization.sqlite3. Read-only — do not write.
         out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
                   pair, grouped by ddi_id.
-        seed: Unused; kept for the common extract_features interface.
-        struct_file: Unused (structures are read via the SASA cache); kept
-                     for the common extract_features interface.
     """
     path = os.environ.get("SASA_CACHE_H5")
     if not path:

@@ -10,7 +10,7 @@ from .sasa_cache import SasaCache
 from .structure_utils import pool_residue_feature
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
     """Extract features from the database and write them to the HDF5 file.
 
     Args:
@@ -18,8 +18,6 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, s
               optimization.sqlite3. Read-only — do not write.
         out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
                   pair, grouped by ddi_id.
-        struct_file: Unused (structures are read via the SASA cache); kept
-                     for the common extract_features interface.
     """
     path = os.environ.get("SASA_CACHE_H5")
     if not path:

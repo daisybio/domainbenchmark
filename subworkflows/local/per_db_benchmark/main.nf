@@ -25,7 +25,7 @@ include { NEURAL_NETWORK                                } from '../../../modules
 include { RANDOM_FOREST                                 } from '../../../modules/local/random_forest/main.nf'
 include { SVM                                           } from '../../../modules/local/svm/main.nf'
 include { GRAPH_MODEL                                   } from '../../../modules/local/graph_model/main.nf'
-include { EVAL_ONE; METADATA; ENRICHMENT; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
+include { EVAL_ONE; METADATA; ENRICHMENT; EVALUATION    } from '../../../modules/local/evaluation/main.nf'
 include { VERIFY_EMBEDDINGS                             } from '../../../modules/local/verify_embeddings/main.nf'
 
 

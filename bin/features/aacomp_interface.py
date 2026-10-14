@@ -22,7 +22,16 @@ def aacomp_from_bundle(b, min_decrease=1.0):
     )
 
 
-def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int, struct_file: h5py.File):
+def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
+    """Extract features from the database and write them to the HDF5 file.
+        
+        Args:
+            conn: SQLite connection to one of train.sqlite3 / test.sqlite3 /
+                    optimization.sqlite3. Read-only — do not write.
+            out_file: Writable HDF5 file. Write one dataset per (ddi, ppi)
+                        pair, grouped by ddi_id.
+    """
+
     path = os.environ.get("SASA_CACHE_H5")
     if not path:
         raise RuntimeError("Set SASA_CACHE_H5 to the file written by features.sasa_cache")

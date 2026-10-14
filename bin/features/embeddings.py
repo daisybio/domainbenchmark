@@ -41,6 +41,70 @@ DOMAIN_KEY_SQL = f"{domain_key_sql()} AS domain_key"
 DOMAIN_JOIN_SQL = "JOIN domain ON domain_protein_map.domain_id = domain.id"
 
 
+# ---------------------------------------------------------------------------
+# Restricting domain instances to the real (non-mock) DDI instances
+# ---------------------------------------------------------------------------
+# The DDI encodings only ever see instance pairs with `is_mock = 0`
+# (see `load_structure_data`). To make sure the domain encodings are built from
+# exactly the same data, every query on `domain_protein_map` has to be limited
+# to the instances that occur in a non-mock `ddi_split_membership` row (as
+# instance_id_a or instance_id_b). If the database has no `ddi_split_membership`
+# table (or it has no `is_mock` column) there is nothing to align with and no
+# filter is applied, i.e. the previous behaviour is kept.
+def has_ddi_split_membership(conn: sqlite3.Connection) -> bool:
+    """True if `ddi_split_membership` exists and carries an `is_mock` column."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'ddi_split_membership'"
+    ).fetchone()
+    if exists is None:
+        return False
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(ddi_split_membership)")}
+    return "is_mock" in columns
+
+
+def real_instance_filter_sql(
+    conn: sqlite3.Connection,
+    alias: str = "domain_protein_map",
+    keyword: str = "WHERE",
+) -> str:
+    """SQL fragment limiting `alias` to instances used by non-mock DDI rows.
+
+    Returns an empty string if `ddi_split_membership` does not exist, otherwise
+    ` <keyword> <instance key> IN (...)`. Use `keyword="WHERE"` when the query
+    has no WHERE clause yet and `keyword="AND"` when appending to one.
+
+    The instance key is the same expression as `instance_key_sql`, so rows
+    without an `instance_id` (rowid fallback) are matched consistently.
+    """
+    if not has_ddi_split_membership(conn):
+        return ""
+    return (
+        f" {keyword} {instance_key_sql(alias)} IN ("
+        "SELECT instance_id_a FROM ddi_split_membership WHERE is_mock = 0 "
+        "UNION "
+        "SELECT instance_id_b FROM ddi_split_membership WHERE is_mock = 0)"
+    )
+
+
+def load_domain_instance_data(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Every domain instance that is also used by a real (non-mock) DDI.
+
+    Without a `ddi_split_membership` table all instances are returned.
+    Columns: domain_key (Pfam accession), instance_key -- both cast to str.
+    """
+    query = (
+        f"SELECT {DOMAIN_KEY_SQL}, {INSTANCE_KEY_SQL} "
+        "FROM domain_protein_map "
+        f"{DOMAIN_JOIN_SQL}"
+        f"{real_instance_filter_sql(conn)}"
+    )
+    df = pd.read_sql(query, conn)
+    df["domain_key"] = df["domain_key"].astype(str)
+    df["instance_key"] = df["instance_key"].astype(str)
+    return df
+
+
 def write_instance(out_file: h5py.File, domain_key: str, instance_key: str, value):
     """Write one instance vector under its domain group, creating it if needed.
 
@@ -64,7 +128,7 @@ def write_instance(out_file: h5py.File, domain_key: str, instance_key: str, valu
 
 # Interaction encodings
 # HDF5 layout is `h5[<pfam_id_a>_<pfam_id_b>][<instance_id_a>_<instance_id_b>]`.
-# 
+#
 # The group name is the concatenation of the two Pfam accessions, as they occurr in ddi_instance table
 # The table ddi_split_membership is structured as follows:
 # CREATE TABLE ddi_split_membership (
@@ -176,7 +240,7 @@ def write_interaction_instance(
 
 
 def load_structure_data(conn: sqlite3.Connection) -> pd.DataFrame:
-    """Load every DDI instance pair with its Pfam accessions resolved.
+    """Load every real (non-mock) DDI instance pair with its Pfam accessions resolved.
 
     Joins ddi_split_membership (the actual instance_id_a/instance_id_b pairs)
     against domain_domain_interaction/domain (via DDI_JOIN_SQL) to attach
@@ -184,6 +248,10 @@ def load_structure_data(conn: sqlite3.Connection) -> pd.DataFrame:
     DOMAIN_JOIN_SQL applies here: ddi.id and domain.id are per-run surrogates,
     so anything cached or compared across runs has to key on Pfam accessions
     instead.
+
+    Only rows with `is_mock = 0` are loaded. The domain encodings are limited to
+    the very same instances by `real_instance_filter_sql`, so DDI and domain
+    features are built from identical data.
 
     Every interaction encoder (aacomp_interface, and any future one) needs
     this exact merge, so it lives here once rather than being reimplemented
@@ -196,8 +264,6 @@ def load_structure_data(conn: sqlite3.Connection) -> pd.DataFrame:
     """
     ddi_pfam_df = pd.read_sql(DDI_JOIN_SQL, conn)
 
-    # TODO: later add is_mock = 0, to only load real instances
-    # current db is not yet updated with is_mock column, so we load all instances for now
     membership_df = pd.read_sql(
         """
         SELECT ddi_id, instance_id_a, instance_id_b

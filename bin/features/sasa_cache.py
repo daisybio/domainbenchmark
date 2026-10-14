@@ -5,12 +5,11 @@ Every SASA-based feature (aacomp_interface, bsa_*, interface_area*, sasa_*,
 rasa_*, hydrophobic_map, charge_map, ...) then reads from this cache instead of
 re-parsing the PDB and re-running Shrake-Rupley itself.
 
-Run it as its own Nextflow process, ONCE, before FEATURE_EXTRACTION (single
-writer; HDF5 does not like concurrent writers):
+Run it as its own Nextflow process, once, before FEATURE_EXTRACTION:
 
     python -m features.sasa_cache \
         --db train.sqlite3 validation.sqlite3 test.sqlite3 ... \
-        --struct structures.h5 --out sasa_cache.h5 --procs 32
+        --struct structures.h5 --out sasa_cache.h5 --procs 12
 
 Structures that occur in several splits / datasets (minimal_leakage, random)
 are computed only once, because the key is (pfam_a, pfam_b, inst_a, inst_b).
@@ -21,10 +20,13 @@ then all chain-B residues):
     sasa_iso   residue SASA with the chain ALONE
     sasa_cplx  residue SASA inside the A+B complex
     attrs total_A, total_B, total_AB   (structure-level SASA)
+    attrs num_res_A, num_res_B, num_res_AB   (structure-level residue counts)
 """
 import argparse
 import sqlite3
 from multiprocessing import Pool
+import os
+
 
 import h5py
 import numpy as np
@@ -103,6 +105,9 @@ def compute_bundle(pdb_gz: bytes, n_points: int = 100):
         "total_A": float(iso[chain_ids == "A"].sum()),
         "total_B": float(iso[chain_ids == "B"].sum()),
         "total_AB": total_AB,
+        "num_res_A": int((chain_ids == "A").sum()),
+        "num_res_B": int((chain_ids == "B").sum()),
+        "num_res_AB": int((chain_ids == "A").sum() + (chain_ids == "B").sum())
     }
 
 class SasaCache:
@@ -125,32 +130,46 @@ class SasaCache:
             "total_A": float(g.attrs["total_A"]),
             "total_B": float(g.attrs["total_B"]),
             "total_AB": float(g.attrs["total_AB"]),
-            "depth_atom": g["depth_atom"][:],  # NEW
+            "depth_atom": g["depth_atom"][:],
+            "num_res_A": int((g["chain"][:] == b"A").sum()),
+            "num_res_B": int((g["chain"][:] == b"B").sum()),
+            "num_res_AB": int((g["chain"][:] == b"A").sum() + (g["chain"][:] == b"B").sum())
         }
 
 
 # ---------------------------------------------------------------- precompute
-def _jobs(dbs, struct_file, done):
+
+_SF = None  # per-worker read-only handle to structures.h5
+
+
+def _init_worker(struct_path):
+    global _SF
+    os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+    _SF = h5py.File(struct_path, "r")
+
+
+def _jobs(dbs, done):
+    """Yield only (key, (pfam_a, pfam_b, inst_a, inst_b)) -- no structure bytes."""
     seen = set(done)
     for db in dbs:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         df = embeddings.load_structure_data(conn)
+        conn.close()
         for _ddi_id, ia, ib, pa, pb in df.itertuples(index=False):
             key = make_key(pa, pb, ia, ib)
             if key in seen:
                 continue
-            pdb_gz = embeddings.read_interaction_instance(struct_file, pa, pb, ia, ib)
-            if pdb_gz is None:
-                continue
             seen.add(key)
-            yield key, pdb_gz.tobytes()
-        conn.close()
+            yield key, (pa, pb, ia, ib)
 
 
 def _work(job):
-    key, pdb_gz = job
+    key, (pa, pb, ia, ib) = job
     try:
-        return key, compute_bundle(pdb_gz)
+        pdb_gz = embeddings.read_interaction_instance(_SF, pa, pb, ia, ib)
+        if pdb_gz is None:
+            return key, False                      # structure missing
+        return key, compute_bundle(pdb_gz.tobytes())
     except Exception as e:  # keep the run alive, report at the end
         return key, repr(e)
 
@@ -163,25 +182,33 @@ def main():
     ap.add_argument("--procs", type=int, default=8)
     a = ap.parse_args()
 
-    n_ok = n_skip = 0
+    n_ok = n_skip = n_missing = 0
     errors = []
-    with h5py.File(a.struct, "r") as sf, h5py.File(a.out, "a") as out, Pool(a.procs) as pool:
-        for key, res in pool.imap_unordered(_work, _jobs(a.db, sf, out.keys()), chunksize=16):
-            if res is None:
-                n_skip += 1          # < 2 chains
-                continue
-            if isinstance(res, str):
-                errors.append((key, res))
-                continue
-            g = out.create_group(key)
-            for name in ("resname", "chain", "ca_xyz", "sasa_iso", "sasa_cplx", "depth_atom"):
-                g.create_dataset(name, data=res[name])
-            for name in ("total_A", "total_B", "total_AB"):
-                g.attrs[name] = res[name]
-            n_ok += 1
-            if n_ok % 5000 == 0:
-                out.flush()
-    print(f"sasa_cache: wrote {n_ok}, skipped {n_skip} (<2 chains), failed {len(errors)}")
+    # Pool first (fork before any HDF5 file is open in the parent)
+    with Pool(a.procs, initializer=_init_worker, initargs=(a.struct,),
+              maxtasksperchild=2000) as pool:
+        with h5py.File(a.out, "a") as out:
+            done = list(out.keys())
+            for key, res in pool.imap_unordered(_work, _jobs(a.db, done), chunksize=8):
+                if res is False:
+                    n_missing += 1
+                    continue
+                if res is None:
+                    n_skip += 1          # < 2 chains
+                    continue
+                if isinstance(res, str):
+                    errors.append((key, res))
+                    continue
+                g = out.create_group(key)
+                for name in ("resname", "chain", "ca_xyz", "sasa_iso", "sasa_cplx", "depth_atom"):
+                    g.create_dataset(name, data=res[name])
+                for name in ("total_A", "total_B", "total_AB", "num_res_A", "num_res_B", "num_res_AB"):
+                    g.attrs[name] = res[name]
+                n_ok += 1
+                if n_ok % 5000 == 0:
+                    out.flush()
+    print(f"sasa_cache: wrote {n_ok}, skipped {n_skip} (<2 chains), "
+          f"missing {n_missing}, failed {len(errors)}")
     for key, msg in errors[:20]:
         print("  FAILED", key, msg)
 

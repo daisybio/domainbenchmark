@@ -20,13 +20,18 @@ def get_aa_comp(seq: str) -> list[float]:
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
     # Deterministic encoder: `seed` is part of the encoder ABI so that a
     # sampling encoder cannot be added without one. Unused here.
+    #
+    # If the database has a ddi_split_membership table, only domain instances
+    # used by real (is_mock = 0) DDI rows are encoded, so the domain features
+    # are built from exactly the same data as the DDI features.
     domain_sequence_df = pd.read_sql(
         f"""
                 SELECT {embeddings.DOMAIN_KEY_SQL},
                        {embeddings.INSTANCE_KEY_SQL},
                        UPPER(domain_sequence) AS sequence
                 FROM domain_protein_map
-                {embeddings.DOMAIN_JOIN_SQL};
+                {embeddings.DOMAIN_JOIN_SQL}
+                {embeddings.real_instance_filter_sql(conn)};
             """,
         conn,
     )
