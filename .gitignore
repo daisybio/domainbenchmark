@@ -220,9 +220,6 @@ run_eval_multiqc_single.sh
 # writes next to the in-repo fixture databases.
 .nf-test/
 tests/data/databases/*/.cobinet_cache/
-bin/check_h5_file.ipynb
 daisybio.config
-invalidate_cache.sh
-metadata/ddi_metadata.csv
-metadata/domain_metadata.csv
+metadata/*
 sandbox.config

@@ -191,15 +191,14 @@ workflow PER_DB_BENCHMARK {
         def svm_enabled          = !train_only && ml_model_names.contains('svm')
 
         // Print all features and feature registry entries for debugging. The registry is a map of feature_name → {variants: [{suffix, params}, ...]}.
-        println "[PER_DB_BENCHMARK] Feature registry: ${params.feature_registry}"
-        println "[PER_DB_BENCHMARK] Requested features: ${all_features}"
+        //println "[PER_DB_BENCHMARK] Feature registry: ${params.feature_registry}"
+        //println "[PER_DB_BENCHMARK] Requested features: ${all_features}"
 
         //NOTE: Rewrite features to take parameterized features
-        def expanded_features  = expandFeatures(extracted_features, params.feature_registry)
-        // Print out all the features that will be run, including parameterized variants.
-        // println "[PER_DB_BENCHMARK] Running features: ${expanded_features*.name.join(', ')}"
-        // println "[PER_DB_BENCHMARK] Running modules: ${expanded_features*.module.join(', ')}"
-        // println "[PER_DB_BENCHMARK] Parameterized features: ${expanded_features.findAll { it.params }.collect { "${it.name}=${it.params}" }.join(', ')}"
+        def feature_registry_file = file(params.modeljson) / 'FeatureRegistry.groovy'
+        def feature_registry = new GroovyShell().evaluate(feature_registry_file.text) as Map
+
+        def expanded_features  = expandFeatures(extracted_features, feature_registry)
 
         ml_features        = expanded_features.collect { it.name }
         // add published features to ml_features for downstream processing
@@ -372,7 +371,6 @@ workflow PER_DB_BENCHMARK {
             .mix(RANDOM_FOREST.out.predictions)
             .mix(SVM.out.predictions)
             .mix(GRAPH_MODEL.out.predictions)
-            .mix(SVM.out.predictions)
             .flatMap { meta, pred ->
                 def files = pred instanceof java.util.List ? pred : [pred]
                 files.collect { f ->

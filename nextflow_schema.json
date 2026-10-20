@@ -154,11 +154,6 @@
                     "help_text": "RANDOM_FOREST trains with cuML and normally exits with retry code 140 when its CUDA smoke test fails, so Nextflow reschedules the task onto a healthy GPU node. Set this on GPU-less machines (CI, laptops) to train with scikit-learn on the CPU instead. Leave it off for real runs: a CPU fit of the full grid is orders of magnitude slower, and the fallback would mask a broken GPU node.",
                     "fa_icon": "fas fa-microchip"
                 },
-                "feature_registry": {
-                    "type": "object",
-                    "description": "List containing additional params for each feature encoding. Schema: feature: [variants: [suffix : suffix_value, params: [param1 : value1, param2 : value2, ...]]]",
-                    "fa_icon": "fa fa-list"                
-                },
                 "train_only": {
                     "type": "boolean",
                     "default": false,
@@ -172,6 +167,14 @@
                     "description": "Path to a directory containining ddi_metadata.csv and domain_metadata.csv files.",
                     "help_text": "Metadadata files needed for the enrichment analysis. The ddi_metadata.csv file should contain columns: pfam_id_a,pfam_id_b,uniprot_id_a,uniprot_id_b,instance_id_a,instance_id_b,source and the domain_metadata.csv file should contain columns: instance_id,pfam_id.",
                     "fa_icon": "fas fa-info-circle"
+                },
+                "structures": {
+                    "type": "string",
+                    "format": "path",
+                    "exists": true,
+                    "description": "Path to a .hd5 file containing the domain complex structures, geneated by the daisybio/domainsplit pipeline.",
+                    "help_text": "The .hd5 file should contain the structures for all domain instances in the datasets.",
+                    "fa_icon": "fas fa-cube"
                 }
             }
         },
