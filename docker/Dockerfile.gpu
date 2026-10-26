@@ -3,13 +3,13 @@ FROM mambaorg/micromamba:1.5.10
 # Build/tag as konstantinpelz/domainbenchmark-gpu:1.0.1 — synced with environments/ml.yml
 LABEL org.opencontainers.image.source="https://github.com/daisybio/domainbenchmark"
 LABEL org.opencontainers.image.version="1.0.1"
-LABEL org.opencontainers.image.description="GPU container (CUDA 12.8, cuML 26.02, torch 2.7, skorch)"
+LABEL org.opencontainers.image.description="GPU container (CUDA 12.8, cuML 26.10, torch 2.7, skorch)"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Install procps (provides `ps`) at system level for Nextflow metrics collection
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends procps \
+RUN apt-get update && apt-get install -y --no-install-recommends procps gzip \
  && rm -rf /var/lib/apt/lists/*
 USER $MAMBA_USER
 
@@ -25,18 +25,24 @@ ENV PIP_DEFAULT_TIMEOUT=100
 ENV NVIDIA_TF32_OVERRIDE=0
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Stable rapidsai channel, not rapidsai-nightly: a nightly build cannot be
+# reproduced later. Python stays 3.12 -- skorch 1.1.0 cannot even be imported on
+# 3.13 (3.13 dedents docstrings and skorch's classifier.py regex expects the
+# indentation). cuML 26.10 ships a single cp311-abi3 build, so 3.12 is
+# supported; pandas 3.0 is what cudf 26.10 requires.
 RUN micromamba create -y -n ${ENV_NAME} -c rapidsai -c conda-forge -c nvidia \
     python=3.12.2 \
     numpy=2.2.6 \
-    pandas=2.2.3 \
+    pandas=3.0 \
     h5py=3.14.0 \
     scikit-learn=1.6.1 \
-    cuml=26.02.00 \
+    cuml=26.10.00 \
     cuda-version=12.8 \
     cudnn=9 \
     pip=25.0 \
     biopython \
     pyarrow \
+    sqlite=3.50.4 \
     && micromamba clean --all --yes
 
 RUN micromamba run -n ${ENV_NAME} pip install \

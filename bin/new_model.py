@@ -38,16 +38,19 @@ class NewModelTrainer(DDIModelTrainer):
             balance_classes=downsample, seed=seed,
         )
 
-    def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
+    def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, scorer, config, num_features):
         # Create, fit, and return a RandomizedSearchCV.
         # `cv_split` is a PredefinedSplit (train=-1, opt=0).
+        # `scorer` is the DDI-level AP over the validation fold: pass it as
+        # `scoring=scorer`, with error_score="raise" and random_state=self._seed.
         # `config` is the full JSON config dict.
         # Set refit=False — the base class handles refitting via _refit().
         raise NotImplementedError("Replace with your classifier + RandomizedSearchCV")
 
-    def _refit(self, best_params, best_balance, args, config, num_features):
+    def _refit(self, best_params, best_balance, args, config, num_features, load_opt):
         # Retrain on full training data with best hyperparameters.
-        # Must return the fitted classifier.
+        # Must return the fitted classifier. `load_opt()` returns the
+        # validation split as (x, y, ddi_pairs), for early stopping.
         x_train, y_train = self._load_train_data(
             args, best_balance, args.seed
         )
@@ -66,8 +69,10 @@ class NewModelTrainer(DDIModelTrainer):
 
     # Optional overrides:
     #
-    # def _pre_train_hook(self):
-    #     """Called before training. Use for GPU probes, env checks, etc."""
+    # def _pre_train_hook(self, args):
+    #     """Called before training. Use for GPU probes, env checks, etc.
+    #     For a GPU model: self._use_gpu = machine_learning.probe_cuda(
+    #         args.allow_cpu, "new_model", <smoke-test callable>)"""
     #
     # def _predict_proba(self, classifier, x):
     #     """Override if your model needs dtype casting or custom inference."""

@@ -36,7 +36,6 @@ RUN micromamba create -y -n ${ENV_NAME} \
     psutil \
     pyarrow \
     fastparquet \
-    biopython \
  && micromamba clean --all --yes
 
 ENTRYPOINT ["micromamba", "run", "-n", "general"]

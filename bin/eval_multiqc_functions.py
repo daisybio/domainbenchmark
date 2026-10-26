@@ -10,15 +10,11 @@ import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from sklearn.metrics import (
-    roc_curve,
-    auc,
-    precision_recall_curve,
-    average_precision_score,
-)
 import sqlite3
 import networkx as nx
 import logging
+
+from load_data_gm import DEFAULT_PPI_SCORE_CUTOFF, load_ppi as gm_load_ppi
 
 
 ### Bootstrap helpers ###
@@ -39,6 +35,13 @@ def bootstrap_metric(
     re-running the bootstrap. Identical `seed` across models means the resample
     *strategy* is identical even though the indices differ in length when
     models cover different test rows.
+
+    A single-class resample is NaN in `samples` (the metric is undefined on
+    it), so the CI rests on `count_valid(samples)` resamples, not on
+    `n_resamples`. With no valid resample at all the CI is NaN rather than the
+    point estimate: a zero-width interval would claim a certainty nothing was
+    measured for. A single-class input makes the point NaN too -- sklearn
+    raises on it for ROC AUC and warns-and-guesses for AP.
     """
     y_true = np.asarray(y_true)
     y_score = np.asarray(y_score)
@@ -54,15 +57,23 @@ def bootstrap_metric(
             samples[i] = np.nan
             continue
         samples[i] = float(metric_fn(yt, ys))
+    point = (
+        float(metric_fn(y_true, y_score))
+        if n and y_true.min() != y_true.max()
+        else float("nan")
+    )
     valid = samples[~np.isnan(samples)]
     if valid.size == 0:
-        point = float(metric_fn(y_true, y_score))
-        return point, point, point, samples
+        return point, float("nan"), float("nan"), samples
     alpha = (1.0 - ci) / 2.0
     lo = float(np.quantile(valid, alpha))
     hi = float(np.quantile(valid, 1.0 - alpha))
-    point = float(metric_fn(y_true, y_score))
     return point, lo, hi, samples
+
+
+def count_valid(samples) -> int:
+    """Resamples a bootstrap CI actually rests on (the non-NaN ones)."""
+    return int(np.isfinite(np.asarray(samples, dtype=np.float64)).sum())
 
 
 def paired_bootstrap_diff(samples_a, samples_b) -> float:
@@ -74,15 +85,22 @@ def paired_bootstrap_diff(samples_a, samples_b) -> float:
     an unpaired stochastic-dominance approximation rather than the textbook
     paired-bootstrap test. It is still informative for ordering models; treat
     p-values as indicative rather than calibrated.
+
+    Resample i of `a` is compared with resample i of `b` and nothing else, so a
+    resample that is NaN on *either* side drops from both. Filtering each side
+    on its own and truncating to the shorter one -- what this used to do --
+    shifts every later pair by one per NaN dropped, which unpairs the draws
+    whenever the two models share a test set (same `seed`, same length: the
+    index draws are then identical).
     """
     a = np.asarray(samples_a, dtype=np.float64)
     b = np.asarray(samples_b, dtype=np.float64)
-    a = a[~np.isnan(a)]
-    b = b[~np.isnan(b)]
-    if a.size == 0 or b.size == 0:
-        return float("nan")
     n = min(a.size, b.size)
-    diff = a[:n] - b[:n]
+    a, b = a[:n], b[:n]
+    joint = np.isfinite(a) & np.isfinite(b)
+    if not joint.any():
+        return float("nan")
+    diff = a[joint] - b[joint]
     # Two-sided: smaller tail mass × 2.
     p_pos = float((diff <= 0).mean())
     p_neg = float((diff >= 0).mean())
@@ -92,8 +110,8 @@ def paired_bootstrap_diff(samples_a, samples_b) -> float:
 ### Retired report blocks ###
 
 #: Blocks this pipeline used to write and no longer does. They are filtered out
-#: wherever an *older* report is read back in -- `--report` in eval_multiqc.py
-#: and the per-dataset report dirs in combine_eval.py -- because MultiQC renders
+#: wherever an *older* report is read back in -- the per-dataset report dirs in
+#: combine_eval.py -- because MultiQC renders
 #: every custom-content block it finds, whether or not the config's `order` lists
 #: it. Without this, resuming onto a results directory written by an earlier
 #: version would resurrect the sections as zombies at the end of the report.
@@ -120,6 +138,17 @@ def is_retired_block(name) -> bool:
 # accident of naming rather than the order anyone wants to read them in.
 #
 # `--mqc_order` fixes that order once and every consumer below follows it.
+
+
+def variant_of_split(test_split) -> str:
+    """`test_balanced` -> `balanced`, `test` -> `test`.
+
+    The same rule as `discoverSplits()` in the utils subworkflow, which is where
+    the pipeline's variant names come from. Only a fallback: EVALUATION passes
+    the variant explicitly.
+    """
+    split = str(test_split or "test")
+    return split[len("test_"):] if split.startswith("test_") else split
 
 
 def parse_dataset_order(raw):
@@ -240,23 +269,17 @@ def load_ddi(path_to_database: Path) -> pd.DataFrame:
     return ddi_final
 
 
-def load_ppi(path_to_database: Path) -> pd.DataFrame:
+def load_ppi(path_to_database: Path, ppi_score_cutoff) -> pd.DataFrame:
+    """PPIs at or above `ppi_score_cutoff` -- the interactome the graph models see.
+
+    Delegates to `load_data_gm.load_ppi` rather than repeating its query, so the
+    report's PPI counts go through the same numeric coercion (and the same
+    failure on a score that will not coerce) as the models they describe.
+    Counting every PPI regardless of the cutoff used to describe a network no
+    model was ever given.
     """
-    Load protein-protein interaction data from the SQLite database and save to CSV.
-    Explicit JOINs (was cartesian-style FROM).
-    """
-    with sqlite3.connect(path_to_database) as conn:
-        ppi_df = pd.read_sql(
-            """
-            SELECT p1.uniprot_id AS protein_1, p2.uniprot_id AS protein_2,
-                   ppi.score
-            FROM protein_protein_interaction AS ppi
-            JOIN protein AS p1 ON ppi.protein_id_a = p1.id
-            JOIN protein AS p2 ON ppi.protein_id_b = p2.id;
-            """,
-            conn,
-        )
-    return ppi_df
+    ppi_df = gm_load_ppi(path_to_database)
+    return ppi_df[ppi_df["score"] >= ppi_score_cutoff].reset_index(drop=True)
 
 
 ### Functions to analyse db data ###
@@ -299,10 +322,10 @@ def get_interaction_counts(interaction_df: pd.DataFrame) -> dict[str, int]:
     return interaction_counts
 
 
-def _analyse_one_db(db_path: str) -> dict:
+def _analyse_one_db(db_path: str, ppi_score_cutoff) -> dict:
     """Analyse a single SQLite split. Loads PPI/DDI exactly once and frees them."""
     ddi_df = load_ddi(Path(db_path))
-    ppi_df = load_ppi(Path(db_path))
+    ppi_df = load_ppi(Path(db_path), ppi_score_cutoff)
 
     PPI_graph = nx.Graph()
     PPI_graph.add_edges_from(ppi_df[["protein_1", "protein_2"]].values)
@@ -320,6 +343,7 @@ def _analyse_one_db(db_path: str) -> dict:
     gc.collect()
 
     return {
+        "ppi_score_cutoff": ppi_score_cutoff,
         "ppi_network_data": ppi_network_data,
         "ddi_network_data": ddi_network_data,
         "ppi_interaction_counts": ppi_interaction_counts,
@@ -327,17 +351,29 @@ def _analyse_one_db(db_path: str) -> dict:
     }
 
 
-def _db_cache_key(db_files: dict) -> str:
-    """Stable hash of db split paths + mtimes — used to memoize analyse_database."""
+def _db_cache_key(db_files: dict, ppi_score_cutoff) -> str:
+    """Stable hash of everything `analyse_database`'s result depends on.
+
+    The split paths + sizes + mtimes, the PPI cutoff, and the source of the code
+    that computes it -- this module and `load_data_gm` (whose `load_ppi` it
+    reuses). Without the code in the key an edit to the analysis kept serving
+    the old numbers until someone thought to delete the cache.
+    """
     h = hashlib.sha1()
     for k in sorted(db_files):
         st = os.stat(db_files[k])
         h.update(f"{k}:{db_files[k]}:{st.st_size}:{int(st.st_mtime)}|".encode())
+    h.update(f"ppi_score_cutoff:{ppi_score_cutoff}|".encode())
+    for src in (__file__, gm_load_ppi.__code__.co_filename):
+        h.update(Path(src).read_bytes())
     return h.hexdigest()
 
 
 def analyse_database(
-    input_dir, test_split: str = "test", cache_dir: str | None = None
+    input_dir,
+    test_split: str = "test",
+    ppi_score_cutoff=DEFAULT_PPI_SCORE_CUTOFF,
+    cache_dir: str | None = None,
 ) -> dict[str, object]:
     """
     Analyse the train / validation / test splits of an input dir.
@@ -346,12 +382,14 @@ def analyse_database(
     an internal test set ships `test_balanced` and `test_realistic`, and each is
     reported as its own dataset, sharing the same train and validation splits.
 
-    cache_dir: if provided, memoize the JSON-serialized result keyed by
-    (split paths + size + mtime). On a re-run this skips the entire PPI/DDI
-    load + graph build (which used to dominate `evaluation` memory). Because the
-    key covers the resolved paths, the two variants of one database cache
-    independently.
-    Default cache dir is `${input_dir}/.cobinet_cache`.
+    ppi_score_cutoff: PPIs below it are not counted -- the same
+    `params.ppi_score_cutoff` the graph models filter their interactome by.
+
+    cache_dir: memoizes the JSON-serialized result under `_db_cache_key`.
+    Defaults to `.cobinet_cache` in the current directory, i.e. the task work
+    dir. It used to default to `${input_dir}/.cobinet_cache`, which wrote
+    through the staged symlink into the *input* database directory -- shared
+    across runs, tasks and checkouts, and keyed without the code version.
     """
     db_files = {
         k: v
@@ -364,12 +402,12 @@ def analyse_database(
     }
 
     if cache_dir is None:
-        cache_dir = os.path.join(input_dir, ".cobinet_cache")
+        cache_dir = os.path.join(os.getcwd(), ".cobinet_cache")
 
     cache_path = None
     try:
         os.makedirs(cache_dir, exist_ok=True)
-        cache_key = _db_cache_key(db_files)
+        cache_key = _db_cache_key(db_files, ppi_score_cutoff)
         cache_path = os.path.join(cache_dir, f"db_analysis_{cache_key}.json")
         if os.path.exists(cache_path):
             logging.info(f"[INFO] analyse_database cache hit: {cache_path}")
@@ -382,7 +420,7 @@ def analyse_database(
     combined_data_all = {}
     for db_type, db_path in db_files.items():
         logging.info(f"Analyzing database: {db_type} ({db_path})")
-        combined_data_all[db_type] = _analyse_one_db(db_path)
+        combined_data_all[db_type] = _analyse_one_db(db_path, ppi_score_cutoff)
 
     if cache_path is not None:
         try:
@@ -401,95 +439,23 @@ def analyse_database(
 
 
 ### Functions to analyse model predictions ###
-
-def _read_predictions(model_file: str) -> pd.DataFrame:
-    """Read a predictions file (parquet preferred, csv fallback). Slim columns + tight dtypes."""
-    p = str(model_file)
-    if p.endswith(".parquet") or p.endswith(".pq"):
-        df = pd.read_parquet(p)
-    else:
-        df = pd.read_csv(p)
-    if (
-        "true_interaction" not in df.columns
-        or "predicted_interaction" not in df.columns
-        or "predicted_probability" not in df.columns
-    ):
-        raise ValueError(
-            f"File {model_file} missing required columns "
-            "(true_interaction / predicted_interaction / predicted_probability)."
-        )
-    # Cheaper dtypes — domain_a/b are short pfam ids, repeat heavily → category.
-    df["domain_a"] = df["domain_a"].astype("category")
-    df["domain_b"] = df["domain_b"].astype("category")
-    df["true_interaction"] = df["true_interaction"].astype(np.int8)
-    df["predicted_interaction"] = df["predicted_interaction"].astype(np.int8)
-    df["predicted_probability"] = df["predicted_probability"].astype(np.float32)
-    return df
-
-
-def process_models(prediction_file_list) -> tuple[pd.DataFrame, pd.DataFrame, list]:
-    """
-    Read per-model predictions, compute confusion-style metrics per model,
-    and build the combined wide score frame used by `calc_curves_roc_pr`.
-
-    Memory notes (vs previous version):
-      * Drops the unused `pred_frames` (was retaining a 2nd full copy).
-      * No `.copy()` after slicing — pandas slices are already independent.
-      * Iterative left-merge replaces `reduce(merge, how="outer")`, which
-        previously row-exploded when dropped pairs differed across models.
-      * Dtype-tight: int8 labels, float32 probabilities, category domain ids.
-    """
-    model_files = {}
-    for f in prediction_file_list:
-        model_name = os.path.basename(os.path.dirname(f))
-        model_files[model_name] = f
-
-    results = []
-    model_list = []
-    combined_df_score = None
-    key_cols = ["domain_a", "domain_b", "true_interaction"]
-
-    for model_name, model_file in model_files.items():
-        df = _read_predictions(model_file)
-
-        results.append(
-            calculate_metrics(df["true_interaction"], df["predicted_interaction"], model_name)
-        )
-
-        score_slim = df[["domain_a", "domain_b", "true_interaction", "predicted_probability"]].rename(
-            columns={"predicted_probability": model_name}
-        )
-        del df
-        gc.collect()
-
-        if combined_df_score is None:
-            combined_df_score = score_slim
-        else:
-            # Left-merge anchored on first model so the wide frame can't blow up.
-            # Models that disagree on (domain_a, domain_b, true_interaction) get NaNs,
-            # which `calc_curves_roc_pr` already masks out per column.
-            combined_df_score = combined_df_score.merge(
-                score_slim, on=key_cols, how="left"
-            )
-        del score_slim
-        gc.collect()
-        model_list.append(model_name)
-
-    if combined_df_score is None:
-        combined_df_score = pd.DataFrame(columns=key_cols)
-
-    return combined_df_score, pd.DataFrame(results), model_list
+#
+# Only the per-model JSON sidecars from eval_one.py are read here. The legacy
+# in-process path (`process_models` / `calc_curves_roc_pr` /
+# `calculate_metrics`, fed by eval_multiqc.py's `--predictions`) is gone: it
+# held every model's predictions at once, which is the 300 GB evaluation OOM
+# the scatter replaced, and nothing had called it since.
 
 
 def aggregate_per_model_metrics(per_model_files):
     """
-    B1 path: build the same return shape as `process_models` from per-model
-    JSON sidecars produced by `eval_one.py`. Avoids reading any prediction
-    rows in the reducer task.
+    Collect the per-model JSON sidecars produced by `eval_one.py`. Avoids
+    reading any prediction rows in the reducer task.
 
     Each JSON file: {model_name, samples, metrics_summary, roc:[[fp,tp]...],
                      pr:[[recall,precision]...], roc_auc, pr_ap,
-                     roc_auc_ci, pr_ap_ci, roc_auc_samples, pr_ap_samples}
+                     roc_auc_ci, pr_ap_ci, roc_auc_samples, pr_ap_samples,
+                     bootstrap_n, roc_auc_n_valid, pr_ap_n_valid, ranking_note}
     """
     metrics_rows = []
     metrics_aucap = {}
@@ -515,6 +481,14 @@ def aggregate_per_model_metrics(per_model_files):
             entry["ROC_AUC_SAMPLES"] = obj["roc_auc_samples"]
         if "pr_ap_samples" in obj:
             entry["PR_AP_SAMPLES"] = obj["pr_ap_samples"]
+        for src, dst in (
+            ("bootstrap_n", "BOOTSTRAP_N"),
+            ("roc_auc_n_valid", "ROC_AUC_N_VALID"),
+            ("pr_ap_n_valid", "PR_AP_N_VALID"),
+            ("ranking_note", "RANKING_NOTE"),
+        ):
+            if obj.get(src) is not None:
+                entry[dst] = obj[src]
         metrics_aucap[name] = entry
         roc_pairs = obj["roc"]
         pr_pairs = obj["pr"]
@@ -529,56 +503,3 @@ def aggregate_per_model_metrics(per_model_files):
         model_list.append(name)
     metrics_df = pd.DataFrame(metrics_rows)
     return metrics_aucap, roc_curves, pr_curves, metrics_df, model_list
-
-
-def calculate_metrics(y_true, y_pred, model_name) -> dict[str, object]:
-    TP = np.sum((y_true == 1) & (y_pred == 1))
-    TN = np.sum((y_true == 0) & (y_pred == 0))
-    FP = np.sum((y_true == 0) & (y_pred == 1))
-    FN = np.sum((y_true == 1) & (y_pred == 0))
-    total = len(y_true)
-    pos = TP + FN
-    neg = TN + FP
-    ACC = (TP + TN) / total if total else np.nan
-    TPR = TP / pos if pos else np.nan
-    TNR = TN / neg if neg else np.nan
-    Precision = TP / (TP + FP) if (TP + FP) else np.nan
-    BA = (TPR + TNR) / 2 if (not np.isnan(TPR) and not np.isnan(TNR)) else np.nan
-    F1 = 2 * Precision * TPR / (Precision + TPR) if (Precision + TPR) else np.nan
-
-    return {
-        "Model": model_name,
-        "Samples": total,
-        "TP": TP,
-        "TN": TN,
-        "FP": FP,
-        "FN": FN,
-        "Accuracy": ACC,
-        "Recall": TPR,
-        "Specificity": TNR,
-        "Precision": Precision,
-        "Balanced Accuracy": BA,
-        "F1 Score": F1,
-    }
-
-
-def calc_curves_roc_pr(df):
-    metrics, roc_curves, pr_curves = {}, {}, {}
-    # For columns starting from index 3 onward
-    score_columns = df.columns[3:]
-    for col in score_columns:
-        y_true = df["true_interaction"]
-        y_scores = df[col]
-        mask = ~(pd.isna(y_true) | pd.isna(y_scores))
-        y_true_clean = y_true[mask]
-        y_scores_clean = y_scores[mask]
-
-        fp, tp, _ = roc_curve(y_true_clean, y_scores_clean)
-        roc_auc = auc(fp, tp)
-        precision, recall, _ = precision_recall_curve(y_true_clean, y_scores_clean)
-        average_precision = average_precision_score(y_true_clean, y_scores_clean)
-
-        metrics[col] = {"ROC_AUC": roc_auc, "PR_AP": average_precision}
-        roc_curves[col] = (fp, tp)
-        pr_curves[col] = (recall, precision)
-    return metrics, roc_curves, pr_curves

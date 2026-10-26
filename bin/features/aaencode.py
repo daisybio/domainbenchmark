@@ -19,9 +19,14 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
         conn,
     )
 
-    domain_sequence_df["encoding"] = domain_sequence_df["sequence"].apply(aaencode)
     domain_sequence_df["domain_key"] = domain_sequence_df["domain_key"].astype(str)
     domain_sequence_df["instance_key"] = domain_sequence_df["instance_key"].astype(str)
+    # min_length=3: a shorter sequence forms no triad and would encode as the
+    # all-zero vector -- indistinguishable from data, so refuse it instead.
+    domain_sequence_df["encoding"] = [
+        aaencode(embeddings.clean_sequence(sequence, domain_key, instance_key, min_length=3))
+        for domain_key, instance_key, sequence in domain_sequence_df.itertuples(index=False)
+    ]
 
     for (
         domain_key,
@@ -47,7 +52,10 @@ ENCODE_MAP = {
 
 
 def aaencode(seq: str):
-    deepiii_encoded_sequence = deepiii_encode(seq.upper())
+    """Triad encoding of a sequence already passed through
+    `embeddings.clean_sequence`. Stripping there, rather than mapping unknown
+    residues to a gap here, means an X no longer breaks the triads around it."""
+    deepiii_encoded_sequence = deepiii_encode(seq)
     sequence_vector = get_triad_freq(deepiii_encoded_sequence)
     normalized_vector = normalize_triad_freq(sequence_vector)
     return normalized_vector
@@ -55,7 +63,7 @@ def aaencode(seq: str):
 
 def deepiii_encode(seq: str) -> str:
     """Encode sequence using DeepIII encoding."""
-    return "".join(ENCODE_MAP.get(char, " ") for char in seq)
+    return "".join(ENCODE_MAP[char] for char in seq)
 
 
 def get_triad_freq(seq: str, feature_number=FEATURE_NUMBER) -> dict:
@@ -67,8 +75,7 @@ def get_triad_freq(seq: str, feature_number=FEATURE_NUMBER) -> dict:
         for k in range(feature_number)
     }
     for i in range(len(seq) - 2):
-        if seq[i] != " " and seq[i + 1] != " " and seq[i + 2] != " ":
-            triad_freq[(int(seq[i]), int(seq[i + 1]), int(seq[i + 2]))] += 1
+        triad_freq[(int(seq[i]), int(seq[i + 1]), int(seq[i + 2]))] += 1
     return triad_freq
 
 

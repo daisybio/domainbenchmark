@@ -6,10 +6,10 @@ channels:
 dependencies:
   - python=3.12.2
   - numpy=2.2.6
-  - pandas=2.2.3
+  - pandas=3.0
   - h5py=3.14.0
   - scikit-learn=1.6.1
-  - cuml=26.02.00
+  - cuml=26.10.00
   - cuda-version=12.8
   - cudnn=9
   - pip=25.0

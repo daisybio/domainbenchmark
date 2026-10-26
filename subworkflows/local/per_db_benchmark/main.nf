@@ -26,15 +26,8 @@ include { RANDOM_FOREST                                 } from '../../../modules
 include { GRAPH_MODEL                                   } from '../../../modules/local/graph_model/main.nf'
 include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 include { VERIFY_EMBEDDINGS                             } from '../../../modules/local/verify_embeddings/main.nf'
+include { csvToList; runLabel                           } from '../utils_nfcore_domainbenchmark_pipeline'
 
-
-def csvToList(s) {
-    // Accept either a List or a comma-separated String. Filter out blanks
-    // and the sentinel 'none' so callers can disable a list cleanly with
-    // `--graph_models none` (or `--graph_models ''` once nf-schema allows it).
-    def items = s instanceof List ? s : (s ? s.tokenize(',') : [])
-    items*.trim().findAll { it && it.toLowerCase() != 'none' }
-}
 
 def embeddingsDir(features) {
     // The directory holding the published embedding files.
@@ -107,15 +100,6 @@ def publishedEmbeddingFile(dir, feature) {
     found
 }
 
-def runLabel(db_id, variant) {
-    // A database with an internal test set produces two runs
-    // (`random_balanced`, `random_realistic`); one with a single `test` keeps
-    // its bare name. The label identifies the run everywhere downstream --
-    // process tags, the evaluation directory, and the entry in the combined
-    // cross-database report.
-    variant == 'test' ? "${db_id}".toString() : "${db_id}_${variant}".toString()
-}
-
 workflow PER_DB_BENCHMARK {
 
     take:
@@ -127,7 +111,17 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
 
         def skip_features        = csvToList(params.skip)
-        def all_features         = csvToList(params.machine_learning_features)
+
+        def all_ml_models        = csvToList(params.machine_learning_models)
+        def ml_model_names       = all_ml_models.findAll { !skip_features.contains(it) }
+        def nn_enabled           = ml_model_names.contains('neural_network')
+        def rf_enabled           = ml_model_names.contains('random_forest')
+
+        // Features exist only to feed NN/RF. With neither enabled (a graph-only
+        // run) every FEATURE_EXTRACTION and VERIFY_EMBEDDINGS task would be
+        // wasted, and a samplesheet run without --embeddings would even fail in
+        // embeddingsDir() asking for a directory nothing reads.
+        def all_features         = (nn_enabled || rf_enabled) ? csvToList(params.machine_learning_features) : []
         def ml_features          = all_features.findAll { !skip_features.contains(it) }
 
         // Split the feature list by where the h5 comes from.
@@ -153,15 +147,23 @@ workflow PER_DB_BENCHMARK {
         def all_graph_models     = csvToList(params.graph_models)
         def graph_model_names    = all_graph_models.findAll { !skip_features.contains(it) }
 
-        def all_ml_models        = csvToList(params.machine_learning_models)
-        def ml_model_names       = all_ml_models.findAll { !skip_features.contains(it) }
-        def nn_enabled           = ml_model_names.contains('neural_network')
-        def rf_enabled           = ml_model_names.contains('random_forest')
-
         // One run per feature (singleton) plus one all-feature concatenation
         // run when more than one feature is available.
         def feature_combos = ml_features.collect { [it] }
         if (ml_features.size() >= 2) feature_combos << ml_features
+
+        // Every model scores every test split, so each (db, variant) receives
+        // exactly this many predictions. Known up front, which lets the
+        // EVALUATION group below emit as soon as its own models are done
+        // instead of waiting for the slowest model of every database.
+        def models_per_variant = feature_combos.size() * ((nn_enabled ? 1 : 0) + (rf_enabled ? 1 : 0)) +
+            graph_model_names.size()
+        if (models_per_variant == 0) {
+            error(
+                "Nothing to benchmark: no ML model, feature or graph model is left after " +
+                "--machine_learning_models / --graph_models / --skip."
+            )
+        }
 
         def ml_config = file(params.modeljson) / 'NeuralNetwork.json'
         def rf_config = file(params.modeljson) / 'RandomForest.json'
@@ -327,7 +329,9 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         per_model_jsons_ch = EVAL_ONE.out.metrics
             .map { meta, j -> tuple("${meta.db}::${meta.variant}".toString(), j) }
-            .groupTuple()
+            // `remainder: true` so a group a failed-and-ignored task left short
+            // still reaches EVALUATION rather than vanishing.
+            .groupTuple(size: models_per_variant, remainder: true)
             // groupTuple() emits in task-completion order. That list becomes
             // eval_multiqc.py's --per_model_metrics argument order, and MultiQC
             // writes its JSON in the order it was fed -- so without this sort
@@ -352,15 +356,17 @@ workflow PER_DB_BENCHMARK {
                 }
             }
 
+        // `remainder: true` and an explicit error: a plain join dropped a
+        // (db, variant) that received no predictions without a word, and with
+        // none at all COMBINE_EVAL never ran and the run "succeeded" with no
+        // report.
         evaluation_input_ch = db_variant_ch
-            .join(per_model_jsons_ch)
-            .map { _key, meta, db_path, jsons ->
-                tuple(
-                    meta,
-                    db_path,
-                    jsons,
-                    "${workflow.projectDir}/${params.outdir}/${params.old_report}"
-                )
+            .join(per_model_jsons_ch, remainder: true)
+            .map { key, meta, db_path, jsons ->
+                if (meta == null || jsons == null) {
+                    error("No predictions reached evaluation for ${key}: every model for this test split failed or was skipped.")
+                }
+                tuple(meta, db_path, jsons)
             }
         EVALUATION(evaluation_input_ch)
 

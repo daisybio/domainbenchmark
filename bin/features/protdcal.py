@@ -8,6 +8,30 @@ import sqlite3
 from features import embeddings
 
 
+# The instance pairs `ddi_split_membership` assigns to this split -- the same
+# pairs DDI_EXTRACTION's INSTANCE_QUERY writes to `<split>_instances.csv`, which
+# is all the ML loader ever looks up. Each side's Pfam accession comes from its
+# own `domain_protein_map` row, so the key is right whichever way round the
+# membership table sorted the two instance ids. This used to be the full
+# cross-product of every instance of domain_a with every instance of domain_b,
+# per DDI: quadratic in family size, and almost all of it never read.
+PAIR_QUERY = f"""
+    SELECT DISTINCT
+           {embeddings.domain_key_sql("d1")} AS domain_1_key,
+           {embeddings.instance_key_sql("dpm_1")} AS instance_1_key,
+           dpm_1.domain_sequence AS sequence_1,
+           {embeddings.domain_key_sql("d2")} AS domain_2_key,
+           {embeddings.instance_key_sql("dpm_2")} AS instance_2_key,
+           dpm_2.domain_sequence AS sequence_2
+    FROM ddi_split_membership AS m
+    JOIN domain_protein_map AS dpm_1 ON dpm_1.instance_id = m.instance_id_a
+    JOIN domain_protein_map AS dpm_2 ON dpm_2.instance_id = m.instance_id_b
+    JOIN domain AS d1 ON dpm_1.domain_id = d1.id
+    JOIN domain AS d2 ON dpm_2.domain_id = d2.id
+    ORDER BY domain_1_key, instance_1_key, domain_2_key, instance_2_key
+"""
+
+
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
     # Deterministic encoder: `seed` is part of the encoder ABI so that a
     # sampling encoder cannot be added without one. Unused here.
@@ -20,23 +44,29 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
     # names every other encoder writes and the `domain_1`/`domain_2` columns of
     # DDI_EXTRACTION's CSVs. Pfam accessions carry no "_", so the joined key
     # stays unambiguous. See bin/features/embeddings.py for why not `domain.id`.
-    domain_sequence_df = pd.read_sql(
-        f"""
-                SELECT {embeddings.domain_key_sql("d1")} AS domain_1_key,
-                       {embeddings.instance_key_sql("dpm_1")} AS instance_1_key,
-                       UPPER(dpm_1.domain_sequence) AS sequence_1,
-                       {embeddings.domain_key_sql("d2")} AS domain_2_key,
-                       {embeddings.instance_key_sql("dpm_2")} AS instance_2_key,
-                       UPPER(dpm_2.domain_sequence) AS sequence_2
-                FROM domain_domain_interaction
-                JOIN domain_protein_map AS dpm_1 ON domain_id_a = dpm_1.domain_id
-                JOIN domain_protein_map AS dpm_2 ON domain_id_b = dpm_2.domain_id
-                JOIN domain AS d1 ON domain_id_a = d1.id
-                JOIN domain AS d2 ON domain_id_b = d2.id;
-            """,
-        conn,
-    )
+    has_membership = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ddi_split_membership'"
+    ).fetchone()
+    if not has_membership:
+        # The loader cannot use an interaction encoding without
+        # `<split>_instances.csv` either, so there is nothing to fall back to.
+        raise ValueError(
+            "protdcal needs ddi_split_membership: it encodes the instance pairs "
+            "the split assigns, and this database names none."
+        )
 
+    pair_df = pd.read_sql(PAIR_QUERY, conn)
+
+    # Per-instance means are reused by every pair the instance appears in.
+    single_means = {}
+
+    def single_mean(domain_key, instance_key, sequence):
+        if instance_key not in single_means:
+            cleaned = embeddings.clean_sequence(sequence, domain_key, instance_key)
+            single_means[instance_key] = (cleaned, e_state_mean(cleaned))
+        return single_means[instance_key]
+
+    written = set()
     for (
         domain_key_1,
         instance_1,
@@ -44,109 +74,91 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
         domain_key_2,
         instance_2,
         seq_2,
-    ) in domain_sequence_df.itertuples(index=False):
-        encoding = protdcal_encode(seq_1, seq_2)
+    ) in pair_df.itertuples(index=False):
+        domain_key_1, instance_1 = str(domain_key_1), str(instance_1)
+        domain_key_2, instance_2 = str(domain_key_2), str(instance_2)
+        clean_1, mean_1 = single_mean(domain_key_1, instance_1, seq_1)
+        clean_2, mean_2 = single_mean(domain_key_2, instance_2, seq_2)
+        encoding = protdcal_combine(clean_1, clean_2, mean_1, mean_2)
 
-        def write_to_h5(pair_key, instance_key):
-            # create a group for each domain pair and put the instance pair
-            # underneath it
-            if pair_key not in out_file:
-                pair_group = out_file.create_group(pair_key)
-            else:
-                pair_group = out_file[pair_key]
+        # Both directions: the loader looks the pair up in whichever
+        # orientation the DDI CSV names it. A homodimer pair can produce the
+        # same key twice -- the vector is symmetric, so the first write stands.
+        for key in (
+            (f"{domain_key_1}_{domain_key_2}", f"{instance_1}_{instance_2}"),
+            (f"{domain_key_2}_{domain_key_1}", f"{instance_2}_{instance_1}"),
+        ):
+            if key not in written:
+                embeddings.write_instance(out_file, *key, encoding)
+                written.add(key)
 
-            if instance_key in pair_group:
-                print(f"Warning: Duplicate entry for {instance_key} in {pair_key}.")
-            else:
-                pair_group[instance_key] = encoding
-
-        # write both directions
-        write_to_h5(f"{domain_key_1}_{domain_key_2}", f"{instance_1}_{instance_2}")
-        write_to_h5(f"{domain_key_2}_{domain_key_1}", f"{instance_2}_{instance_1}")
+    print(f"protdcal: wrote {len(written)} instance-pair entries from {len(pair_df)} membership pairs")
 
 
 protdcal_table = pd.read_csv(Path(__file__).parent / "protdcal_table.csv", index_col=0)
+_PROPERTIES = protdcal_table.to_numpy(dtype=float)
+_ROW_OF = {aa: row for row, aa in enumerate(protdcal_table.index)}
 
 
-def protdcal_encode(seq1, seq2):
-    seq1 = seq1.replace("U", "C")
-    seq2 = seq2.replace("U", "C")
+def protdcal_combine(seq1: str, seq2: str, mean_1: np.ndarray, mean_2: np.ndarray) -> np.ndarray:
+    """Interaction vector for one pair of cleaned sequences.
 
-    seq_list = [seq1, seq2, seq1 + seq2, seq2 + seq1]
-
-    norm_dict = generate_matrix(seq_list, protdcal_table)
-
-    average_matrix = np.zeros((4, len(protdcal_table.columns)), dtype=float)
-
-    for idx, matrix in enumerate(norm_dict):
-        if matrix is None or not matrix.size:
-            print(f"No features found for sequence {seq1} or {seq2}. Skipping pair.")
-            return None
-        average_matrix[idx] = np.mean(matrix, axis=0)
-
-    # Now do the aggregation as described in the paper
-    combined_features = (
-        average_matrix[2]
-        + average_matrix[3]
-        - 2 * average_matrix[0]
-        - 2 * average_matrix[1]
+    The four averages -- each sequence alone and both concatenations -- are
+    combined as described in the paper:
+    `avg(s1+s2) + avg(s2+s1) - 2 avg(s1) - 2 avg(s2)`.
+    """
+    return (
+        e_state_mean(seq1 + seq2)
+        + e_state_mean(seq2 + seq1)
+        - 2 * mean_1
+        - 2 * mean_2
     )
-    return combined_features
 
 
-def generate_matrix(seq_list, protdcal: pd.DataFrame) -> dict[str, np.ndarray]:
-    """Generate input matrix for PROTDCAL features for a set of sequences."""
-    normalized_matrix_list = []
-
-    for seq in seq_list:
-        # Generate the PROTDCAL feature matrix for the sequence
-        matrix = generate_protdcal_feature_matrix(seq, protdcal)
-        if not matrix.size:
-            print(f"No features found for sequence {id}.")
-            continue
-        # Normalize the feature matrix
-        normalized_matrix = normalize_protcal_matrix(matrix)
-        normalized_matrix_list.append(normalized_matrix)
-
-    return normalized_matrix_list
+def e_state_mean(sequence: str) -> np.ndarray:
+    """Mean over residues of the E-state-normalised property matrix."""
+    return e_state(property_matrix(sequence)).mean(axis=0)
 
 
-def generate_protdcal_feature_matrix(
-    sequence: str, protdcal: pd.DataFrame
-) -> np.ndarray:
-    """Generate PROTDCAL matrix for a sequence."""
-    slist = list(sequence)
-    matrix = np.zeros((len(slist), len(protdcal.columns)), dtype=float)
-    for i in range(len(slist)):
-        aa = slist[i]
-        if aa not in protdcal.index:
-            print(f"Amino acid '{aa}' not found in protdcal table.")
-        matrix[i] = protdcal.loc[aa].values
-    return matrix
+def property_matrix(sequence: str) -> np.ndarray:
+    """`(len(sequence), n_properties)` ProtDCal property matrix.
 
-
-def normalize_protdcal_row(feature_list: list[float]) -> list[float]:
+    `sequence` must already be cleaned (`embeddings.clean_sequence`): the
+    table holds the 20 standard residues only.
     """
-    NORMALIZING PROTDCAL FEATURES USING E-State operator
-    D_es = D_i - Σ_j≠i (D_j - D_i) / (j - i)^2
+    return _PROPERTIES[[_ROW_OF[aa] for aa in sequence]]
+
+
+def e_state(matrix: np.ndarray) -> np.ndarray:
+    """E-state operator along the residue axis, independently per property.
+
+        E_i = D_i - sum_{j != i} (D_j - D_i) / (j - i)^2
+
+    i and j are *residue positions*: each residue's property value is
+    perturbed by every other residue's, weighted by inverse squared sequence
+    distance. It used to run across the 16 property columns of one residue
+    instead, mixing quantities in different units (a free energy minus a
+    hydrophobicity) and never looking at a neighbour.
+
+    With W the Toeplitz matrix of 1/(j-i)^2 (zero diagonal) and w its row sums,
+    E = D - W D + w * D. W D is a convolution with that kernel, which keeps
+    memory linear in sequence length instead of materialising W.
+
+    Under the residue mean taken afterwards the correction cancels exactly --
+    W is symmetric, so sum_i sum_j W_ij (D_j - D_i) = 0 -- and the mean of E
+    equals the mean of D up to rounding. The operator is kept so the matrix is
+    the one the method defines, should another aggregation be added.
     """
-    e_state = []
-    num = len(feature_list)
-    for i in range(num):
-        feature_value = feature_list[i]
-        sum_ = 0.0
-        for j in range(num):
-            if i != j:
-                dij = j - i
-                sum_ += (feature_list[j] - feature_value) / (dij**2)
-        e_state.append(feature_value - sum_)
-    return e_state
-
-
-def normalize_protcal_matrix(feature_matrix: np.ndarray) -> np.ndarray:
-    """Normalize each row of the feature matrix using the E-State operator."""
-    normalized_matrix = np.zeros_like(feature_matrix)
-    for i, row in enumerate(feature_matrix):
-        normalized_row = normalize_protdcal_row(row)
-        normalized_matrix[i] = normalized_row
-    return normalized_matrix
+    n = len(matrix)
+    offsets = np.arange(-(n - 1), n, dtype=float)
+    kernel = np.zeros_like(offsets)
+    nonzero = offsets != 0
+    kernel[nonzero] = 1.0 / offsets[nonzero] ** 2
+    # Full convolution, then the window where output index i lines up with
+    # (W @ column)[i] = sum_j column[j] * kernel[(i - j) + n - 1].
+    window = slice(n - 1, 2 * n - 1)
+    weighted = np.stack(
+        [np.convolve(column, kernel)[window] for column in matrix.T], axis=1
+    )
+    weight_sum = np.convolve(np.ones(n), kernel)[window]
+    return matrix - weighted + weight_sum[:, None] * matrix

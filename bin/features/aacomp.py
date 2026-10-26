@@ -8,13 +8,12 @@ AA = "ACDEFGHIKLMNPQRSTVWY"
 
 
 def get_aa_comp(seq: str) -> list[float]:
-    """Calculate amino acid composition"""
+    """Amino acid composition of a sequence already passed through
+    `embeddings.clean_sequence` (standard residues only, non-empty)."""
     aa_count = {aa: 0 for aa in AA}
     for aa in seq:
-        if aa in aa_count:
-            aa_count[aa] += 1
-    total = sum(aa_count.values())
-    return [aa_count[aa] / total for aa in AA]
+        aa_count[aa] += 1
+    return [aa_count[aa] / len(seq) for aa in AA]
 
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
@@ -31,9 +30,12 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
         conn,
     )
 
-    domain_sequence_df["aacomp"] = domain_sequence_df["sequence"].apply(get_aa_comp)
     domain_sequence_df["domain_key"] = domain_sequence_df["domain_key"].astype(str)
     domain_sequence_df["instance_key"] = domain_sequence_df["instance_key"].astype(str)
+    domain_sequence_df["aacomp"] = [
+        get_aa_comp(embeddings.clean_sequence(sequence, domain_key, instance_key))
+        for domain_key, instance_key, sequence in domain_sequence_df.itertuples(index=False)
+    ]
 
     for (
         domain_key,

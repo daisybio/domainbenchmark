@@ -19,8 +19,9 @@ process EVAL_ONE {
     script:
         // `<split>_sources.csv` carries each test DDI's comma-joined provenance
         // list, which is what turns the predictions into per-source accuracy.
-        // Passed as a path, not a flag: a database whose splitter predates the
-        // `source` column simply has no such file and the block is skipped.
+        // The block is dropped only when meta.split is null (no test split to
+        // name). Otherwise DDI_EXTRACTION wrote the file for that split, so
+        // eval_one.py treats a missing one as a staging error and fails.
         def sources_arg = meta.split ? "--sources ${ddi_dir}/${meta.split}_sources.csv" : ''
         """
         mkdir -p per_model
@@ -49,7 +50,7 @@ process EVALUATION {
     container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
 
     input:
-        tuple val(meta), path(database), path(per_model_jsons), val(old_report)
+        tuple val(meta), path(database), path(per_model_jsons)
 
     output:
         tuple val(meta), path('evaluation/'), emit: report
@@ -57,16 +58,17 @@ process EVALUATION {
     script:
         // Sorted, not as-received: the argument order reaches MultiQC's JSON
         // output, so it has to be a function of the file names and nothing else.
-        def jsons_list     = (per_model_jsons instanceof java.util.List ? per_model_jsons : [per_model_jsons])
+        def jsons_list = (per_model_jsons instanceof java.util.List ? per_model_jsons : [per_model_jsons])
             .collect { it.toString() }.toSorted().join(' ')
-        def old_report_arg = old_report ? "--report ${old_report}" : ''
-        // Not strict at this stage -- see write_multiqc_config() in
-        // bin/eval_multiqc.py. Passed anyway so a merged --report keeps the same
-        // dataset order the combined report will use.
-        def mqc_order_arg  = params.mqc_order ? "--mqc_order '${params.mqc_order}'" : ''
         // One report per (database, test variant): the train and validation
         // splits are shared, only the test set differs.
-        def test_split     = meta.split ?: 'test'
+        def test_split = meta.split ?: 'test'
+        // No --mqc_order: a single-dataset report has nothing to order, and
+        // passing it anyway put it in this task's hash, so editing the order
+        // reran every EVALUATION. COMBINE_EVAL is where it applies.
+        //
+        // --db_id / --variant travel into source_accuracy.json so COMBINE_EVAL
+        // can pool by variant without parsing the run label back apart.
         """
         mkdir -p evaluation
 
@@ -74,10 +76,11 @@ process EVALUATION {
             --database ${database} \\
             --per_model_metrics ${jsons_list} \\
             --db_name ${meta.run_label ?: meta.id} \\
+            --db_id ${meta.db ?: meta.id} \\
+            --variant ${meta.variant ?: 'test'} \\
             --test_split ${test_split} \\
-            --out_dir evaluation/ \\
-            ${mqc_order_arg} \\
-            ${old_report_arg}
+            --ppi_score_cutoff ${params.ppi_score_cutoff} \\
+            --out_dir evaluation/
         """
 
     stub:

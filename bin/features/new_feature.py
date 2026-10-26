@@ -40,8 +40,12 @@ copies of one family has two rows that would collide on protein_id. Use
 `embeddings.INSTANCE_KEY_SQL` in the SELECT and `embeddings.write_instance()`
 to write, as every shipped encoder does. Never parse an instance key apart.
 
-See aacomp.py for a minimal example, embeddings.py for pre-computed
-embedding extraction with helper utilities.
+A sequence-derived encoder passes `domain_sequence` through
+`embeddings.clean_sequence()` first: it strips non-standard residues and raises
+on a NULL, empty or too-short sequence, so every encoder fails the same way.
+
+See aacomp.py for a minimal example, embeddings.py for the key SQL,
+`write_instance()` and `clean_sequence()`.
 """
 
 import h5py

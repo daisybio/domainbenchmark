@@ -2,93 +2,80 @@
 """Random Forest DDI prediction model (cuML GPU-accelerated)."""
 
 import gc
-import sys
 import time
 
 import numpy as np
 import pickle
-from sklearn.metrics import average_precision_score
 from sklearn.model_selection import ParameterSampler
 
-from machine_learning import DDIModelTrainer, load_embedding_data
+from machine_learning import (
+    DDIModelTrainer,
+    clear_load_cache,
+    ddi_row_groups,
+    load_embedding_data,
+    probe_cuda,
+)
 
 
-# Exit code 140 sits in conf/base.config's retry list (errorStrategy retries on
-# [137, 139, 140, 143, 247]). We use it to flag transient CUDA failures so
-# Nextflow reschedules onto a different GPU node instead of giving up.
-_CUDA_RETRY_EXIT_CODE = 140
-
-
-def _probe_cuda(allow_cpu: bool) -> bool:
-    """Run a 1-element GPU op to surface broken CUDA init before grid search.
-
-    Without this, a node-local CUDA glitch (cudaErrorOperatingSystem from
-    stale --nv bind / cgroup race) makes all GridSearchCV fits fail identically
-    and sklearn swallows the exception behind "All N fits failed". We catch it
-    here and exit 140 so the SLURM retry policy moves us to another node.
-
-    Returns True when the GPU is usable. With `allow_cpu` (set by
-    `--allow_cpu`, i.e. `params.allow_cpu_ml`) a failed probe returns False so
-    the caller trains with scikit-learn on the CPU instead — for GPU-less
-    machines like CI runners and laptops. Without it a failed probe still exits
-    140, so a broken GPU node is retried rather than silently downgraded.
-    """
-    try:
-        import cupy as cp
-        _ = cp.asarray([1.0], dtype=cp.float32) + 1.0
-        cp.cuda.runtime.deviceSynchronize()
-        return True
-    except Exception as exc:  # noqa: BLE001 — any CUDA-init failure counts
-        reason = f"{type(exc).__name__}: {exc}"
-        if allow_cpu:
-            print(
-                f"[random_forest] CUDA smoke test failed ({reason}). "
-                "--allow_cpu is set, training with scikit-learn on the CPU.",
-                file=sys.stderr,
-            )
-            return False
-        print(
-            f"[random_forest] CUDA smoke test failed ({reason}). "
-            "Exiting with retry code so Nextflow reschedules on a different GPU node.",
-            file=sys.stderr,
-        )
-        sys.exit(_CUDA_RETRY_EXIT_CODE)
+def _cupy_smoke_test():
+    """The RF's half of `machine_learning.probe_cuda`: one op through cupy."""
+    import cupy as cp
+    _ = cp.asarray([1.0], dtype=cp.float32) + 1.0
+    cp.cuda.runtime.deviceSynchronize()
 
 
 # Three ways to address the heavy positive-class imbalance in the training set.
 # "none"        — train on raw data, no correction.
-# "downsample"  — load_embedding_data(balance_classes=True): equal pos/neg by
-#                 resampling; preserves the original pipeline behaviour.
-# "oversample"  — replicate minority-class rows to match majority size; keeps
-#                 all original data and is equivalent to balanced integer
-#                 sample weights. cuML RandomForestClassifier.fit() does not
+# "downsample"  — load_embedding_data(balance_classes=True): equally many
+#                 positive and negative DDIs, drawn per canonical DDI.
+# "oversample"  — replicate minority-class DDIs (each with all of its rows) to
+#                 match the majority's DDI count; keeps all original data. The
+#                 same unit as "downsample", so the two differ only in which
+#                 side moves. cuML RandomForestClassifier.fit() does not
 #                 accept a sample_weight kwarg, so we materialise the weights
 #                 as duplicated rows instead.
 BALANCE_METHODS = ("none", "downsample", "oversample")
 
 
-def _oversample_minority(x, y, seed):
-    """Replicate minority-class rows so class counts match. Returns (x, y)."""
+def _oversample_index(y, groups, seed):
+    """Row index that replicates minority-class DDIs until DDI counts match.
+
+    `groups` is `ddi_row_groups` of the rows: both orientations and every
+    instance pair of one DDI share an id, and a drawn DDI brings all of them.
+    It used to draw individual rows, which balanced rows while the downsample
+    path balanced (oriented) pairs, so the two methods the grid compares were
+    not even correcting the same imbalance.
+
+    Returns an index rather than arrays, so the caller makes the one copy
+    `x[index]`. The old form built `[x, x[pick]]`, concatenated it and then
+    permuted that -- three full-size arrays alive at the peak.
+    """
     rng = np.random.default_rng(seed)
-    y_arr = np.asarray(y).astype(np.int32)
-    classes, counts = np.unique(y_arr, return_counts=True)
+    y = np.asarray(y).astype(np.int32)
+    groups = np.asarray(groups, dtype=np.int64)
+    n_groups = int(groups.max()) + 1
+    group_label = np.empty(n_groups, dtype=np.int32)
+    group_label[groups] = y     # constant within a DDI
+    classes, counts = np.unique(group_label, return_counts=True)
     if len(classes) < 2:
-        return x, y_arr
-    majority_count = counts.max()
-    parts_x = [x]
-    parts_y = [y_arr]
+        return np.arange(len(y))
+
+    # Rows of each group, contiguous: rows_by_group[start[g]:start[g] + size[g]].
+    rows_by_group = np.argsort(groups, kind="stable")
+    size = np.bincount(groups, minlength=n_groups)
+    start = np.concatenate([[0], np.cumsum(size)[:-1]])
+
+    extra = [np.arange(len(y))]
     for cls, cnt in zip(classes, counts):
-        if cnt >= majority_count:
+        need = counts.max() - cnt
+        if need == 0:
             continue
-        idx = np.where(y_arr == cls)[0]
-        need = majority_count - cnt
-        pick = rng.choice(idx, size=need, replace=True)
-        parts_x.append(x[pick])
-        parts_y.append(y_arr[pick])
-    x_out = np.concatenate(parts_x, axis=0)
-    y_out = np.concatenate(parts_y, axis=0)
-    perm = rng.permutation(len(y_out))
-    return x_out[perm], y_out[perm]
+        pick = rng.choice(np.flatnonzero(group_label == cls), size=need, replace=True)
+        lengths = size[pick]
+        offsets = np.arange(lengths.sum()) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+        extra.append(rows_by_group[np.repeat(start[pick], lengths) + offsets])
+    index = np.concatenate(extra)
+    return index[rng.permutation(len(index))]
 
 
 def _load_train_with_balance(args, balance_method: str, seed: int):
@@ -96,16 +83,21 @@ def _load_train_with_balance(args, balance_method: str, seed: int):
     if balance_method not in BALANCE_METHODS:
         raise ValueError(f"Unknown balance_method: {balance_method}")
     downsample = balance_method == "downsample"
-    x_train, y_train = load_embedding_data(
+    x_train, y_train, ddi_pairs = load_embedding_data(
         args.features_path,
         args.features,
         args.ddi_path,
         "train",
         balance_classes=downsample,
+        return_ddi_pairs=True,
         seed=seed,
     )
     if balance_method == "oversample":
-        x_train, y_train = _oversample_minority(x_train, y_train, seed)
+        index = _oversample_index(y_train, ddi_row_groups(ddi_pairs), seed)
+        # Drop the cache's reference too, or the un-oversampled block stays
+        # alive next to the oversampled one for the whole search.
+        clear_load_cache()
+        x_train, y_train = x_train[index], y_train[index]
     return x_train, y_train
 
 
@@ -117,7 +109,7 @@ class RandomForestTrainer(DDIModelTrainer):
     _use_gpu = True
 
     def _pre_train_hook(self, args):
-        self._use_gpu = _probe_cuda(args.allow_cpu)
+        self._use_gpu = probe_cuda(args.allow_cpu, "random_forest", _cupy_smoke_test)
 
     def _rf_class(self):
         """cuML's RandomForestClassifier, or scikit-learn's on the CPU path.
@@ -146,9 +138,8 @@ class RandomForestTrainer(DDIModelTrainer):
         # summation order and the last bits of each probability depend on thread
         # scheduling. That moved the MCC-tuned decision threshold between runs
         # (visibly, in model_parameters.json) without flipping any prediction,
-        # and the same wobble reaches the average_precision scores
-        # RandomizedSearchCV ranks candidates by -- where it *could* flip which
-        # model wins. The CPU path only runs under --allow_cpu (CI, laptops);
+        # and the same wobble reaches the validation AP the search ranks
+        # candidates by -- where it *could* flip which model wins. The CPU path only runs under --allow_cpu (CI, laptops);
         # production uses cuML, where n_jobs does not apply.
         return {"n_streams": 1} if self._use_gpu else {"n_jobs": 1}
 
@@ -175,9 +166,10 @@ class RandomForestTrainer(DDIModelTrainer):
         # Chunked, because cuML copies the whole input onto the device:
         # external_test's `test` split is 1385692 x 9174 float32 = 50.8 GB
         # against a 44 GB A40, so the un-chunked call cannot run at all. A
-        # single chunk is 2.4 GB. Inputs at or below one chunk take the old
-        # path untouched, dtype included -- the CPU backend returns float64 and
-        # the tuned MCC threshold is sensitive to that.
+        # single chunk is 2.4 GB. Output dtype is the backend's (float64 from
+        # scikit-learn, float32 from cuML); it makes no difference downstream,
+        # because `_aggregate_to_ddi_level` casts every score to float32 before
+        # the DDI mean, the threshold tuning and the parquet see it.
         head = classifier.predict_proba(
             np.asarray(x[:self._PREDICT_CHUNK_ROWS], dtype=np.float32)
         )[:, 1]
@@ -195,8 +187,8 @@ class RandomForestTrainer(DDIModelTrainer):
             )[:, 1]
         return out
 
-    def _search(self, hyperparameters, n_iter, load_train, x_opt, y_opt, config, num_features):
-        """Explicit randomised search, equivalent to the RandomizedSearchCV it replaced.
+    def _search(self, hyperparameters, n_iter, load_train, x_opt, y_opt, opt_scorer, config, num_features):
+        """Explicit randomised search over one train/validation split.
 
         The old form was `RandomizedSearchCV(..., n_jobs=1, cv=PredefinedSplit,
         refit=False)` over `np.concatenate([x_train, x_opt])`. With exactly one
@@ -217,23 +209,24 @@ class RandomForestTrainer(DDIModelTrainer):
           `ParameterSampler(param_distributions, n_iter, random_state=random_state)`.
           Constructing the same sampler with the same int seed yields the same
           candidates in the same order.
-        * `scoring="average_precision"` resolves to
-          `average_precision_score(y_test, predict_proba(X_test)[:, 1])`; neither
-          this estimator nor scikit-learn's own forest has `decision_function`.
+        * The score is `opt_scorer`: AP over DDIs after `_aggregate_to_ddi_level`,
+          not the row-level `scoring="average_precision"` of the original. That
+          one is a deliberate change, not part of the equivalence.
         * `best_index_ = rank_test_score.argmin()` with ranks from
           `rankdata(-score, method="min")` selects the *first* candidate holding
           the maximum. `if score > best_score` does the same.
         * `best_score_` is the mean over folds, i.e. the single fold's score.
 
         `error_score="raise"` has no counterpart because there is no wrapper to
-        swallow the exception: a failing fit propagates out of this loop.
+        swallow the exception: a failing fit propagates out of this loop. A NaN
+        score never wins (`nan > x` is False); if nothing scores finite the
+        result is `(None, -inf)` and `DDIModelTrainer.train` raises.
         """
         rf_class = self._rf_class()
         x_train, y_train = load_train()
         x_train = np.asarray(x_train, dtype=np.float32)
         y_train = np.asarray(y_train, dtype=np.int32)
         x_opt = np.asarray(x_opt, dtype=np.float32)
-        y_opt = np.asarray(y_opt, dtype=np.int32)
 
         best_params, best_score = None, -np.inf
         candidates = list(
@@ -245,13 +238,11 @@ class RandomForestTrainer(DDIModelTrainer):
                 **params, random_state=self._seed, **self._rf_extra_kwargs()
             )
             classifier.fit(x_train, y_train)
-            score = average_precision_score(
-                y_opt, self._predict_proba(classifier, x_opt)
-            )
+            score = opt_scorer.score(self._predict_proba(classifier, x_opt))
             print(
                 f"[CV] {i}/{len(candidates)} "
                 + ", ".join(f"{k}={params[k]}" for k in sorted(params))
-                + f"; AP={score:.6f}; total time={time.monotonic() - started:6.1f}s",
+                + f"; DDI-AP={score:.6f}; total time={time.monotonic() - started:6.1f}s",
                 flush=True,
             )
             if score > best_score:
@@ -263,7 +254,7 @@ class RandomForestTrainer(DDIModelTrainer):
         gc.collect()
         return best_params, best_score
 
-    def _refit(self, best_params, best_balance, args, config, num_features):
+    def _refit(self, best_params, best_balance, args, config, num_features, load_opt):
         rf_class = self._rf_class()
         x_train, y_train = self._load_train_data(
             args, best_balance, args.seed

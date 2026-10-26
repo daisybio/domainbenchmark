@@ -36,9 +36,12 @@
 
     Only the *entry* script's declarations count: a `params { }` block inside an
     included script is ignored, so a pipeline embedding this one would have to
-    repeat these. The nf-core boilerplate flags are deliberately absent -- they
-    are used bare, and `help` is a string-or-boolean union a type here would
-    break.
+    repeat these.
+
+    The nf-core boolean flags are declared too. They are usually passed bare,
+    but `--validate_params false` arrived as the String "false" -- truthy in
+    Groovy -- so it left validation *on*. `help` stays undeclared: it is a
+    string-or-boolean union a type here would break.
 ----------------------------------------------------------------------------------------
 */
 params {
@@ -46,6 +49,12 @@ params {
     ppi_score_cutoff: Integer
     min_embedding_coverage: Float
     allow_cpu_ml: Boolean
+    validate_params: Boolean
+    monochrome_logs: Boolean
+    plaintext_email: Boolean
+    help_full: Boolean
+    show_hidden: Boolean
+    version: Boolean
 }
 
 include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_domainbenchmark_pipeline'
@@ -113,7 +122,9 @@ workflow {
         params.plaintext_email,
         params.outdir,
         params.monochrome_logs,
-        DAISYBIO_DOMAINBENCHMARK.out.combined
+        // The report file, not COMBINE_EVAL's (meta, dir) tuple: completionEmail
+        // attaches whatever it is handed and turned the tuple into a bogus path.
+        DAISYBIO_DOMAINBENCHMARK.out.combined.map { _meta, dir -> dir / 'ddi_report.html' }
     )
 }
 

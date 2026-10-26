@@ -12,6 +12,7 @@ import itertools
 import json
 import math
 import random
+import sys
 
 import h5py
 import numpy as np
@@ -19,7 +20,7 @@ import pandas as pd
 from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from pathlib import Path
-from sklearn.metrics import matthews_corrcoef
+from sklearn.metrics import average_precision_score, matthews_corrcoef
 from sklearn.model_selection import PredefinedSplit
 from typing import List
 
@@ -32,9 +33,15 @@ interaction_encodings = ["protdcal"]
 # balance) variant of train/validation/test simultaneously, which on
 # ESM/ProtT5 features stacked to many GB and dominated the GPU process RAM).
 #
-# Now: keep at most one entry. Outer-loop callers either reload (cheap with
-# h5py memmap) or get a hit when the SAME key repeats inside one inner loop
-# (e.g. final refit immediately after the same grid iter).
+# Now: keep at most one entry, and drop it on a *miss* before loading the
+# replacement -- evicting only after the insert held the old and the new array
+# at once, e.g. two training blocks across consecutive balance methods. A hit
+# needs the SAME key twice in a row (the validation split reloaded for
+# threshold tuning right after the NN refit used it for early stopping).
+#
+# The cache holds a reference, so `del x` in a caller frees nothing while the
+# entry lives. A caller that wants the memory back must `clear_load_cache()`
+# too -- see `DDIModelTrainer._search`.
 _LOAD_CACHE_MAX = 1
 _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 
@@ -42,6 +49,130 @@ _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 def clear_load_cache() -> None:
     """Drop every cached embedding array. Call between training phases."""
     _load_cache.clear()
+
+
+# Exit code 140 sits in conf/base.config's retry list (errorStrategy retries on
+# [137, 139, 140, 143, 247]). We use it to flag transient CUDA failures so
+# Nextflow reschedules onto a different GPU node instead of giving up.
+CUDA_RETRY_EXIT_CODE = 140
+
+
+def probe_cuda(allow_cpu: bool, model_name: str, smoke_test) -> bool:
+    """Run a 1-element GPU op to surface broken CUDA init before grid search.
+
+    Without this, a node-local CUDA glitch (cudaErrorOperatingSystem from
+    stale --nv bind / cgroup race) makes every candidate fit fail identically
+    -- or, for the NN, used to make it fall back to the CPU without a word and
+    spend the walltime on a GPU node doing CPU work. We catch it here and exit
+    140 so the SLURM retry policy moves us to another node.
+
+    `smoke_test` is the backend's own minimal op (cupy for cuML, torch for the
+    NN): it has to exercise the library that will actually train.
+
+    Returns True when the GPU is usable. With `allow_cpu` (set by
+    `--allow_cpu`, i.e. `params.allow_cpu_ml`) a failed probe returns False so
+    the caller trains on the CPU instead — for GPU-less machines like CI
+    runners and laptops. Without it a failed probe still exits 140, so a broken
+    GPU node is retried rather than silently downgraded.
+    """
+    try:
+        smoke_test()
+        return True
+    except Exception as exc:  # noqa: BLE001 — any CUDA-init failure counts
+        reason = f"{type(exc).__name__}: {exc}"
+        if allow_cpu:
+            print(
+                f"[{model_name}] CUDA smoke test failed ({reason}). "
+                "--allow_cpu is set, training on the CPU.",
+                file=sys.stderr,
+            )
+            return False
+        print(
+            f"[{model_name}] CUDA smoke test failed ({reason}). "
+            "Exiting with retry code so Nextflow reschedules on a different GPU node.",
+            file=sys.stderr,
+        )
+        sys.exit(CUDA_RETRY_EXIT_CODE)
+
+
+def canonical_ddi(domain_a: str, domain_b: str, interaction: int):
+    """`(lo, hi, interaction)`: one key per undirected DDI.
+
+    Same order as `_aggregate_to_ddi_level` and `load_data_gm.canonical_pair`
+    (plain string comparison is numeric order for Pfam accessions).
+    """
+    if domain_b < domain_a:
+        domain_a, domain_b = domain_b, domain_a
+    return domain_a, domain_b, interaction
+
+
+def ddi_row_groups(ddi_pairs) -> np.ndarray:
+    """Per-row integer id of the canonical DDI the row instantiates.
+
+    Ids are dense and numbered in sorted pair order, so they are a function of
+    the data alone. Both orientations of a DDI share an id.
+    """
+    df = pd.DataFrame(np.asarray(ddi_pairs, dtype=str).reshape(-1, 2),
+                      columns=["a", "b"])
+    lo = df["a"].where(df["a"] <= df["b"], df["b"])
+    hi = df["b"].where(df["a"] <= df["b"], df["a"])
+    return (
+        pd.DataFrame({"lo": lo, "hi": hi})
+        .groupby(["lo", "hi"], sort=True).ngroup().to_numpy(np.int64)
+    )
+
+
+class DDIAveragePrecision:
+    """Model-selection score: average precision over DDIs, not over rows.
+
+    The search used to rank candidates by AP over instance-pair *rows*. A DDI
+    contributes one row per (instance pair, orientation), so a family pair with
+    hundreds of instantiations outweighed one with a single row by a factor of
+    hundreds -- while everything the benchmark reports is per DDI, after
+    `_aggregate_to_ddi_level`. The score is now taken after that very
+    aggregation (mean over instance rows and both orientations), so the
+    candidate that wins is the one that is best at what gets reported.
+
+    Usable both ways the trainers need it: `score(y_score)` for an explicit
+    loop, and as a scikit-learn `scoring` callable `(estimator, X, y)`. The
+    latter relies on the fold's test block being exactly the validation rows
+    in order -- true for the single `PredefinedSplit` fold -- and checks the
+    labels it is handed against its own to catch anything else.
+
+    A candidate whose predictions are not all finite (a diverged NN) scores
+    NaN rather than raising: it is a bad candidate, not a broken run. The
+    search ranks NaN last, and `DDIModelTrainer.train` raises when nothing
+    scored finite.
+    """
+
+    def __init__(self, ddi_pairs, y_true):
+        # A compact (n, 2) str array rather than a list of tuples: the scorer
+        # is pickled into every joblib worker of the NN search.
+        self.ddi_pairs = np.asarray(ddi_pairs, dtype=str).reshape(-1, 2)
+        self.y_true = np.asarray(y_true, dtype=np.float32)
+
+    def score(self, y_score) -> float:
+        y_score = np.asarray(y_score)
+        if len(y_score) != len(self.y_true):
+            raise ValueError(
+                f"DDI scorer got {len(y_score)} predictions for "
+                f"{len(self.y_true)} validation rows"
+            )
+        if not np.isfinite(y_score).all():
+            return float("nan")
+        agg = _aggregate_to_ddi_level(self.ddi_pairs, self.y_true, y_score)
+        return float(average_precision_score(
+            agg["true_interaction"].to_numpy(),
+            agg["predicted_probability"].to_numpy(),
+        ))
+
+    def __call__(self, estimator, X, y):
+        if not np.array_equal(np.asarray(y, dtype=np.float32), self.y_true):
+            raise ValueError(
+                "DDI scorer was handed rows other than the validation block it "
+                "was built for; it can only score the single PredefinedSplit fold."
+            )
+        return self.score(estimator.predict_proba(X)[:, 1])
 
 
 def variant_of(test_split: str) -> str:
@@ -100,9 +231,11 @@ def _aggregate_to_ddi_level(ddi_pairs, y_true, y_score):
 def _tune_threshold_mcc(y_true, y_score, n_candidates: int = 200):
     """Pick the decision threshold that maximises Matthews correlation.
 
-    MCC is class-balance invariant, so the result generalises across test priors
-    that differ from the optimisation set (avoiding the F1-induced positive-bias
-    that previously collapsed predictions to the majority class).
+    MCC uses all four cells of the confusion matrix, so unlike F1 it does not
+    reward predicting everything positive (the F1-induced positive bias that
+    previously collapsed predictions to the majority class). It is *not*
+    prevalence-invariant: the threshold is tuned at the validation set's class
+    balance and may be off at a test prior that differs from it.
 
     Returns (threshold, mcc_at_threshold).
     """
@@ -142,7 +275,15 @@ def load_instance_pairs(ddi_path: Path, dataset: str):
         return None
 
     pairs = collections.defaultdict(set)
-    for row in pd.read_csv(instances_csv).itertuples(index=False):
+    # dtype=str: the ids are opaque keys. Inferred dtypes would turn an
+    # all-digit id into an int (and a missing one into a float NaN) whose
+    # str() no longer matches the HDF5 key.
+    instances_df = pd.read_csv(
+        instances_csv,
+        dtype={"domain_1": str, "domain_2": str,
+               "instance_1": str, "instance_2": str},
+    )
+    for row in instances_df.itertuples(index=False):
         domain_a, domain_b = str(row.domain_1), str(row.domain_2)
         instance_a, instance_b = str(row.instance_1), str(row.instance_2)
         pairs[(domain_a, domain_b, row.interaction)].add((instance_a, instance_b))
@@ -206,6 +347,9 @@ def load_embedding_data(
         if return_protein_pairs:
             return x, y, result_protein_pairs
         return x, y
+    # A miss: make room *before* building the replacement (see _LOAD_CACHE_MAX).
+    while len(_load_cache) >= _LOAD_CACHE_MAX:
+        _load_cache.popitem(last=False)
 
     ddi_csv_path = ddi_path / f"{dataset}.csv"
     feature_paths = [
@@ -230,7 +374,7 @@ def load_embedding_data(
     # the batches a network sees), and the row order of the predictions parquet
     # -- it was the single largest source of run-to-run drift.
     labeled_domain_pairs = set()
-    ddi_df = pd.read_csv(ddi_csv_path)
+    ddi_df = pd.read_csv(ddi_csv_path, dtype={"domain_1": str, "domain_2": str})
     for row in ddi_df.itertuples(index=False):
         domain_a = str(row.domain_1)
         domain_b = str(row.domain_2)
@@ -239,17 +383,6 @@ def load_embedding_data(
         labeled_domain_pairs.add((domain_a, domain_b, interaction))
         labeled_domain_pairs.add((domain_b, domain_a, interaction))
     labeled_domain_pairs = sorted(labeled_domain_pairs)
-
-    # If balance_classes is True, we will balance the classes by resampling
-    # to have an equal number of positive and negative samples in the dataset
-    if balance_classes:
-        pos = [t for t in labeled_domain_pairs if t[2] == 1]
-        neg = [t for t in labeled_domain_pairs if t[2] == 0]
-        n = min(len(pos), len(neg))
-        # `seed`, not a hardcoded 42: --seed has to reach the one draw that
-        # decides which examples the model is trained on.
-        rng = random.Random(seed)
-        labeled_domain_pairs = rng.sample(pos, n) + rng.sample(neg, n)
 
     # The domain-instance pairs this split assigns, when the database carries
     # `ddi_split_membership`. None = fall back to the cross-product.
@@ -308,23 +441,42 @@ def load_embedding_data(
         #
         # The loop below *skips* every pair and every instance combination it
         # cannot resolve. Both halves of the key can drift: the group name is
-        # the Pfam accession (stable across runs, so a mismatch means the wrong
-        # dataset or a stale export) and the dataset name is domainsplit's
-        # run-local instance id (so a foreign-run export misses even when the
-        # Pfam groups line up). Either way nothing raises on its own: no key
-        # resolves, every pair is skipped, and the result is an empty training
-        # set indistinguishable from a database that genuinely holds no data.
-        # Count what resolves so the failure can name the feature responsible
-        # instead of reporting "no data found".
+        # the Pfam accession and the dataset name is domainsplit's instance id
+        # (`{family}_{accession}_{start}_{end}`). Both are stable across runs,
+        # so a miss means the wrong dataset, a stale or truncated export, or a
+        # file keyed by something else -- a foreign run over the same domains
+        # resolves fine (see CLAUDE.md, "Published embeddings"). Either way
+        # nothing raises on its own: no key resolves, every pair is skipped,
+        # and the result is an empty training set indistinguishable from a
+        # database that genuinely holds no data. Count what resolves so the
+        # failure can name the feature responsible instead of reporting "no
+        # data found".
         pair_hits = {name: 0 for name in domain_encoding_names + interaction_encoding_names}
         candidates_seen = 0
         candidates_resolved = 0
+        rows_non_finite = 0
+        # Furthest stage each canonical DDI reached over both orientations, for
+        # the resolution report. Partial resolution is reported, never fatal.
+        ddi_stage = {}
+        # Finiteness of each (file, domain, instance) vector. A row is finite
+        # iff every vector it concatenates is, and there are far fewer distinct
+        # instance vectors than rows, so each is read once here. Settling it
+        # before the read pass is what lets balancing count only DDIs that
+        # really produce a row, and lets that pass allocate the exact size.
+        finite_memo = {}
         # (domain_a, domain_b, interaction, instance_combinations) per usable
         # pair. The combination tuples are the ones `instance_pairs` already
         # owns, so this costs pointers rather than a second copy of the keys.
         plan = []
 
+        def is_finite(dataset_handle):
+            # Cast first: a float64 value beyond float32 range is finite in the
+            # file and inf in the float32 row it is copied into.
+            return bool(np.isfinite(np.asarray(dataset_handle, dtype=np.float32)).all())
+
         for domain_a, domain_b, interaction in labeled_domain_pairs:
+            ddi_key = canonical_ddi(domain_a, domain_b, interaction)
+            ddi_stage.setdefault(ddi_key, _MISSING_DOMAIN)
             pair_found = True
             combined_domain_id = f"{domain_a}_{domain_b}"
             # No `break`: every file is probed even once the pair is known to be
@@ -340,8 +492,8 @@ def load_embedding_data(
                 else:
                     pair_found = False
             if not pair_found:
-                # print(f"Skipping pair ({domain_a}, {domain_b}) as one of the domains is missing in embeddings.")
                 continue
+            ddi_stage[ddi_key] = max(ddi_stage[ddi_key], _NO_INSTANCE_PAIR)
 
             # Candidate instance pairs for this DDI. Instance keys are opaque
             # strings and are never parsed apart — they are looked up whole.
@@ -375,6 +527,23 @@ def load_embedding_data(
                         return False
                 return True
 
+            # ...and of those, the ones whose row would be all finite.
+            def combination_finite(combo):
+                instance_a, instance_b = combo
+                for i, f in enumerate(domain_encoding_files):
+                    for domain, instance in ((domain_a, instance_a), (domain_b, instance_b)):
+                        key = (i, domain, instance)
+                        ok = finite_memo.get(key)
+                        if ok is None:
+                            ok = finite_memo[key] = is_finite(f[domain][instance])
+                        if not ok:
+                            return False
+                joined = f"{instance_a}_{instance_b}"
+                for f in interaction_encoding_files:
+                    if not is_finite(f[combined_domain_id][joined]):
+                        return False
+                return True
+
             instance_combinations = sorted(
                 combo for combo in candidate_combinations if combination_available(combo)
             )
@@ -382,11 +551,19 @@ def load_embedding_data(
             candidates_resolved += len(instance_combinations)
             if not instance_combinations:
                 continue
-            plan.append((domain_a, domain_b, interaction, instance_combinations))
+            ddi_stage[ddi_key] = max(ddi_stage[ddi_key], _NON_FINITE)
+            finite_combinations = [
+                combo for combo in instance_combinations if combination_finite(combo)
+            ]
+            rows_non_finite += len(instance_combinations) - len(finite_combinations)
+            if not finite_combinations:
+                continue
+            ddi_stage[ddi_key] = _RESOLVED
+            plan.append((domain_a, domain_b, interaction, finite_combinations))
 
         # Assert the join resolved rather than assuming it. A feature that
         # matched no domain pair at all is not "sparse coverage" -- it is a file
-        # keyed by something other than these databases' domain ids.
+        # keyed by something other than these databases' Pfam accessions.
         dead_features = sorted(name for name, hits in pair_hits.items() if hits == 0)
         if dead_features and labeled_domain_pairs:
             tally = ", ".join(
@@ -408,21 +585,36 @@ def load_embedding_data(
                 f"{dataset}: every domain pair was found, but none of the "
                 f"{candidates_seen} candidate instance pairs resolved in the "
                 "feature files. The Pfam accessions line up and the instance "
-                "keys do not -- the feature files and "
-                f"{dataset}_instances.csv disagree on "
-                "COALESCE(instance_id, 'r' || rowid). For a published embedding "
-                "file that is the signature of a foreign domainsplit run: "
-                "instance ids are run-local even though Pfam accessions are "
-                "not."
+                f"keys do not: {dataset}_instances.csv carries "
+                "ddi_split_membership's raw instance ids, while the feature "
+                "files key each instance by COALESCE(instance_id, 'r' || rowid). "
+                "domainsplit's instance ids are stable across runs, so this is "
+                "not a foreign run; suspect an export written before instance "
+                "ids were populated (its keys are then the run-local 'r<rowid>' "
+                "fallback) or one keyed some other way."
             )
 
+        _report_resolution(
+            dataset, ddi_stage, candidates_seen, candidates_resolved, rows_non_finite
+        )
+
         if not plan:
+            if candidates_resolved and rows_non_finite == candidates_resolved:
+                raise ValueError(
+                    f"{dataset}: all {candidates_resolved} resolved instance-pair "
+                    "rows carry a NaN or +-inf in at least one feature. The "
+                    "feature files resolve but hold no usable values -- check "
+                    "the extraction / export that wrote them."
+                )
             raise ValueError(
                 f"{dataset}: no usable rows. {candidates_resolved} instance pairs "
                 f"resolved out of {candidates_seen} candidates across "
                 f"{len(labeled_domain_pairs)} labelled domain pairs -- check the "
                 "DDI CSVs and the feature files."
             )
+
+        if balance_classes:
+            plan = _balance_plan(plan, seed, dataset)
 
         # Column widths, taken from the first resolved combination.
         # `combination_available` passed for it in every file, so every lookup
@@ -438,14 +630,11 @@ def load_embedding_data(
         ]
         n_cols = 2 * sum(domain_widths) + sum(interaction_widths)
 
-        # Upper bound: the NaN filter below only ever removes rows, so allocate
-        # for every resolved combination and slice at the end. `out[:at]` is a
-        # view, which keeps the whole allocation alive -- the right trade here,
-        # since copying it down would need exactly the second full-size buffer
-        # this rewrite removed.
-        n_upper = sum(len(combos) for *_, combos in plan)
-        out = np.empty((n_upper, n_cols), dtype=np.float32)
-        y = np.empty(n_upper, dtype=np.float32)
+        # Exact size: non-finite rows were already filtered out of `plan`, so
+        # every planned row is written and nothing is sliced off afterwards.
+        n_rows = sum(len(combos) for *_, combos in plan)
+        x = np.empty((n_rows, n_cols), dtype=np.float32)
+        y = np.empty(n_rows, dtype=np.float32)
 
         at = 0
         for domain_a, domain_b, interaction, instance_combinations in plan:
@@ -461,7 +650,7 @@ def load_embedding_data(
             ddi_pair = (domain_a, domain_b)
 
             for instance_a, instance_b in instance_combinations:
-                row = out[at]
+                row = x[at]
                 col = 0
                 for group, width in zip(groups_a, domain_widths):
                     row[col:col + width] = np.asarray(group[instance_a]).ravel()
@@ -477,21 +666,13 @@ def load_embedding_data(
                         ).ravel()
                         col += width
 
-                # Drop rows carrying a NaN. `at` does not advance, so the next
-                # row overwrites this one in place.
-                if np.isnan(row).any():
-                    continue
                 y[at] = interaction
                 result_ddi_pairs.append(ddi_pair)
                 if return_protein_pairs:
                     result_protein_pairs.append([instance_a, instance_b])
                 at += 1
 
-    x = out[:at]
-    y = y[:at]
     _load_cache[cache_key] = (x, y, result_ddi_pairs, result_protein_pairs)
-    while len(_load_cache) > _LOAD_CACHE_MAX:
-        _load_cache.popitem(last=False)
     if return_ddi_pairs:
         if return_protein_pairs:
             return x, y, result_ddi_pairs, result_protein_pairs
@@ -502,6 +683,75 @@ def load_embedding_data(
             return x, y, result_protein_pairs
         else:
             return x, y
+
+
+# How far a canonical DDI got through resolution; the max over its two
+# orientations is what the report counts it under.
+_MISSING_DOMAIN, _NO_INSTANCE_PAIR, _NON_FINITE, _RESOLVED = range(4)
+_DROP_REASONS = {
+    _MISSING_DOMAIN: "domain missing from a feature file",
+    _NO_INSTANCE_PAIR: "no instance pair in every feature file",
+    _NON_FINITE: "every row NaN/inf",
+}
+
+
+def _report_resolution(dataset, ddi_stage, candidates_seen, candidates_resolved,
+                       rows_non_finite):
+    """Print how many of the split's DDIs became rows, and why the rest did not.
+
+    Before this a test or validation DDI that failed to resolve vanished
+    without a count, so a report scored on 60% of a split looked exactly like
+    one scored on all of it.
+    """
+    stages = collections.Counter(ddi_stage.values())
+    n_requested = len(ddi_stage)
+    n_resolved = stages[_RESOLVED]
+    dropped = ", ".join(
+        f"{reason}: {stages[stage]}" for stage, reason in _DROP_REASONS.items()
+    )
+    print(
+        f"[load] {dataset}: {n_requested} DDIs requested, {n_resolved} resolved, "
+        f"{n_requested - n_resolved} dropped ({dropped}); instance-pair rows: "
+        f"{candidates_seen} candidates, {candidates_resolved} present in every "
+        f"feature file, {rows_non_finite} dropped as non-finite"
+    )
+
+
+def _balance_plan(plan, seed: int, dataset: str):
+    """Downsample `plan` to equally many positive and negative DDIs.
+
+    Balanced per *canonical DDI*, after resolution. The old step sampled
+    oriented triples from `labeled_domain_pairs` before anything was resolved.
+    A hetero DDI is two triples there, so that balanced neither DDIs nor rows,
+    most kept DDIs lost one of their orientations (undoing the augmentation
+    `_aggregate_to_ddi_level` describes), and a drawn DDI that then failed to
+    resolve left the classes unequal again. Now both orientations of a kept DDI
+    stay together and only DDIs that produce at least one row are counted.
+
+    Rows are not balanced: a DDI brings every instance pair it resolved to.
+    Order is `plan`'s (sorted oriented triples), not draw order.
+    """
+    keys = sorted({canonical_ddi(a, b, i) for a, b, i, _ in plan})
+    pos = [k for k in keys if k[2] == 1]
+    neg = [k for k in keys if k[2] != 1]
+    n = min(len(pos), len(neg))
+    if n == 0:
+        raise ValueError(
+            f"{dataset}: cannot balance classes -- {len(pos)} positive and "
+            f"{len(neg)} negative DDIs resolved."
+        )
+    # `seed`, not a hardcoded 42: --seed has to reach the one draw that
+    # decides which examples the model is trained on. Drawn from sorted lists,
+    # so the sample is a function of the data and the seed alone.
+    rng = random.Random(seed)
+    keep = set(rng.sample(pos, n)) | set(rng.sample(neg, n))
+    balanced = [entry for entry in plan if canonical_ddi(*entry[:3]) in keep]
+    print(
+        f"[load] {dataset}: balanced to {n} positive + {n} negative DDIs "
+        f"(from {len(pos)} + {len(neg)}), "
+        f"{sum(len(c) for *_, c in balanced)} rows"
+    )
+    return balanced
 
 
 class DDIModelTrainer(ABC):
@@ -526,10 +776,11 @@ class DDIModelTrainer(ABC):
     def _load_train_data(self, args, balance_method: str, seed: int):
         """Load training data with the given balance strategy. Returns (x, y)."""
 
-    def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
+    def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, scorer, config, num_features):
         """Create and fit a RandomizedSearchCV. Returns the fitted object.
 
-        Only reached through the default `_search` below. A subclass that
+        `scorer` is the `DDIAveragePrecision` for the validation block; pass it
+        as `scoring` so candidates are ranked per DDI. Only reached through the default `_search` below. A subclass that
         overrides `_search` (RandomForestTrainer does) never needs this.
         """
         raise NotImplementedError(
@@ -537,8 +788,12 @@ class DDIModelTrainer(ABC):
             "implement _create_grid_search"
         )
 
-    def _search(self, hyperparameters, n_iter, load_train, x_opt, y_opt, config, num_features):
+    def _search(self, hyperparameters, n_iter, load_train, x_opt, y_opt, opt_scorer, config, num_features):
         """Pick hyperparameters. Returns `(best_params, best_score)`.
+
+        `opt_scorer` is a `DDIAveragePrecision` over the validation block: the
+        score every candidate -- and, in `train`, every balance method -- is
+        ranked by.
 
         `load_train` is a zero-argument callable returning `(x_train, y_train)`
         -- not the arrays themselves. The caller therefore holds no reference to
@@ -555,6 +810,10 @@ class DDIModelTrainer(ABC):
         fancy-index copy scikit-learn makes of it.
         """
         x_train, y_train = load_train()
+        # The load cache holds its own reference to the train block, so the
+        # `del x_train` below used to free nothing and the search ran with train
+        # *and* the concatenation alive. Evicting costs a reload at refit.
+        clear_load_cache()
         # Anything derived from the training data alone -- input standardisation
         # statistics, say -- has to be fitted here, before the concatenation.
         # Fitting it on `x` would compute it over train *and* validation, which
@@ -571,7 +830,7 @@ class DDIModelTrainer(ABC):
 
         split = PredefinedSplit([-1] * n_train + [0] * len(x_opt))
         gs = self._create_grid_search(
-            hyperparameters, n_iter, split, x, y, config, num_features
+            hyperparameters, n_iter, split, x, y, opt_scorer, config, num_features
         )
         best = (gs.best_params_, gs.best_score_)
         del x, y, gs
@@ -579,8 +838,13 @@ class DDIModelTrainer(ABC):
         return best
 
     @abstractmethod
-    def _refit(self, best_params, best_balance, args, config, num_features):
-        """Refit on full training data with best params. Returns the classifier."""
+    def _refit(self, best_params, best_balance, args, config, num_features, load_opt):
+        """Refit on full training data with best params. Returns the classifier.
+
+        `load_opt` is a zero-argument callable returning the validation split
+        as `(x_opt, y_opt, ddi_pairs)`, for a model that monitors it while
+        training (the NN's early stopping). Ignore it otherwise.
+        """
 
     @abstractmethod
     def _save_model(self, classifier, model_path: Path):
@@ -742,11 +1006,17 @@ class DDIModelTrainer(ABC):
             search_parameters["models_to_evaluate"] / len(balance_methods)
         )
 
+        def load_opt():
+            return load_embedding_data(
+                args.features_path, args.features, args.ddi_path, args.val_split,
+                balance_classes=balance_opt_set, return_ddi_pairs=True,
+                seed=args.seed,
+            )
+
         print(f"Loading {args.val_split} data...")
-        x_opt, y_opt = load_embedding_data(
-            args.features_path, args.features, args.ddi_path, args.val_split,
-            balance_classes=balance_opt_set, seed=args.seed,
-        )
+        x_opt, y_opt, opt_ddi_pairs = load_opt()
+        opt_scorer = DDIAveragePrecision(opt_ddi_pairs, y_opt)
+        del opt_ddi_pairs
         num_features = x_opt.shape[1]
         print(f"Validation data shape: {x_opt.shape}, Labels shape: {y_opt.shape}")
         print(
@@ -770,12 +1040,25 @@ class DDIModelTrainer(ABC):
                 lambda bm=balance_method: self._load_train_data(args, bm, args.seed),
                 x_opt,
                 y_opt,
+                opt_scorer,
                 config,
                 num_features,
             )
+            print(f"[grid] balance_method={balance_method}: best DDI-level AP={best_score}")
+            # A search where nothing scored finite returns no usable winner; the
+            # RF loop used to hand back None and die later on `**None`.
+            if best_params is None or not np.isfinite(best_score):
+                raise RuntimeError(
+                    f"[{self.MODEL_NAME}] balance_method={balance_method}: no "
+                    f"candidate produced a finite validation score "
+                    f"(best={best_score}). Every candidate diverged or predicted "
+                    "non-finite probabilities."
+                )
             results.append((best_params, best_score, balance_method))
             gc.collect()
 
+        # Ranked by the same DDI-level score as the candidates within a method.
+        # Stable sort, so a tie keeps config order.
         results.sort(key=lambda r: r[1], reverse=True)
         best_params, _, best_balance = results[0]
 
@@ -783,19 +1066,15 @@ class DDIModelTrainer(ABC):
         print(f"Balance method: {best_balance}")
 
         x_opt_shape = x_opt.shape
-        del x_opt, y_opt
+        del x_opt, y_opt, opt_scorer
         clear_load_cache()
         gc.collect()
 
         classifier = self._refit(
-            best_params, best_balance, args, config, num_features
+            best_params, best_balance, args, config, num_features, load_opt
         )
 
-        x_opt, y_opt, opt_ddi_pairs = load_embedding_data(
-            args.features_path, args.features, args.ddi_path, args.val_split,
-            balance_classes=balance_opt_set,
-            return_ddi_pairs=True, seed=args.seed,
-        )
+        x_opt, y_opt, opt_ddi_pairs = load_opt()
         assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
 
         print("Tuning decision threshold on DDI-aggregated validation data via MCC...")
@@ -848,6 +1127,10 @@ class DDIModelTrainer(ABC):
                     "model_parameters": best_params,
                     "balance_method": best_balance,
                     "threshold": best_thr,
+                    # In --features order, which is the column order of x: the
+                    # only record of what an `all` combo concatenated.
+                    "features": list(args.features),
+                    "seed": args.seed,
                 },
                 f,
                 indent=4,

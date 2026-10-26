@@ -7,10 +7,16 @@
 //     `h5[pfam_id][instance_id]`: one file covers every split database of the
 //     run that produced it, because it holds every domain the run saw. Nothing
 //     downstream would raise if it did not fit -- `load_embedding_data` skips
-//     the (pfam_id, instance_id) pairs it cannot resolve, so an ill-fitting file
-//     yields zero training rows rather than an error. Running the check as a
-//     process makes the failure structural: NN/RF consume this output, so they
-//     cannot start on unverified files.
+//     every instance pair with a side it cannot resolve or a NaN in it, so an
+//     ill-fitting file yields few or zero training rows rather than an error.
+//     Coverage is therefore measured over the `ddi_split_membership` instance
+//     pairs, both sides present and finite. Running the check as a process
+//     makes the failure structural: NN/RF consume this output, so they cannot
+//     start on unverified files.
+//
+//     Only `meta.splits` is checked -- the train/validation/test* set
+//     discoverSplits() found. A domainsplit database directory can hold
+//     other *.sqlite3 that nothing here reads.
 //
 //     What it cannot catch is a foreign *run*: Pfam accessions are stable across
 //     runs, so an export made by another run over the same domains resolves like
@@ -49,6 +55,7 @@ process VERIFY_EMBEDDINGS {
             .transpose()
             .collect { feature, f -> "--pair ${feature}=${f}" }
             .join(' \\\n            ')
+        def split_args = meta.splits.collect { "--split ${it}" }.join(' ')
         def links = [feats, files]
             .transpose()
             .collect { feature, f -> "ln -s ../${f} verified/${feature}.h5" }
@@ -56,6 +63,7 @@ process VERIFY_EMBEDDINGS {
         """
         verify_embeddings.py \\
             --db-dir ${database_dir} \\
+            ${split_args} \\
             ${pairs} \\
             --min-coverage ${params.min_embedding_coverage}
 

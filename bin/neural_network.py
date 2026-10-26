@@ -9,13 +9,27 @@ import torch
 from sklearn.model_selection import RandomizedSearchCV
 from skorch import NeuralNetBinaryClassifier
 from skorch.callbacks import Callback, EarlyStopping
-from skorch.dataset import ValidSplit
+from skorch.dataset import Dataset
+from skorch.helper import predefined_split
 
 from determinism import seed_everything
-from machine_learning import DDIModelTrainer, load_embedding_data
+from machine_learning import DDIModelTrainer, load_embedding_data, probe_cuda
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+# TF32 off. It was on, which rounds every fp32 matmul/conv input to a 10-bit
+# mantissa on Ampere+ -- so the same model scored differently on an A40 than on
+# a pre-Ampere card or the CPU path. The GPU image also exports
+# NVIDIA_TF32_OVERRIDE=0, which overrides this from the driver side; a conda
+# run has no such variable, so these two lines are what makes it match.
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
+
+def _torch_cuda_smoke_test():
+    """The NN's half of `machine_learning.probe_cuda`: one op through torch."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("torch.cuda.is_available() is False")
+    _ = torch.ones(1, device="cuda") + 1.0
+    torch.cuda.synchronize()
 
 
 def _warm_lazy_torch_imports():
@@ -97,38 +111,59 @@ class SeededNeuralNetBinaryClassifier(NeuralNetBinaryClassifier):
         return super().initialize()
 
 
+# A column whose standard deviation is below this fraction of its magnitude is
+# treated as constant. float32 resolves ~6e-8 relative, so anything this small
+# is representation noise in the stored values, not signal.
+_CONSTANT_RELATIVE_SCALE = 1e-6
+
+
 def standardisation_stats(x, chunk_rows: int = 8192):
-    """Per-column mean and standard deviation of `x`, for input standardisation.
+    """Per-column mean, standard deviation and constant-column count of `x`.
 
-    Computed in float64 over row chunks. Both parts matter at this scale: the
-    all-feature combo is ~283 k rows x 9174 columns, where `x.mean(axis=0)` on a
-    float32 array accumulates in float32 and loses precision, and a
-    `x.astype(np.float64)` would be a second full-size allocation of a matrix
-    that is already 10 GB.
+    Two passes over row chunks, accumulated in float64: the mean first, then
+    the sum of squared deviations from it. The one-pass `E[x^2] - E[x]^2` form
+    this replaced cancels catastrophically when |mean| >> std -- a constant
+    non-zero column came out with a std of ~1e-8 instead of 0, slipped past the
+    `== 0` guard, and was then *divided* by that, blowing it up to ~1e8. The
+    chunking stays for memory: the all-feature combo is ~283 k rows x 9174
+    columns, and a `x.astype(np.float64)` would be a second full-size
+    allocation of a matrix that is already 10 GB.
 
-    Columns with zero variance get scale 1.0 rather than 0.0 -- the same
+    Constant columns -- max == min, or a std negligible against the column's
+    magnitude (`_CONSTANT_RELATIVE_SCALE`) -- get scale 1.0, the same
     convention `sklearn.preprocessing.StandardScaler` uses. Several are
     genuinely constant here (an amino acid absent from every domain in the
-    split, say), and dividing by their standard deviation would put inf or nan
-    into every row.
+    split, say), and dividing by their standard deviation would put inf, nan or
+    noise into every row.
     """
     n_rows, n_cols = x.shape
     total = np.zeros(n_cols, dtype=np.float64)
-    total_sq = np.zeros(n_cols, dtype=np.float64)
+    col_min = np.full(n_cols, np.inf, dtype=np.float64)
+    col_max = np.full(n_cols, -np.inf, dtype=np.float64)
+    # 8192 rows of 9174 float64 columns is ~600 MB per chunk. Deliberately not
+    # larger: a 65536-row chunk is 4.8 GB, so the statistics pass would cost
+    # more than the matrix.
     for start in range(0, n_rows, chunk_rows):
-        # 8192 rows of 9174 float64 columns is ~600 MB. Deliberately not larger:
-        # a 65536-row chunk is 4.8 GB, and `np.square(block)` would allocate a
-        # second one, so the statistics pass would cost more than the matrix.
         block = np.asarray(x[start:start + chunk_rows], dtype=np.float64)
         total += block.sum(axis=0)
-        block *= block          # in place -- no second full-size chunk
-        total_sq += block.sum(axis=0)
+        np.minimum(col_min, block.min(axis=0), out=col_min)
+        np.maximum(col_max, block.max(axis=0), out=col_max)
         del block
     mean = total / n_rows
-    variance = np.maximum(total_sq / n_rows - np.square(mean), 0.0)
-    scale = np.sqrt(variance)
-    scale[scale == 0.0] = 1.0
-    return mean.astype(np.float32), scale.astype(np.float32)
+
+    sq_dev = np.zeros(n_cols, dtype=np.float64)
+    for start in range(0, n_rows, chunk_rows):
+        block = np.asarray(x[start:start + chunk_rows], dtype=np.float64)
+        block -= mean           # in place -- no second full-size chunk
+        block *= block
+        sq_dev += block.sum(axis=0)
+        del block
+    scale = np.sqrt(sq_dev / n_rows)
+
+    magnitude = np.maximum(np.abs(col_min), np.abs(col_max))
+    constant = (col_max == col_min) | (scale <= _CONSTANT_RELATIVE_SCALE * magnitude)
+    scale[constant] = 1.0
+    return mean.astype(np.float32), scale.astype(np.float32), int(constant.sum())
 
 
 class MLPModule(torch.nn.Module):
@@ -210,6 +245,24 @@ class NeuralNetworkTrainer(DDIModelTrainer):
     def _balance_keys(self):
         return ["balance_method"]
 
+    # Set by _pre_train_hook; the CPU path is only ever taken with --allow_cpu.
+    _use_gpu = True
+
+    def _pre_train_hook(self, args):
+        # Same policy as the RF: an unusable GPU exits 140 for a retry on
+        # another node. The NN used to fall back to the CPU on its own and grind
+        # through the whole grid there, inside a GPU job's walltime.
+        self._use_gpu = probe_cuda(
+            args.allow_cpu, "neural_network", _torch_cuda_smoke_test
+        )
+
+    def _device(self, config):
+        # config "device": "cpu" forces the CPU; "auto"/"cuda" mean the GPU,
+        # which the probe has either confirmed or (--allow_cpu) ruled out.
+        if config["device"] == "cpu" or not self._use_gpu:
+            return "cpu"
+        return "cuda"
+
     def _load_train_data(self, args, balance_method, seed):
         if balance_method not in ("downsample", "none"):
             raise ValueError(
@@ -227,27 +280,27 @@ class NeuralNetworkTrainer(DDIModelTrainer):
     _input_std = None
 
     def _fit_preprocessing(self, x_train, y_train):
-        self._input_mean, self._input_std = standardisation_stats(x_train)
-        n_const = int(np.sum(self._input_std == 1.0))
+        self._input_mean, self._input_std, n_const = standardisation_stats(x_train)
         print(
             f"[standardise] fitted on {x_train.shape[0]} training rows x "
             f"{x_train.shape[1]} features ({n_const} zero-variance columns left "
             "unscaled)"
         )
 
-    def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, config, num_features):
-        device = config["device"]
-        if device in ("auto", "cuda") and not torch.cuda.is_available():
-            print("CUDA requested but not available — falling back to CPU.")
-            device = "cpu"
-        elif device == "auto":
-            device = "cuda"
+    def _create_grid_search(self, hyperparameters, n_iter, cv_split, x, y, scorer, config, num_features):
+        device = self._device(config)
         print(f"Training device: {device}")
 
-        # iterator_train__shuffle=True is critical: load_embedding_data with
-        # balance_classes=True concatenates `pos + neg`, so unshuffled batches
-        # are class-pure and the model collapses to majority prediction.
-        # Stratified valid split keeps positives in the holdout used by EarlyStopping.
+        # iterator_train__shuffle=True is critical: load_embedding_data emits
+        # rows in sorted pair order, so unshuffled batches are long runs of one
+        # family pair (and, without balancing, mostly one class).
+        #
+        # train_split=None: candidates train for a fixed grid_search_epochs on
+        # the whole train block. They used to carve out a stratified 20% row
+        # holdout that nothing monitored -- no EarlyStopping here -- so every
+        # candidate silently trained on 80% of train, and the holdout shared
+        # DDIs with the rest anyway. The candidate is judged on the validation
+        # fold by `scorer`.
         classifier = SeededNeuralNetBinaryClassifier(
             MLPModule,
             seed=self._seed,
@@ -258,16 +311,21 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             module__input_mean=self._input_mean,
             module__input_std=self._input_std,
             iterator_train__shuffle=True,
-            # random_state: an unseeded ValidSplit draws a different holdout on
-            # every fit, which moves both the EarlyStopping signal and the score
-            # the search ranks candidates by.
-            train_split=ValidSplit(0.2, stratified=True, random_state=self._seed),
+            train_split=None,
             callbacks=[SeedFit(self._seed)],
         )
         gs = RandomizedSearchCV(
             classifier, hyperparameters, n_iter=n_iter,
             n_jobs=config["jobs"], cv=cv_split, refit=False,
-            verbose=2, scoring="average_precision",
+            # DDI-level AP after `_aggregate_to_ddi_level`, not row-level AP --
+            # see machine_learning.DDIAveragePrecision.
+            verbose=2, scoring=scorer,
+            # A failing candidate fit is a bug or a broken node, not a bad
+            # hyperparameter: the default (error_score=nan) logged a warning and
+            # ranked it last, so a search where most fits crashed still
+            # "succeeded". Same as the RF loop, which has no wrapper to swallow
+            # the exception.
+            error_score="raise",
             # Without random_state the search samples a different subset of the
             # grid on every run, so repeated runs pick different models.
             random_state=self._seed,
@@ -275,7 +333,7 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         gs.fit(x, y)
         return gs
 
-    def _refit(self, best_params, best_balance, args, config, num_features):
+    def _refit(self, best_params, best_balance, args, config, num_features, load_opt):
         x_train, y_train = self._load_train_data(
             args, best_balance, args.seed
         )
@@ -290,17 +348,24 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         # predict() and --predict-only standardise with these same statistics.
         self._fit_preprocessing(x_train, y_train)
 
-        device = config["device"]
-        if device in ("auto", "cuda") and not torch.cuda.is_available():
-            device = "cpu"
-        elif device == "auto":
-            device = "cuda"
+        # Early stopping watches the real validation split. It used to watch a
+        # stratified 20% *row* holdout of train: rows of one DDI landed on both
+        # sides, so valid_loss measured memorisation, and EarlyStopping kept the
+        # *last* epoch (load_best defaults to False), not the best one. The
+        # validation split is DDI-disjoint from train by construction; it is
+        # the same block the search and the MCC threshold use. load_best=True
+        # restores the weights of the epoch with the lowest valid_loss.
+        x_opt, y_opt, _ = load_opt()
+        valid_ds = Dataset(
+            np.asarray(x_opt, dtype=np.float32), np.asarray(y_opt, dtype=np.float32)
+        )
+        del x_opt, y_opt
 
         classifier = SeededNeuralNetBinaryClassifier(
             MLPModule,
             seed=self._seed,
             max_epochs=config["search_parameters"]["retrain_epochs"],
-            device=device,
+            device=self._device(config),
             **best_params,
             verbose=1,
             module__input_size=num_features,
@@ -308,15 +373,15 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             module__input_std=self._input_std,
             criterion__pos_weight=pos_weight,
             iterator_train__shuffle=True,
-            train_split=ValidSplit(0.2, stratified=True, random_state=self._seed),
+            train_split=predefined_split(valid_ds),
             callbacks=[
                 SeedFit(self._seed),
-                EarlyStopping(patience=5, monitor="valid_loss"),
+                EarlyStopping(patience=5, monitor="valid_loss", load_best=True),
             ],
         )
         print("Refitting best parameter model on training data...")
         classifier.fit(x_train, y_train)
-        del x_train, y_train
+        del x_train, y_train, valid_ds
         gc.collect()
         return classifier
 

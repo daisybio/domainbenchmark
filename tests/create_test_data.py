@@ -38,7 +38,8 @@ Deliberate properties the pipeline depends on:
   the union of all splits. Pfam accessions are offset-shifted per split, so the
   splits stay disjoint in the key space too; `instance_id` is globally unique.
   The `domainsplit_run` root attribute is written because the real exporter
-  writes it, not because anything reads it -- the pipeline stopped checking it.
+  writes it, not because anything reads it -- the pipeline never checks it
+  (the `--domainsplit_run` param that did is gone).
 
 Usage:
 
@@ -61,9 +62,8 @@ SEED = 42
 # What domainsplit publishes under `results/embeddings/`, and the feature names
 # the benchmark maps them onto (`params.published_features`).
 EMBEDDING_MODELS = ["esm3", "esmc", "prott5"]
-# Stands in for domainsplit's `workflow.sessionId`. `-profile test` declares the
-# same value as `--domainsplit_run`, so the fixture covers both the structural
-# check and the declared-id check.
+# Stands in for domainsplit's `workflow.sessionId`, written to the
+# `domainsplit_run` root attribute for fidelity only -- nothing reads it.
 FIXTURE_RUN_ID = "fixture-run-0001"
 
 # Per split: how many domain families, proteins, and DDI pairs to synthesise.

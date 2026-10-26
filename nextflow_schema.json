@@ -40,11 +40,11 @@
                 },
                 "min_embedding_coverage": {
                     "type": "number",
-                    "default": 0.5,
+                    "default": 0.95,
                     "minimum": 0,
                     "maximum": 1,
-                    "description": "Minimum fraction of a split's (pfam_id, instance_id) pairs a published embedding file must resolve before the pairing is accepted.",
-                    "help_text": "A same-run file resolves close to 100% (domainsplit's exporter drops a handful of instances for --max-len or an OOM at batch size 1). This catches an export that does not cover these databases at all -- the wrong dataset, or one made before domains were added. It cannot catch an export from a different run over the same domain universe: Pfam accessions are stable across runs. Pairing the right export with the right databases is the caller's job, which the derived --embeddings default does by construction.",
+                    "description": "Minimum fraction of a split's ddi_split_membership instance pairs whose two sides are both present in a published embedding file with all-finite vectors.",
+                    "help_text": "Measured per instance pair, i.e. what the ML loader will actually look up; pair coverage is roughly the square of instance coverage. A same-run file resolves close to 100% (domainsplit's exporter drops a handful of instances for --max-len or an OOM at batch size 1). This catches an export that does not cover these databases at all -- the wrong dataset, or one made before domains were added. It cannot catch an export from a different run over the same domain universe: Pfam accessions are stable across runs. Pairing the right export with the right databases is the caller's job, which the derived --embeddings default does by construction.",
                     "fa_icon": "fas fa-percent",
                     "hidden": true
                 },
@@ -121,12 +121,6 @@
                     "help_text": "Filename must match the model_name field inside the JSON. Defaults to ${projectDir}/assets.",
                     "fa_icon": "fas fa-file-code",
                     "hidden": true
-                },
-                "old_report": {
-                    "type": "string",
-                    "default": "evaluation",
-                    "description": "Path to a prior evaluation/ directory used as a baseline for the MultiQC report.",
-                    "fa_icon": "fas fa-history"
                 },
                 "mqc_order": {
                     "type": "string",

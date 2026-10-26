@@ -18,6 +18,7 @@ from eval_multiqc_functions import (
     parse_dataset_order,
     resolve_dataset_order,
     sort_by_dataset,
+    variant_of_split,
 )
 import logging
 
@@ -107,6 +108,9 @@ def write_multiqc_config(outdir, dataset_order=None) -> str:
     white_tbl = present(ID)
     # auc_ap_tbl = pick(r"_metrics_table")
     metric_blocks = pick(r"model_eval_metrics")
+    # Copied through per dataset like `model_eval_metrics`, but used to be
+    # missing from this list, so MultiQC rendered them wherever it pleased.
+    pairwise_blocks = pick(r"^combined_pairwise_significance_")
 
     # metrics_heatmap_block = pick(r"combined_metrics_heatmap")
     roc_curves_block = pick(r"combined_roc_curves")
@@ -123,18 +127,20 @@ def write_multiqc_config(outdir, dataset_order=None) -> str:
     # db_header = pick(r"db_header$")
     # models_header = pick(r"models_header$")
 
-    # `db_database_analysis_<dataset>` and `model_eval_metrics_<dataset>` exist
-    # once per dataset. `all_ids` is alphabetical, which puts them in an order
+    # `db_database_analysis_<dataset>`, `model_eval_metrics_<dataset>` and
+    # `combined_pairwise_significance_<dataset>` exist once per dataset. `all_ids` is alphabetical, which puts them in an order
     # nobody chose -- `--mqc_order` replaces it. Everything else stays a pure
     # function of the file names, which is what keeps the report reproducible.
     if dataset_order:
         db_blocks = sort_by_dataset(db_blocks, dataset_order)
         metric_blocks = sort_by_dataset(metric_blocks, dataset_order)
+        pairwise_blocks = sort_by_dataset(pairwise_blocks, dataset_order)
 
     ordered = (
         white_tbl
         + db_blocks
         + metric_blocks
+        + pairwise_blocks
         + roc_heatmap_block
         + roc_heatmap_ci
         + pr_heatmep_block
@@ -249,6 +255,11 @@ def fix_trailing_punctuation_in_report(html_path: str) -> None:
         logging.info("[INFO] No stray trailing dots found to fix.")
 
 
+#: Per-dataset blocks (ids as eval_multiqc.py writes them) that are not copied
+#: through: cross_db_comparison() rebuilds them as cross-dataset blocks.
+REBUILT_BLOCKS = frozenset({"combined_roc", "combined_pr", "combined_metrics_table"})
+
+
 def get_db_name_from_dir(report_dir):
     # Extract db name from directory name or a file inside
     # The path is /path/to/db_name/evaluation/, we want to extract db_name
@@ -292,9 +303,20 @@ ALL_SOURCES = "ALL"
 #: Extra bar per source group: unweighted mean over the models in that group.
 AVERAGE_CAT = "Average"
 
-#: Extra tab: every dataset pooled. Exact, not an average of averages -- summed
-#: `correct` over summed `n_scored`.
-COMBINED_LABEL = "Combined"
+#: Extra tabs: datasets pooled per test variant. Exact, not an average of
+#: averages -- summed `correct` over summed `n_scored`.
+#:
+#: One pool per variant, never one over everything: the balanced and realistic
+#: test sets of a database are two views of the same DDIs, so pooling both
+#: counted every shared pair twice and mixed two class balances into one
+#: number. A database with a single test split (variant `test`, e.g.
+#: external_test) has no balanced/realistic distinction and joins both pools.
+POOLED_VARIANTS = ("realistic", "balanced")
+SINGLE_SPLIT_VARIANT = "test"
+
+
+def pooled_label(variant) -> str:
+    return f"Combined_{variant}"
 
 
 def read_source_accuracy(report_dir):
@@ -322,8 +344,13 @@ def _model_palette(models):
     return palette
 
 
-def _combine_datasets(sidecars):
-    """Pool every dataset into one synthetic `Combined` sidecar.
+def _variant(sidecar) -> str:
+    """The sidecar's test variant; derived from its split for older sidecars."""
+    return sidecar.get("variant") or variant_of_split(sidecar.get("test_split"))
+
+
+def _combine_datasets(sidecars, label=None):
+    """Pool `sidecars` into one synthetic sidecar named `label`.
 
     Accuracy is recomputed from summed `correct` / `n_scored` rather than
     averaged, so a dataset with ten times the DDIs of another carries ten times
@@ -347,8 +374,35 @@ def _combine_datasets(sidecars):
             stats["accuracy"] = (
                 stats["correct"] / stats["n_scored"] if stats["n_scored"] else None
             )
-    return {"db_name": COMBINED_LABEL, "test_split": COMBINED_LABEL,
+    return {"db_name": label, "test_split": label, "pooled": True,
             "totals": totals, "models": models}
+
+
+def _pool_by_variant(sidecars):
+    """`Combined_realistic` / `Combined_balanced` over the real datasets.
+
+    A pool is emitted only when it holds at least two datasets -- with one it
+    would repeat that dataset's tab under another name. A variant that is
+    neither pooled one nor `test` belongs to no pool and is reported once.
+    """
+    pools = []
+    for variant in POOLED_VARIANTS:
+        members = [
+            sc for sc in sidecars if _variant(sc) in (variant, SINGLE_SPLIT_VARIANT)
+        ]
+        if len(members) >= 2:
+            pools.append(_combine_datasets(members, pooled_label(variant)))
+    unpooled = sorted(
+        sc.get("db_name", "") for sc in sidecars
+        if _variant(sc) not in POOLED_VARIANTS + (SINGLE_SPLIT_VARIANT,)
+    )
+    if unpooled:
+        print(
+            f"[WARN] dataset(s) {', '.join(unpooled)} have a test variant other "
+            f"than {', '.join(POOLED_VARIANTS)} or '{SINGLE_SPLIT_VARIANT}'; "
+            "they are in no pooled tab."
+        )
+    return pools
 
 
 def _source_order(totals):
@@ -400,38 +454,63 @@ def _counts_table_html(sidecars, source_order):
 
 
 def _coverage_notes(sidecars):
-    """Flag (dataset, model, source) cells scored on less than the full source.
+    """Flag (dataset, model, source) cells scored on more or less than the source.
 
     Models do not all see the same DDIs: an ML model drops pairs whose domains
     have no usable features, and a graph model only scores the pairs its network
     reaches. Accuracy is computed over what each model actually scored, so a low
     coverage cell is a weaker claim than its neighbours and has to say so.
+
+    Scoring *more* than the source holds is never coverage: eval_one.py drops
+    duplicate pairs on both sides, so it means a cell was counted from rows
+    that do not belong to it. It is flagged separately and louder.
     """
-    notes = []
+    def _render(cells):
+        shown = ", ".join(cells[:6])
+        more = f", +{len(cells) - 6} more" if len(cells) > 6 else ""
+        return f"{shown}{more}"
+
+    partial_notes, excess_notes = [], []
     for sidecar in sidecars:
-        # The pooled tab has no coverage of its own -- it inherits whatever the
+        # A pooled tab has no coverage of its own -- it inherits whatever the
         # real datasets already reported, so listing it again says nothing new.
-        if sidecar.get("db_name") == COMBINED_LABEL:
+        if sidecar.get("pooled"):
             continue
         for model in sorted(sidecar.get("models", {})):
-            partial = []
+            partial, excess = [], []
             for source, stats in sorted(sidecar["models"][model].items()):
                 n = int(sidecar.get("totals", {}).get(source, {}).get("n", 0))
                 scored = int(stats.get("n_scored", 0))
                 if n and scored < n:
                     partial.append(f"{source} {100.0 * scored / n:.1f}%")
+                elif scored > n:
+                    excess.append(f"{source} {scored:,} of {n:,}")
             if partial:
-                shown = ", ".join(partial[:6])
-                more = f", +{len(partial) - 6} more" if len(partial) > 6 else ""
-                notes.append(f"{sidecar['db_name']} / {model}: {shown}{more}")
-    if not notes:
-        return ""
-    return (
-        "<p><b>Partial coverage.</b> These models scored fewer DDIs than the source "
-        "contains; their accuracy is over the scored subset only.<br><small>"
-        + "<br>".join(notes)
-        + "</small></p>"
-    )
+                partial_notes.append(f"{sidecar['db_name']} / {model}: {_render(partial)}")
+            if excess:
+                excess_notes.append(f"{sidecar['db_name']} / {model}: {_render(excess)}")
+            if excess:
+                print(
+                    f"[WARN] {sidecar['db_name']} / {model} scored more DDIs than "
+                    f"the source holds: {_render(excess)}"
+                )
+    html = ""
+    if excess_notes:
+        html += (
+            "<p><b>Scored more DDIs than exist.</b> These cells count more scored "
+            "pairs than the source contains, so their accuracy is not over the "
+            "test set and should not be read.<br><small>"
+            + "<br>".join(excess_notes)
+            + "</small></p>"
+        )
+    if partial_notes:
+        html += (
+            "<p><b>Partial coverage.</b> These models scored fewer DDIs than the source "
+            "contains; their accuracy is over the scored subset only.<br><small>"
+            + "<br>".join(partial_notes)
+            + "</small></p>"
+        )
+    return html
 
 
 def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
@@ -448,13 +527,17 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
         print("[INFO] No per-source sidecars found; skipping the by-source section.")
         return
 
-    # Tabs are datasets, so `--mqc_order` is the tab order. `Combined` is
-    # appended after, never ordered: it is a pooled summary of the others.
+    # Tabs are datasets, so `--mqc_order` is the tab order. The pooled tabs are
+    # appended after, never ordered: they are summaries of the others.
     sidecars = sort_by_dataset(
         sidecars, dataset_order, key=lambda sc: sc.get("db_name", "")
     )
-    if len(sidecars) > 1:
-        sidecars = sidecars + [_combine_datasets(sidecars)]
+    # Row order of the counts table: every source of every real dataset, by
+    # size. Taken from all of them at once rather than from one pool, which
+    # would leave out a source only the other variant carries.
+    source_order = _source_order(_combine_datasets(sidecars)["totals"])
+    pools = _pool_by_variant(sidecars)
+    sidecars = sidecars + pools
 
     palette = _model_palette(sorted({m for sc in sidecars for m in sc["models"]}))
 
@@ -497,7 +580,7 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
     block = {
         "id": "source_accuracy_by_ddi_source",
         "section_name": "Accuracy by DDI source",
-        "description": _counts_table_html(sidecars, _source_order(sidecars[-1]["totals"]))
+        "description": _counts_table_html(sidecars, source_order)
         + _coverage_notes(sidecars),
         "plot_type": "bargraph",
         "categories": categories,
@@ -525,7 +608,8 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
         json.dump(block, fh, indent=2)
     print(
         f"[INFO] Wrote {out_path} ({len(data)} datasets, "
-        f"{len(data_labels)} tabs incl. {COMBINED_LABEL if len(sidecars) > 1 else 'none'})"
+        f"{len(data_labels)} tabs incl. "
+        f"{', '.join(p['db_name'] for p in pools) or 'no pooled tab'})"
     )
 
 
@@ -693,8 +777,10 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
     # heatmap so the CI string is visible alongside the colour cell.
 
     def _to_float(v):
+        # NaN is "undefined" (a single-class split, see eval_one.py's
+        # ranking_note): no heatmap cell, and the CI table shows the reason.
         if isinstance(v, (int, float)):
-            return float(v)
+            return float(v) if v == v else None
         if isinstance(v, str):
             # backwards-compat: "0.948 [0.938, 0.956]" or "0.948"
             try:
@@ -873,6 +959,11 @@ def main():
                 src = os.path.join(report_dir, fn)
                 with open(src, "r", encoding="utf-8") as f:
                     block = json.load(f)
+                # Decided on the id as eval_multiqc.py wrote it, before the
+                # dataset suffix: a substring test on the suffixed id dropped
+                # every block of a dataset whose name merely contains `pr` or
+                # `roc` (`protein_x`, `pr_bench`).
+                stem = block.get("id", "")
                 block = relabel_multiqc_block(block, db_name)
                 # Write to output dir with new name
                 # delete the old _mqc.json suffix and add the db_name and _mqc.json back
@@ -884,11 +975,7 @@ def main():
                 # as single cross-dataset blocks. (The degree / betweenness /
                 # clustering box plots used to be skipped here for the same
                 # reason; they no longer exist at all.)
-                if not (
-                    "roc" in block["id"]
-                    or "pr" in block["id"]
-                    or "combined_metrics_table_" in block["id"]
-                ):
+                if stem not in REBUILT_BLOCKS:
                     with open(
                         os.path.join(outdir_json, out_fn), "w", encoding="utf-8"
                     ) as out_f:

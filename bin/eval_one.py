@@ -25,7 +25,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 
-from eval_multiqc_functions import bootstrap_metric
+from eval_multiqc_functions import bootstrap_metric, count_valid
 
 
 #: Row label for the whole test set, used as the per-source table's baseline.
@@ -48,6 +48,13 @@ UNMATCHED = "\x00unmatched"
 
 #: How many unmatched pairs the failure message names.
 UNMATCHED_EXAMPLES = 10
+
+#: How many pairs a duplicate / non-finite-score message names.
+EXAMPLES = 5
+
+
+def _examples(keys, limit: int = EXAMPLES) -> str:
+    return ", ".join(k.replace("\t", " <-> ") for k in sorted(set(keys))[:limit])
 
 
 def _pair_keys(domain_a, domain_b) -> np.ndarray:
@@ -75,6 +82,15 @@ def _read_sources(path: str) -> tuple:
     Returns ``(exploded, totals)`` where `exploded` has columns
     ``pair``/``source`` and `totals` maps source -> ground-truth counts in this
     test split (i.e. the denominator the model's coverage is measured against).
+
+    One row per canonical pair, and one (pair, source) row per distinct source.
+    domainsplit keys `domain_domain_interaction` UNIQUE on the *ordered* pair,
+    so the one way a pair can appear twice here is as (A, B) and (B, A). Those
+    rows are merged with a warning, keeping the union of their sources: two
+    sources for one DDI is ordinary multi-source provenance and both rows
+    count, but the pair itself is one DDI. Left alone, the duplicate fanned out
+    in the merge with the predictions and every such pair was scored -- and
+    counted in `n` -- twice per source.
     """
     df = pd.read_csv(path, dtype={"domain_1": str, "domain_2": str, "source": str})
     df["pair"] = _pair_keys(df["domain_1"], df["domain_2"])
@@ -86,7 +102,41 @@ def _read_sources(path: str) -> tuple:
         return parts or [UNKNOWN_SOURCE]
 
     df["source"] = df["source"].map(_split)
-    exploded = df.explode("source", ignore_index=True)
+
+    dup = df["pair"].duplicated(keep=False)
+    if dup.any():
+        n_extra = int(df["pair"].duplicated().sum())
+        print(
+            f"[eval_one][WARN] {path}: {n_extra} duplicate row(s) over "
+            f"{int(df.loc[dup, 'pair'].nunique())} domain pair(s) (same pair in "
+            f"both orientations), merged into one row each with the union of "
+            f"their sources. e.g. {_examples(df.loc[dup, 'pair'])}"
+        )
+        # A pair that is positive in one orientation and negative in the other
+        # is a domainsplit bug, not provenance. Positive wins: the DDI was
+        # observed by at least one source.
+        labels = df.loc[dup].groupby("pair")["interaction"].nunique()
+        conflicting = labels[labels > 1].index
+        if len(conflicting):
+            print(
+                f"[eval_one][WARN] {path}: {len(conflicting)} of those pair(s) "
+                "disagree on `interaction` between orientations; counting them "
+                f"as positive. e.g. {_examples(conflicting)}"
+            )
+
+    exploded = (
+        df.explode("source", ignore_index=True)
+        .drop_duplicates(["pair", "source"])
+    )
+    # `unknown` stands for "no provenance at all", which stops being true once
+    # the other orientation of the pair named a source.
+    named = set(exploded.loc[exploded["source"] != UNKNOWN_SOURCE, "pair"])
+    exploded = exploded[
+        ~((exploded["source"] == UNKNOWN_SOURCE) & exploded["pair"].isin(named))
+    ]
+    label = df.groupby("pair", sort=True)["interaction"].max()
+    exploded = exploded.assign(interaction=exploded["pair"].map(label).astype(np.int8))
+    df = label.reset_index()
 
     totals = {}
     for source, grp in exploded.groupby("source", sort=True):
@@ -119,9 +169,13 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
     is a key-space mismatch between the predictions and the CSVs, and a report
     built on it is meaningless rather than merely incomplete.
     """
-    if not sources_path or not os.path.isfile(sources_path):
-        print(f"[eval_one] no source table at {sources_path}; skipping per-source metrics")
+    if not sources_path:
+        print("[eval_one] no --sources given; skipping per-source metrics")
         return {}
+    # Given but absent is not "no provenance": DDI_EXTRACTION writes this file
+    # for every split it extracts, so a miss is a wiring or staging error.
+    if not os.path.isfile(sources_path):
+        raise SystemExit(f"[eval_one] --sources {sources_path} does not exist")
 
     exploded, totals = _read_sources(sources_path)
 
@@ -201,7 +255,51 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
     return per_source
 
 
-def _read_predictions(path: str) -> pd.DataFrame:
+def _drop_duplicate_pairs(df: pd.DataFrame, path: str) -> pd.DataFrame:
+    """One row per canonical (domain_a, domain_b), dropping the rest with a warning.
+
+    Every predictions file is supposed to be canonical already (CLAUDE.md, "The
+    domain key"), so a duplicate is an upstream bug -- but one that used to be
+    counted twice in every metric and in `n_scored`, silently.
+
+    The row kept is the one that sorts first on (true_interaction,
+    predicted_probability, predicted_interaction), so the choice is a function
+    of the rows' contents, not of the order the model happened to write them
+    in. Kept rows stay in file order, which leaves a clean file -- and its
+    bootstrap draws -- exactly as before.
+    """
+    key = _pair_keys(df["domain_a"], df["domain_b"])
+    is_extra = pd.Series(key).duplicated().to_numpy()
+    if not is_extra.any():
+        return df
+    order = np.lexsort((
+        df["predicted_interaction"].to_numpy(),
+        df["predicted_probability"].to_numpy(),
+        df["true_interaction"].to_numpy(),
+        key,
+    ))
+    first = ~pd.Series(key[order]).duplicated().to_numpy()
+    keep = np.sort(order[first])
+
+    in_dup = pd.Series(key).duplicated(keep=False).to_numpy()
+    dup_keys = key[in_dup]
+    n_disagree = int(
+        df.loc[in_dup, ["true_interaction", "predicted_probability", "predicted_interaction"]]
+        .assign(pair=dup_keys)
+        .drop_duplicates()
+        .groupby("pair").size().gt(1).sum()
+    )
+    print(
+        f"[eval_one][WARN] {path}: {int(is_extra.sum())} duplicate row(s) over "
+        f"{len(set(dup_keys))} domain pair(s) after canonicalising the "
+        f"orientation; dropped, keeping one row per pair "
+        f"({n_disagree} pair(s) disagree on label or score). "
+        f"e.g. {_examples(dup_keys)}"
+    )
+    return df.iloc[keep].reset_index(drop=True)
+
+
+def _read_predictions(path: str, model_name: str) -> pd.DataFrame:
     if path.endswith(".parquet") or path.endswith(".pq"):
         df = pd.read_parquet(path)
     else:
@@ -210,7 +308,10 @@ def _read_predictions(path: str) -> pd.DataFrame:
     # the bare KeyError that follows names the column rather than the file --
     # useless when a dozen scatter tasks fail at once. Say which prediction
     # file is malformed and how.
-    required = ("true_interaction", "predicted_interaction", "predicted_probability")
+    required = (
+        "domain_a", "domain_b",
+        "true_interaction", "predicted_interaction", "predicted_probability",
+    )
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
@@ -221,7 +322,20 @@ def _read_predictions(path: str) -> pd.DataFrame:
     df["true_interaction"] = df["true_interaction"].astype(np.int8)
     df["predicted_interaction"] = df["predicted_interaction"].astype(np.int8)
     df["predicted_probability"] = df["predicted_probability"].astype(np.float32)
-    return df
+
+    # A non-finite score is fatal, not masked. It used to be dropped from the
+    # ROC/AP/bootstrap inputs while the same row still counted in the confusion
+    # metrics, so one model's numbers were computed over two different sets of
+    # pairs -- and a model that emits NaN is broken, not uncertain.
+    bad = ~np.isfinite(df["predicted_probability"].to_numpy())
+    if bad.any():
+        keys = _pair_keys(df.loc[bad, "domain_a"], df.loc[bad, "domain_b"])
+        raise SystemExit(
+            f"[eval_one] model {model_name}: {int(bad.sum())}/{len(df)} rows of "
+            f"{path} have a non-finite predicted_probability. "
+            f"e.g. {_examples(keys)}"
+        )
+    return _drop_duplicate_pairs(df, path)
 
 
 def _summary(y_true, y_pred, model_name) -> dict:
@@ -287,7 +401,8 @@ def main():
     p.add_argument(
         "--sources", default=None,
         help="`<split>_sources.csv` from DDI_EXTRACTION (domain pair -> comma-joined "
-             "provenance list). Enables the per-source accuracy block; skipped when absent.",
+             "provenance list). Enables the per-source accuracy block; skipped when "
+             "not given, fatal when given but missing.",
     )
     p.add_argument("--max_curve_points", type=int, default=600)
     p.add_argument("--bootstrap_n", type=int, default=1000,
@@ -304,37 +419,50 @@ def main():
     if args.run_id:
         print(f"[eval_one] run_id={args.run_id}")
 
-    df = _read_predictions(args.predictions)
+    df = _read_predictions(args.predictions, args.model_name)
     y_true = df["true_interaction"].to_numpy()
     y_pred = df["predicted_interaction"].to_numpy()
     y_score = df["predicted_probability"].to_numpy()
 
-    mask = ~(pd.isna(y_true) | pd.isna(y_score))
-    y_true_clean = y_true[mask]
-    y_score_clean = y_score[mask]
+    # Both ranking metrics are undefined on a single-class split. Say so in the
+    # sidecar instead of leaving a bare NaN -- or, as roc_auc_score did, dying
+    # on it -- so the report can tell "undefined" from "broken".
+    classes = np.unique(y_true)
+    ranking_note = None
+    if len(classes) < 2:
+        only = {1: "positive", 0: "negative"}.get(int(classes[0]), "?") if len(classes) else "none"
+        ranking_note = (
+            f"single-class test split ({len(y_true)} pairs, all {only}): "
+            "ROC AUC and AP are undefined"
+        )
+        print(f"[eval_one][WARN] {args.model_name}: {ranking_note}")
+        roc_auc = pr_ap = float("nan")
+        roc_lo = roc_hi = pr_lo = pr_hi = float("nan")
+        roc_samples = pr_samples = np.full(args.bootstrap_n, np.nan)
+        fp_d = tp_d = rec_d = prec_d = np.empty(0, dtype=np.float32)
+    else:
+        fp, tp, _ = roc_curve(y_true, y_score)
+        roc_auc = float(auc(fp, tp))
+        precision, recall, _ = precision_recall_curve(y_true, y_score)
+        pr_ap = float(average_precision_score(y_true, y_score))
 
-    fp, tp, _ = roc_curve(y_true_clean, y_score_clean)
-    roc_auc = float(auc(fp, tp))
-    precision, recall, _ = precision_recall_curve(y_true_clean, y_score_clean)
-    pr_ap = float(average_precision_score(y_true_clean, y_score_clean))
+        # Phase 4: bootstrap CIs for the two ranking metrics. Cheap (<5s on 30k
+        # samples × 1000 resamples) and gives `0.847 [0.821, 0.872]` style cells
+        # in the overview table.
+        _, roc_lo, roc_hi, roc_samples = bootstrap_metric(
+            y_true, y_score, roc_auc_score,
+            n_resamples=args.bootstrap_n, seed=args.seed,
+        )
+        _, pr_lo, pr_hi, pr_samples = bootstrap_metric(
+            y_true, y_score, average_precision_score,
+            n_resamples=args.bootstrap_n, seed=args.seed,
+        )
 
-    # Phase 4: bootstrap CIs for the two ranking metrics. Cheap (<5s on 30k
-    # samples × 1000 resamples) and gives `0.847 [0.821, 0.872]` style cells
-    # in the overview table.
-    _, roc_lo, roc_hi, roc_samples = bootstrap_metric(
-        y_true_clean, y_score_clean, roc_auc_score,
-        n_resamples=args.bootstrap_n, seed=args.seed,
-    )
-    _, pr_lo, pr_hi, pr_samples = bootstrap_metric(
-        y_true_clean, y_score_clean, average_precision_score,
-        n_resamples=args.bootstrap_n, seed=args.seed,
-    )
-
-    fp_d, tp_d = _downsample_curve(fp.astype(np.float32), tp.astype(np.float32),
-                                   args.max_curve_points)
-    rec_d, prec_d = _downsample_curve(recall.astype(np.float32),
-                                      precision.astype(np.float32),
-                                      args.max_curve_points)
+        fp_d, tp_d = _downsample_curve(fp.astype(np.float32), tp.astype(np.float32),
+                                       args.max_curve_points)
+        rec_d, prec_d = _downsample_curve(recall.astype(np.float32),
+                                          precision.astype(np.float32),
+                                          args.max_curve_points)
 
     payload = {
         "model_name": args.model_name,
@@ -345,6 +473,13 @@ def main():
         "pr_ap": pr_ap,
         "roc_auc_ci": [roc_lo, roc_hi],
         "pr_ap_ci": [pr_lo, pr_hi],
+        # A single-class resample is undefined and skipped, so the CI rests on
+        # the valid ones only. On a heavily imbalanced split that can be far
+        # fewer than bootstrap_n, which is worth seeing next to the interval.
+        "bootstrap_n": int(args.bootstrap_n),
+        "roc_auc_n_valid": count_valid(roc_samples),
+        "pr_ap_n_valid": count_valid(pr_samples),
+        "ranking_note": ranking_note,
         # Per-resample arrays are kept so eval_multiqc.py can run pairwise
         # comparisons without re-reading predictions. ~8KB per metric per model.
         "roc_auc_samples": [float(v) for v in roc_samples],

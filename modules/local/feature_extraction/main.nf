@@ -11,8 +11,9 @@
 // node that cannot loop-mount the SIF, singularity unpacked the whole image to
 // a temporary sandbox first — which outlived the label's walltime and killed the
 // run with exit 140 after three attempts. `bin/machine_learning.py`'s
-// `resolve_feature_file` reads both layouts, so a pre-existing per-feature
-// directory tree still works.
+// `resolve_feature_file` reads `<feature>__<split>.h5` from here and
+// `<feature>.h5` (a published per-run file, via VERIFY_EMBEDDINGS); the
+// per-feature directory tree is no longer accepted.
 //
 // The split set comes from `meta.splits` — `train`, `validation`, and one or
 // more `test*` — so a database shipping both `test_balanced` and
@@ -40,34 +41,19 @@ process FEATURE_EXTRACTION_ONE {
         def feature_name = meta.feature
         def dataset      = meta.dataset
 
-        if (database_dir.isFile()) {
-            // Single-file db inputs only support a 'test' split.
-            if (dataset != 'test') {
-                """
-                echo "Single-file database ${database_dir} has no '${dataset}' split — nothing to extract."
-                """
-            } else {
-                """
-                extract_features.py \\
-                    --db ${database_dir} \\
-                    --feature ${feature_name} \\
-                    --out ${out} \\
-                    --seed ${params.seed}
-                """
-            }
-        } else {
-            """
-            if [ -f "${database_dir}/${dataset}.sqlite3" ]; then
-                extract_features.py \\
-                    --db ${database_dir}/${dataset}.sqlite3 \\
-                    --feature ${feature_name} \\
-                    --out ${out} \\
-                    --seed ${params.seed}
-            else
-                echo "Database ${database_dir} has no ${dataset}.sqlite3 — nothing to extract."
-            fi
-            """
-        }
+        // `database_dir` is always a directory -- datasetTuple() lists it via
+        // discoverSplits() -- so there is no single-file branch.
+        """
+        if [ -f "${database_dir}/${dataset}.sqlite3" ]; then
+            extract_features.py \\
+                --db ${database_dir}/${dataset}.sqlite3 \\
+                --feature ${feature_name} \\
+                --out ${out} \\
+                --seed ${params.seed}
+        else
+            echo "Database ${database_dir} has no ${dataset}.sqlite3 — nothing to extract."
+        fi
+        """
 
     stub:
         """
