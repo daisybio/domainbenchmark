@@ -102,7 +102,7 @@ process DDI_EXTRACTION {
             # mapping_df.to_csv(f"${meta.id}/DDI/mapping.csv", index=False)
             PYEOF
             """
-        } else {
+                } else {
             """
             #!/usr/bin/env bash
             python3 <<'PYEOF'
@@ -111,45 +111,50 @@ process DDI_EXTRACTION {
             import os
             import sys
 
-            DDI_QUERY = '''
-                SELECT d1.pfam_id AS domain_1, d2.pfam_id AS domain_2,
-                       NOT ddi.negative AS interaction
-                FROM domain_domain_interaction AS ddi
-                JOIN domain AS d1 ON ddi.domain_id_a = d1.id
-                JOIN domain AS d2 ON ddi.domain_id_b = d2.id;
-            '''
-
-            # Same rows plus the provenance list. `source` is a comma-joined list
-            # of every source that contributed the pair (domainsplit keys
-            # `domain_domain_interaction` UNIQUE on the pair), so a DDI with
-            # "single_domain_ppi,PPIDM,PPIDM_Gold" counts towards all three
-            # per-source performance rows in the report.
-            SOURCES_QUERY = '''
-                SELECT d1.pfam_id AS domain_1, d2.pfam_id AS domain_2,
-                       NOT ddi.negative AS interaction, ddi.source AS source
-                FROM domain_domain_interaction AS ddi
-                JOIN domain AS d1 ON ddi.domain_id_a = d1.id
-                JOIN domain AS d2 ON ddi.domain_id_b = d2.id;
-            '''
+            # Only DDIs / instance pairs with is_mock = 0 are real data. The
+            # structural encoders already see only those (load_structure_data);
+            # the CSVs the ML loader instantiates have to agree, otherwise every
+            # non-structural encoding trains and evaluates on the mock pairs too.
+            # Filtering the per-instance feature files cannot do this: they are a
+            # lookup table, and a mock pair is made of two instances that are
+            # themselves real.
+            def ddi_query(real_only, with_source):
+                source_col = ", ddi.source AS source" if with_source else ""
+                where = (
+                    "WHERE EXISTS (SELECT 1 FROM ddi_split_membership AS m "
+                    "WHERE m.ddi_id = ddi.id AND m.is_mock = 0)"
+                    if real_only else ""
+                )
+                return f'''
+                    SELECT d1.pfam_id AS domain_1, d2.pfam_id AS domain_2,
+                           NOT ddi.negative AS interaction{source_col}
+                    FROM domain_domain_interaction AS ddi
+                    JOIN domain AS d1 ON ddi.domain_id_a = d1.id
+                    JOIN domain AS d2 ON ddi.domain_id_b = d2.id
+                    {where};
+                '''
 
             # `ddi_split_membership` canonicalises each pair by sorting the two
             # instance ids, so instance_id_a does not necessarily belong to
             # domain_id_a. Resolve the side through domain_protein_map.
             # Homodimers satisfy both branches -- either orientation is correct.
-            INSTANCE_QUERY = '''
-                SELECT d1.pfam_id AS domain_1,
-                       d2.pfam_id AS domain_2,
-                       CASE WHEN pa.domain_id = ddi.domain_id_a
-                            THEN m.instance_id_a ELSE m.instance_id_b END AS instance_1,
-                       CASE WHEN pa.domain_id = ddi.domain_id_a
-                            THEN m.instance_id_b ELSE m.instance_id_a END AS instance_2,
-                       NOT ddi.negative AS interaction
-                FROM ddi_split_membership AS m
-                JOIN domain_domain_interaction AS ddi ON ddi.id = m.ddi_id
-                JOIN domain_protein_map AS pa ON pa.instance_id = m.instance_id_a
-                JOIN domain AS d1 ON ddi.domain_id_a = d1.id
-                JOIN domain AS d2 ON ddi.domain_id_b = d2.id;
-            '''
+            def instance_query(real_only):
+                where = "WHERE m.is_mock = 0" if real_only else ""
+                return f'''
+                    SELECT d1.pfam_id AS domain_1,
+                           d2.pfam_id AS domain_2,
+                           CASE WHEN pa.domain_id = ddi.domain_id_a
+                                THEN m.instance_id_a ELSE m.instance_id_b END AS instance_1,
+                           CASE WHEN pa.domain_id = ddi.domain_id_a
+                                THEN m.instance_id_b ELSE m.instance_id_a END AS instance_2,
+                           NOT ddi.negative AS interaction
+                    FROM ddi_split_membership AS m
+                    JOIN domain_domain_interaction AS ddi ON ddi.id = m.ddi_id
+                    JOIN domain_protein_map AS pa ON pa.instance_id = m.instance_id_a
+                    JOIN domain AS d1 ON ddi.domain_id_a = d1.id
+                    JOIN domain AS d2 ON ddi.domain_id_b = d2.id
+                    {where};
+                '''
 
             NULL_PFAM_QUERY = (
                 "SELECT COUNT(*) FROM domain "
@@ -160,6 +165,12 @@ process DDI_EXTRACTION {
                 return conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
                 ).fetchone() is not None
+
+            def has_is_mock(conn):
+                if not has_table(conn, "ddi_split_membership"):
+                    return False
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(ddi_split_membership)")}
+                return "is_mock" in cols
 
             def assert_pfam_ids(conn, path):
                 # pfam_id is the join key for the whole downstream report -- the
@@ -185,14 +196,25 @@ process DDI_EXTRACTION {
                     continue
                 with sqlite3.connect(path) as conn:
                     assert_pfam_ids(conn, path)
-                    pd.read_sql(DDI_QUERY, conn).to_csv(f"{out_dir}/{split}.csv", index=False)
-                    pd.read_sql(SOURCES_QUERY, conn).to_csv(
+                    real_only = has_is_mock(conn)
+
+                    ddi_df = pd.read_sql(ddi_query(real_only, False), conn)
+                    ddi_df.to_csv(f"{out_dir}/{split}.csv", index=False)
+                    pd.read_sql(ddi_query(real_only, True), conn).to_csv(
                         f"{out_dir}/{split}_sources.csv", index=False
                     )
+
+                    n_inst = None
                     if has_table(conn, "ddi_split_membership"):
-                        pd.read_sql(INSTANCE_QUERY, conn).to_csv(
-                            f"{out_dir}/{split}_instances.csv", index=False
-                        )
+                        inst_df = pd.read_sql(instance_query(real_only), conn)
+                        inst_df.to_csv(f"{out_dir}/{split}_instances.csv", index=False)
+                        n_inst = len(inst_df)
+
+                    print(
+                        f"[ddi_extraction] {split}: {len(ddi_df)} DDIs, "
+                        f"{n_inst} instance pairs "
+                        f"({'non-mock only' if real_only else 'no is_mock column: unfiltered'})"
+                    )
             PYEOF
             """
         }

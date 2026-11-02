@@ -195,7 +195,7 @@ workflow PER_DB_BENCHMARK {
         //println "[PER_DB_BENCHMARK] Requested features: ${all_features}"
 
         //NOTE: Rewrite features to take parameterized features
-        def feature_registry_file = file(params.modeljson) / 'FeatureRegistry.groovy'
+        def feature_registry_file = file(params.modeljson) / 'FeatureRegistry_mrmr.groovy'
         def feature_registry = new GroovyShell().evaluate(feature_registry_file.text) as Map
 
         def expanded_features  = expandFeatures(extracted_features, feature_registry)

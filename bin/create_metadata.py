@@ -167,7 +167,8 @@ def aggregate_metadata_to_ddi_level(ddi_metadata, key_cols=("pfam_id_a", "pfam_i
     return agg_ddi_metadata, ddi_numerical_features
 
 
-def create_single_metadata_file(agg_domain_metadata, agg_ddi_metadata, instance_map_df, out_path):
+
+def create_single_metadata_file(agg_domain_metadata, agg_ddi_metadata, instance_map_df, out_path, include_af=False):
     """
     Create a single metadata file, one row per DDI *instance* (i.e. one row
     per pfam_id pair from the test set), one column group for
@@ -223,18 +224,22 @@ def create_single_metadata_file(agg_domain_metadata, agg_ddi_metadata, instance_
     # no a/b-swapping is needed for the ddi-level features: a sorted-pair key
     # refers to a single interaction-level row regardless of which side is
     # 'a' or 'b' in the original orientation.
-    merged_df = merged_df.merge(agg_ddi_metadata, left_on='ddi_key', right_on='_pair_key', how='left')
-    ddi_feature_cols = [c for c in agg_ddi_metadata.columns if c != '_pair_key']
-    merged_df.drop(columns=['_pair_key'], inplace=True)  # drop the _pair_key column after the merge, since it's not a feature and must not leak into the output
 
-    # Check for NaNs introduced by the ddi-metadata merge (e.g. domain pairs
-    # present in the test set but missing from the complete ddi metadata)
-    if merged_df[ddi_feature_cols].isnull().any().any():
-        nan_rows = merged_df[merged_df[ddi_feature_cols].isnull().any(axis=1)]
-        print(f"Warning: {len(nan_rows)} rows contain NaN values in the DDI-level features after merging. Example NaN rows:\n{nan_rows.head()}")
+    if include_af:
+        print("Including AF models in the metadata table")
+    
+        merged_df = merged_df.merge(agg_ddi_metadata, left_on='ddi_key', right_on='_pair_key', how='left')
+        ddi_feature_cols = [c for c in agg_ddi_metadata.columns if c != '_pair_key']
+        merged_df.drop(columns=['_pair_key'], inplace=True)  # drop the _pair_key column after the merge, since it's not a feature and must not leak into the output
+
+        # Check for NaNs introduced by the ddi-metadata merge (e.g. domain pairs
+        # present in the test set but missing from the complete ddi metadata)
+        if merged_df[ddi_feature_cols].isnull().any().any():
+            nan_rows = merged_df[merged_df[ddi_feature_cols].isnull().any(axis=1)]
+            print(f"Warning: {len(nan_rows)} rows contain NaN values in the DDI-level features after merging. Example NaN rows:\n{nan_rows.head()}")
 
     # Drop helper key columns, since they're not features and must not leak into the output
-    merged_df.drop(columns=['ddi_key'], inplace=True)  # , '_pair_key'
+    merged_df.drop(columns=['ddi_key'], inplace=True)
 
     # Put pfam_id_a / pfam_id_b as the first two columns
     other_cols = [c for c in merged_df.columns if c not in ('pfam_id_a', 'pfam_id_b')]
@@ -250,6 +255,7 @@ def main():
     parser.add_argument("--metadata_dir", type=str, required=True, help="Path to the directory containing the complete metadata sets (domain_metadata.csv and ddi_metadata.csv)")
     parser.add_argument("--ddi", type=str, required=True, help="Path to the file containing the test set DDIs for the current database")
     parser.add_argument("--out", type=str, required=True, help="Path to the output file where the database-specific metadata will be saved")
+    parser.add_argument("--af", action="store_true", help="If set, AF models are included in the metadata table")
     args = parser.parse_args()
 
     domain_metadata_df, ddi_metadata_df = read_metadata(args.metadata_dir)
@@ -279,7 +285,7 @@ def main():
     # Create single metadata file, one row per ddi instance (pfam_id_a / pfam_id_b),
     # one column group for interaction-level metadata, two column groups for
     # domain-level metadata (one for each domain in the ddi, with _a and _b suffixes)
-    create_single_metadata_file(db_domain_metadata_agg_df, db_ddi_metadata_agg_df, instance_map_df, args.out)
+    create_single_metadata_file(db_domain_metadata_agg_df, db_ddi_metadata_agg_df, instance_map_df, args.out, args.af)
 
 
 if __name__ == "__main__":

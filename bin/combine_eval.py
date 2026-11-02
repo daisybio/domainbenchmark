@@ -127,6 +127,8 @@ def write_multiqc_config(outdir, dataset_order=None) -> str:
 
     enrichment_r2_barplot = pick(rf"^{ENRICHMENT_PREFIX}r2_adj_barplot$")
     enrichment_r2_heatmaps = pick(rf"^{ENRICHMENT_PREFIX}(partial_model_r2|single_feature_r2)_heatmap$")
+    enrichment_group_heatmaps = pick(rf"^{ENRICHMENT_PREFIX}group_partial_model_r2_heatmap$")
+    enrichment_log_odds_heatmaps = pick(rf"^{ENRICHMENT_PREFIX}single_feature_log_odds_heatmap$")
     enrichment_feature_importance = pick(rf"^{ENRICHMENT_PREFIX}feature_importance_(switch|grouped)$")
     enrichment_odds_ratios = pick(rf"^{ENRICHMENT_PREFIX}odds_ratios_(switch|grouped)$")
     enrichment_agreement = pick(rf"^{ENRICHMENT_PREFIX}agreement_(summary|detail)$")
@@ -154,6 +156,8 @@ def write_multiqc_config(outdir, dataset_order=None) -> str:
         + pr_curves_block
         + enrichment_r2_barplot
         + enrichment_r2_heatmaps
+        + enrichment_group_heatmaps
+        + enrichment_log_odds_heatmaps
         + enrichment_feature_importance
         + enrichment_odds_ratios
         + enrichment_agreement

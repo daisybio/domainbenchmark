@@ -10,11 +10,6 @@ HDF5 carries. Below `--min-coverage` is a hard failure. This catches an export
 that does not cover these databases: the wrong dataset, a stale export made
 before domains were added, a truncated file.
 
-If a database has a `ddi_split_membership` table, only the domain instances that
-occur in a row with `is_mock = 0` (as instance_id_a or instance_id_b) are
-counted, so the check covers exactly the data the DDI encodings use. Databases
-without that table are checked on all their domain instances.
-
 Coverage is not required to be exactly 1.0: domainsplit's own exporter warns
 about instances with no embedding ("sequences dropped by --max-len or an OOM at
 batch size 1"), so a legitimate pairing can sit a little under 100%.
@@ -61,15 +56,6 @@ INSTANCE_QUERY_BASE = (
     "JOIN domain ON domain_protein_map.domain_id = domain.id"
 )
 
-# Restricts the lookup to instances used by real (non-mock) DDI rows. Must stay
-# identical to `embeddings.real_instance_filter_sql()`.
-REAL_INSTANCE_FILTER = (
-    f" WHERE {INSTANCE_KEY_EXPR} IN ("
-    "SELECT instance_id_a FROM ddi_split_membership WHERE is_mock = 0 "
-    "UNION "
-    "SELECT instance_id_b FROM ddi_split_membership WHERE is_mock = 0)"
-)
-
 INSTANCE_QUERY_ORDER = " ORDER BY domain.pfam_id, domain_protein_map.rowid"
 
 
@@ -111,34 +97,12 @@ def parse_pairs(raw_pairs):
     return sorted(pairs)
 
 
-def has_ddi_split_membership(conn: sqlite3.Connection) -> bool:
-    """True if `ddi_split_membership` exists and carries an `is_mock` column."""
-    exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'ddi_split_membership'"
-    ).fetchone()
-    if exists is None:
-        return False
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(ddi_split_membership)")}
-    return "is_mock" in columns
-
-
 def read_instances(db_path: Path):
-    """`([(pfam_id, instance_key)], filtered)` for one split database.
-
-    `filtered` is True if the instances were restricted to those used by
-    non-mock rows of `ddi_split_membership`.
-    """
+    """`[(pfam_id, instance_key)]` for every domain instance of one split database."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        filtered = has_ddi_split_membership(conn)
-        query = (
-            INSTANCE_QUERY_BASE
-            + (REAL_INSTANCE_FILTER if filtered else "")
-            + INSTANCE_QUERY_ORDER
-        )
-        instances = [(str(pfam_id), str(key)) for pfam_id, key in conn.execute(query)]
-        return instances, filtered
+        query = INSTANCE_QUERY_BASE + INSTANCE_QUERY_ORDER
+        return [(str(pfam_id), str(key)) for pfam_id, key in conn.execute(query)]
     finally:
         conn.close()
 
@@ -228,21 +192,17 @@ def main() -> int:
     for feature, path in pairs:
         with h5py.File(path, "r") as h5_file:
             for db_path in split_dbs:
-                instances, filtered = read_instances(db_path)
+                instances = read_instances(db_path)
                 split = db_path.stem
-                scope = " (non-mock DDI instances only)" if filtered else ""
                 if not instances:
-                    print(
-                        f"[verify] {feature} x {split}: no domain instances"
-                        f"{scope} -- skipped"
-                    )
+                    print(f"[verify] {feature} x {split}: no domain instances -- skipped")
                     continue
 
                 resolved, total, dom_hit, dom_total, missing = coverage(h5_file, instances)
                 frac = resolved / total
                 print(
                     f"[verify] {feature} x {split}: {resolved}/{total} instances "
-                    f"({frac:.2%}), {dom_hit}/{dom_total} domains{scope}"
+                    f"({frac:.2%}), {dom_hit}/{dom_total} domains"
                 )
                 if frac < args.min_coverage:
                     failures.append(

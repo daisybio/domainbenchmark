@@ -36,28 +36,57 @@ def splitsFor(db_meta) {
     params.train_only ? splits.findAll { it == 'train' } : splits
 }
 
-process SASA_CACHE {
-    tag "sasa_cache"
+params.sasa_cache_shards = 12
+
+process SASA_CACHE_SHARD {
+    tag "sasa_cache_${shard_id}"
     label 'sasa_cache'
 
     conda "${projectDir}/environments/general.yml"
-    // Same image the structure features run in (Bio.PDB + the `features` package).
     container 'docker.io/konstantinpelz/domainbenchmark-gpu:1.0.1'
 
     input:
-        path(dbs, stageAs: 'db?/*')   // every split sqlite3 file, each in its own dbN/ (avoids name clashes)
+        path(dbs, stageAs: 'db?/*')
         path(structure_h5, stageAs: 'structures.h5')
+        each shard_id
 
     output:
-        path('sasa_cache.h5'), emit: cache
+        path("sasa_cache.shard_${shard_id}.h5"), emit: shard
 
     script:
         """
         build_sasa_cache.py \\
             --db db*/* \\
             --struct structures.h5 \\
-            --out sasa_cache.h5 \\
-            --procs ${task.cpus}
+            --out sasa_cache.shard_${shard_id}.h5 \\
+            --procs ${task.cpus} \\
+            --shard_id ${shard_id} \\
+            --n_shards ${params.sasa_cache_shards}
+        """
+
+    stub:
+        """
+        touch sasa_cache.shard_${shard_id}.h5
+        """
+}
+
+
+process MERGE_SASA_CACHE {
+    tag "sasa_cache_merge"
+    label 'process_low'   // use whatever light label your config has
+
+    conda "${projectDir}/environments/general.yml"
+    container 'docker.io/konstantinpelz/domainbenchmark-gpu:1.0.1'
+
+    input:
+        path(shards, stageAs: 'shards/*')
+
+    output:
+        path('sasa_cache.h5'), emit: cache
+
+    script:
+        """
+        merge_sasa_cache.py --shards shards/* --out sasa_cache.h5
         """
 
     stub:
@@ -65,7 +94,6 @@ process SASA_CACHE {
         touch sasa_cache.h5
         """
 }
-
 
 process FEATURE_EXTRACTION_ONE {
     tag "${meta.id}"
@@ -191,8 +219,9 @@ workflow FEATURE_EXTRACTION {
                 }
                 .toSortedList { a, b -> a.toString() <=> b.toString() }
 
-            SASA_CACHE(sasa_dbs, struct_file_ch)
-            sasa_cache_ch = SASA_CACHE.out.cache.first()
+            SASA_CACHE_SHARD(sasa_dbs, struct_file_ch, Channel.of(0..<params.sasa_cache_shards))
+            MERGE_SASA_CACHE(SASA_CACHE_SHARD.out.shard.collect())
+            sasa_cache_ch = MERGE_SASA_CACHE.out.cache.first()
 
             // Structure features wait for the cache ...
             with_cache = per_task_with_struct

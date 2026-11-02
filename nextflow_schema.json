@@ -155,9 +155,9 @@
                     "fa_icon": "fas fa-microchip"
                 },
                 "train_only": {
-                    "type": "boolean",
-                    "default": false,
+                    "type": "string",
                     "description": "Only compute encodings for training data, used for external feature selection.",
+                    "help_text": "For external feature selection, only the training data is needed. This option skips the feature extraction for validation and test splits and all downstream analyses, which saves time and memory.",
                     "fa_icon": "fas fa-dumbbell"
                 },
                 "metadata": {

@@ -35,6 +35,7 @@ from Bio.PDB.SASA import ShrakeRupley
 from scipy.spatial.distance import cdist
 from features import embeddings
 from .structure_utils import bytes_to_pdb_structure
+import zlib
 
 # Tien et al. 2013 (same values as structure_utils.calculate_rsa_residue_level)
 MAX_SASA = {
@@ -148,8 +149,8 @@ def _init_worker(struct_path):
     _SF = h5py.File(struct_path, "r")
 
 
-def _jobs(dbs, done):
-    """Yield only (key, (pfam_a, pfam_b, inst_a, inst_b)) -- no structure bytes."""
+def _jobs(dbs, done, shard_id=0, n_shards=1):
+    """Yield only (key, (pfam_a, pfam_b, inst_a, inst_b)) belonging to this shard."""
     seen = set(done)
     for db in dbs:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -160,6 +161,8 @@ def _jobs(dbs, done):
             if key in seen:
                 continue
             seen.add(key)
+            if n_shards > 1 and zlib.crc32(key.encode()) % n_shards != shard_id:
+                continue
             yield key, (pa, pb, ia, ib)
 
 
@@ -180,16 +183,22 @@ def main():
     ap.add_argument("--struct", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--procs", type=int, default=8)
+    ap.add_argument("--shard_id", type=int, default=0)
+    ap.add_argument("--n_shards", type=int, default=1)
     a = ap.parse_args()
+
+    if not (0 <= a.shard_id < a.n_shards):
+        raise SystemExit(f"shard_id {a.shard_id} out of range for n_shards {a.n_shards}")
 
     n_ok = n_skip = n_missing = 0
     errors = []
     # Pool first (fork before any HDF5 file is open in the parent)
     with Pool(a.procs, initializer=_init_worker, initargs=(a.struct,),
               maxtasksperchild=2000) as pool:
-        with h5py.File(a.out, "a") as out:
+        with h5py.File(a.out, "a") as out:   # always created, even if this shard is empty
             done = list(out.keys())
-            for key, res in pool.imap_unordered(_work, _jobs(a.db, done), chunksize=8):
+            jobs = _jobs(a.db, done, a.shard_id, a.n_shards)
+            for key, res in pool.imap_unordered(_work, jobs, chunksize=8):
                 if res is False:
                     n_missing += 1
                     continue
@@ -207,7 +216,7 @@ def main():
                 n_ok += 1
                 if n_ok % 5000 == 0:
                     out.flush()
-    print(f"sasa_cache: wrote {n_ok}, skipped {n_skip} (<2 chains), "
+    print(f"sasa_cache shard {a.shard_id}/{a.n_shards}: wrote {n_ok}, skipped {n_skip} (<2 chains), "
           f"missing {n_missing}, failed {len(errors)}")
     for key, msg in errors[:20]:
         print("  FAILED", key, msg)

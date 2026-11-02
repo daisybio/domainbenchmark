@@ -7,8 +7,8 @@
     ],
     k_closest_distance: [
         variants: [
-            [suffix: '_5d',  params: [res_num: 5]],
-            [suffix: '_10d', params: [res_num: 10]],
+            [suffix: '_5k',  params: [res_num: 5]],
+            [suffix: '_10k', params: [res_num: 10]],
         ]
     ],
     patch_mean_contacts: [

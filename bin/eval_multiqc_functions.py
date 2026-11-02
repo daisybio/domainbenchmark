@@ -531,11 +531,11 @@ def aggregate_per_model_metrics(per_model_files):
     return metrics_aucap, roc_curves, pr_curves, metrics_df, model_list
 
 
-ENRICHMENT_TARGET_ORDER = ["binary", "predicted", "combined", "error"]
+ENRICHMENT_TARGET_ORDER = ["observed", "predicted", "combined", "error"]
 
 ENRICHMENT_TARGET_LABELS = {
     "error": "Prediction error",
-    "binary": "True interaction",
+    "observed": "Observed interaction",
     "predicted": "Predicted interaction",
     "combined": "Combined (TN/FP/FN/TP)",
 }
@@ -560,10 +560,14 @@ def aggregate_per_model_enrichment(per_model_files):
                   "per_class": {...},                     # mnlogit only
               },
               "partial_model_r2": {feature: float},
+              "group_partial_model_r2": {group: float},     # leave-group-out: af / interpro / biochem
+              "feature_groups": {feature: group},
               "single_feature_r2": {feature: float},
+              "single_feature_log_odds": {feature: float}       # logit
+                                         | {equation: {feature: float}},  # mnlogit
               "checks": {...},
           },
-          ... one entry per target ("error", "binary", "predicted", "combined") ...
+          ... one entry per target ("error", "observed", "predicted", "combined") ...
         }
  
     Returns
@@ -717,6 +721,29 @@ def get_odds_ratio_series(target_data: dict):
     return series
 
 
+
+
+def get_single_feature_log_odds_series(target_data: dict):
+    """
+    Return a list of (label_suffix, {feature: log_odds}) tuples for the
+    single-feature models of one target: one series for a Logit target, one per
+    non-baseline equation (suffix e.g. " (TP vs TN)") for MNLogit. Empty for OLS
+    targets and for JSONs written before `single_feature_log_odds` existed.
+    Values are natural-log odds (the raw slope), None where a fit had none.
+    """
+    model_kind = target_data.get("model_kind")
+    sfl = target_data.get("single_feature_log_odds") or {}
+    if not sfl:
+        return []
+    if model_kind == "logit":
+        return [("", sfl)]
+    if model_kind == "mnlogit":
+        return [
+            (f" ({CLASS_EQUATION_LABELS.get(eq_name, eq_name)})", vals)
+            for eq_name, vals in sfl.items()
+            if isinstance(vals, dict)
+        ]
+    return []
 
 
 def calculate_metrics(y_true, y_pred, model_name) -> dict[str, object]:

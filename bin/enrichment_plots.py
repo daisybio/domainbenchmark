@@ -42,6 +42,7 @@ from eval_multiqc_functions import (
     aggregate_per_model_enrichment,
     get_odds_ratio_series,
     get_signed_effect,
+    get_single_feature_log_odds_series,
 )
 
 
@@ -282,6 +283,45 @@ def build_r2_heatmap_blocks(enrichment_by_model, models, targets, features, outd
     return block_ids
 
 
+GROUP_PARTIAL_KEY = "group_partial_model_r2"
+GROUP_ORDER = ("af", "interpro", "biochem")
+
+
+def build_group_partial_heatmap_blocks(enrichment_by_model, models, targets, outdir, prefix, db_name):
+    """Leave-group-out R^2 (group x model, switch by target). Writes 1 block
+    (empty list if no model carries group results, e.g. JSONs from older runs)."""
+    seen = set()
+    for model in models:
+        for target in targets:
+            seen.update(enrichment_by_model.get(model, {}).get(target, {}).get(GROUP_PARTIAL_KEY, {}).keys())
+    if not seen:
+        return []
+    groups = [g for g in GROUP_ORDER if g in seen] + sorted(seen - set(GROUP_ORDER))
+
+    kind_label = "Leave-group-out R\u00b2"
+    target_labels = {t: ENRICHMENT_TARGET_LABELS.get(t, t) for t in targets}
+    entries_for_db = _r2_heatmap_entries_for_db(enrichment_by_model, models, targets, groups, GROUP_PARTIAL_KEY)
+    for entry in entries_for_db.values():
+        entry["layout"]["yaxis"] = {"title": "Feature group"}
+    axes = [{"key": "target", "label": "Target", "values": targets, "control": "buttons",
+             "value_labels": target_labels}]
+    entries = {(t,): v for t, v in entries_for_db.items()}
+
+    block_id = f"{prefix}{GROUP_PARTIAL_KEY}_heatmap"
+    div_id = f"{block_id}_plot"
+    body_html = render_switchable_plot(div_id, axes, entries, height=360)
+    _write_block(
+        outdir, block_id, f"{kind_label} by feature group (group \u00d7 model)", body_html,
+        extra={
+            "raw_entries": {db_name: entries_for_db},
+            "raw_targets": {db_name: targets},
+            "raw_target_labels": target_labels,
+            "kind_label": kind_label,
+        },
+    )
+    return [block_id]
+
+
 def _combine_r2_heatmap(block_id, per_db_blocks, outdir):
     all_targets, target_labels = [], {}
     entries = {}
@@ -304,7 +344,88 @@ def _combine_r2_heatmap(block_id, per_db_blocks, outdir):
     ]
     div_id = f"{block_id}_plot"
     body_html = render_switchable_plot(div_id, axes, entries, height=560)
-    _write_block(outdir, block_id, f"{kind_label} by feature (feature \u00d7 model)", body_html)
+    by_what = "feature group (group \u00d7 model)" if GROUP_PARTIAL_KEY in block_id else "feature (feature \u00d7 model)"
+    _write_block(outdir, block_id, f"{kind_label} by {by_what}", body_html)
+
+
+# ---------------------------------------------------------------------------
+# 1b) Single-feature log-odds heatmaps: feature x model, switch by target
+#     (+ database if combined). Same layout as the R^2 heatmaps, but signed:
+#     diverging colorscale centred on 0 (blue = negative, red = positive).
+#     Only Logit / MNLogit targets have log odds, so "error" (OLS) is absent;
+#     each MNLogit equation (FP/FN/TP vs TN) is its own target button.
+# ---------------------------------------------------------------------------
+LOG_ODDS_KEY = "single_feature_log_odds"
+LOG_ODDS_KIND_LABEL = "Single-feature log2(odds ratio)"
+_LN2 = float(np.log(2.0))  # JSON stores natural-log odds; plots/CSV use log2 = ln / ln(2)
+
+
+def _log2(val):
+    """Natural-log odds (as stored in the JSON) -> log2 odds ratio, JSON-safe."""
+    v = _safe(val)
+    return None if v is None else v / _LN2
+
+
+def build_single_feature_log_odds_heatmap_blocks(enrichment_by_model, models, targets, features,
+                                                 outdir, prefix, db_name):
+    """Per-database entry point. Writes 1 block (empty list if no data at all)."""
+    # {tkey: {model: {feature: log_odds}}}, tkey = target + equation suffix
+    values, target_labels, tkeys = {}, {}, []
+    for target in targets:
+        for model in models:
+            target_data = enrichment_by_model.get(model, {}).get(target, {})
+            for suffix, vals in get_single_feature_log_odds_series(target_data):
+                tkey = f"{target}{suffix}"
+                if tkey not in tkeys:
+                    tkeys.append(tkey)
+                target_labels[tkey] = ENRICHMENT_TARGET_LABELS.get(target, target) + suffix
+                values.setdefault(tkey, {})[model] = vals
+
+    entries_for_db = {}
+    for tkey in tkeys:
+        matrix = [
+            [_log2(values[tkey].get(model, {}).get(feat)) for model in models]
+            for feat in features
+        ]
+        finite = [v for row in matrix for v in row if v is not None]
+        if not finite:
+            continue
+        # Symmetric range so the neutral colour is always exactly log2(OR) = 0.
+        bound = max(abs(v) for v in finite) or 1.0
+        trace = _heatmap_trace(
+            matrix, models, features, colorscale="RdBu", zmin=-bound, zmax=bound, zmid=0,
+            colorbar={"title": "log2(OR)"},
+        )
+        layout = {
+            "title": f"{target_labels[tkey]} \u2014 log2(odds ratio) of single-feature models "
+                     "(blue=negative, red=positive)",
+            "xaxis": {"title": "Model"},
+            "yaxis": {"title": "Feature"},
+        }
+        entries_for_db[tkey] = {"traces": [trace], "layout": layout}
+
+    if not entries_for_db:
+        return []
+
+    tkeys = [t for t in tkeys if t in entries_for_db]
+    target_labels = {t: target_labels[t] for t in tkeys}
+    axes = [{"key": "target", "label": "Target", "values": tkeys, "control": "buttons",
+             "value_labels": target_labels}]
+    entries = {(t,): v for t, v in entries_for_db.items()}
+
+    block_id = f"{prefix}{LOG_ODDS_KEY}_heatmap"
+    div_id = f"{block_id}_plot"
+    body_html = render_switchable_plot(div_id, axes, entries, height=560)
+    _write_block(
+        outdir, block_id, f"{LOG_ODDS_KIND_LABEL} by feature (feature \u00d7 model)", body_html,
+        extra={
+            "raw_entries": {db_name: entries_for_db},
+            "raw_targets": {db_name: tkeys},
+            "raw_target_labels": target_labels,
+            "kind_label": LOG_ODDS_KIND_LABEL,
+        },
+    )
+    return [block_id]
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +844,7 @@ def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefi
 
     Writes (only the files for which data actually exists):
         enrichment_r2_heatmap_data.csv          database,kind,target,feature,model,r2
+        enrichment_single_feature_log_odds_heatmap_data.csv  database,target,feature,model,log2_odds_ratio
         enrichment_r2_adj_barplot_data.csv       database,target,model,r2_adj
         enrichment_feature_importance_data.csv   database,target,model,feature,partial_r2
         enrichment_odds_ratios_data.csv          database,target,model,feature,log2_odds_ratio
@@ -738,6 +860,7 @@ def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefi
     for db_name, blocks in enrichment_blocks_by_db.items():
         for kind, block_id in (
             ("partial_model_r2", f"{prefix}partial_model_r2_heatmap"),
+            ("group_partial_model_r2", f"{prefix}group_partial_model_r2_heatmap"),
             ("single_feature_r2", f"{prefix}single_feature_r2_heatmap"),
         ):
             block = blocks.get(block_id)
@@ -750,8 +873,6 @@ def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefi
                 for fi, feat in enumerate(features_y):
                     for mi, model in enumerate(models_x):
                         val = z[fi][mi]
-                        if val is None:
-                            continue
                         heatmap_rows.append({
                             "database": db_name, "kind": kind, "target": target,
                             "feature": feat, "model": model, "r2": val,
@@ -760,6 +881,29 @@ def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefi
         written.append(_write_csv(
             outdir, f"{prefix}r2_heatmap_data.csv",
             ["database", "kind", "target", "feature", "model", "r2"], heatmap_rows,
+        ))
+
+    # --- 1b) single-feature log odds heatmap (feature x model, per target/equation) ---
+    log_odds_rows = []
+    for db_name, blocks in enrichment_blocks_by_db.items():
+        block = blocks.get(f"{prefix}{LOG_ODDS_KEY}_heatmap")
+        if not block:
+            continue
+        entries = block.get("raw_entries", {}).get(db_name, {})
+        for target, entry in entries.items():
+            trace = entry["traces"][0]
+            models_x, features_y, z = trace["x"], trace["y"], trace["z"]
+            for fi, feat in enumerate(features_y):
+                for mi, model in enumerate(models_x):
+                    val = z[fi][mi]
+                    log_odds_rows.append({
+                        "database": db_name, "target": target,
+                        "feature": feat, "model": model, "log2_odds_ratio": val,
+                    })
+    if log_odds_rows:
+        written.append(_write_csv(
+            outdir, f"{prefix}{LOG_ODDS_KEY}_heatmap_data.csv",
+            ["database", "target", "feature", "model", "log2_odds_ratio"], log_odds_rows,
         ))
 
     # --- 2) R^2 / pseudo-R^2 barplot (per model, series=target) ---
@@ -774,8 +918,8 @@ def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefi
         for trace in entry["traces"]:
             target = trace["name"]
             for model, val in zip(trace["x"], trace["y"]):
-                if val is None:
-                    continue
+                # if val is None:
+                #     continue
                 bar_rows.append({"database": db_name, "target": target, "model": model, "r2_adj": val})
     if bar_rows:
         written.append(_write_csv(
@@ -800,8 +944,6 @@ def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefi
                 for trace in entry["traces"]:
                     target = trace["name"]
                     for feat, val in zip(trace["x"], trace["y"]):
-                        if val is None:
-                            continue
                         rows.append({
                             "database": db_name, "target": target, "model": model,
                             "feature": feat, value_col: val,
@@ -822,6 +964,7 @@ def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefi
         for model, row in data.items():
             summary_rows.append({
                 "database": db_name, "model": model,
+                # "r2": row.get("R²"),
                 "sign_consistent_pct": row.get("Sign-consistent features (%)"),
             })
     if summary_rows:
@@ -844,8 +987,6 @@ def write_enrichment_data_csvs(enrichment_blocks_by_db: dict, outdir: str, prefi
             for fi, feat in enumerate(features_y):
                 for ti, target in enumerate(targets_x):
                     val = z[fi][ti]
-                    if val is None:
-                        continue
                     detail_rows.append({
                         "database": db_name, "model": model, "target": target,
                         "feature": feat, "sign": val,
@@ -872,6 +1013,9 @@ def write_enrichment_plotly_blocks(per_model_enrichment_files, outdir, db_name, 
 
     block_ids = []
     block_ids += build_r2_heatmap_blocks(enrichment_by_model, models, targets, features, outdir, prefix, db_name)
+    block_ids += build_group_partial_heatmap_blocks(enrichment_by_model, models, targets, outdir, prefix, db_name)
+    block_ids += build_single_feature_log_odds_heatmap_blocks(
+        enrichment_by_model, models, targets, features, outdir, prefix, db_name)
     block_ids.append(build_r2_barplot_block(enrichment_by_model, models, targets, outdir, prefix, db_name))
     block_ids += build_feature_importance_blocks(enrichment_by_model, models, targets, outdir, prefix, db_name)
     block_ids += build_odds_ratio_blocks(enrichment_by_model, models, targets, outdir, prefix, db_name)
@@ -882,8 +1026,10 @@ def write_enrichment_plotly_blocks(per_model_enrichment_files, outdir, db_name, 
 # Map block-id suffix (without prefix) -> merge function. Populated once the
 # prefix-stripped ids are known; used by combine_enrichment_blocks().
 _MERGE_DISPATCH_SUFFIXES = {
+    "group_partial_model_r2_heatmap": _combine_r2_heatmap,
     "partial_model_r2_heatmap": _combine_r2_heatmap,
     "single_feature_r2_heatmap": _combine_r2_heatmap,
+    "single_feature_log_odds_heatmap": _combine_r2_heatmap,
     "r2_adj_barplot": _combine_r2_barplot,
     "feature_importance_switch": lambda bid, blocks, outdir: _combine_bar_family_switch(bid, blocks, outdir, "Partial R\u00b2"),
     "feature_importance_grouped": lambda bid, blocks, outdir: _combine_bar_family_grouped(bid, blocks, outdir, "Partial R\u00b2"),

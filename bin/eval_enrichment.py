@@ -6,16 +6,22 @@ Reads ONE predictions file, computes enrichment metrics, specifically
 different regression models and evaluates feature importance,
 generating a small JSON sidecar consumed by `eval_multiqc.py`.
 
+Besides the per-feature drop-one importance, a leave-group-out importance is
+computed for three feature blocks (AlphaFold `af_*`, InterPro `interpro_*`,
+everything else = biochem). Dropping a whole block avoids the underestimation of
+collinear features that drop-one suffers from (a feature's information is still
+carried by its correlated neighbours).
+
 Model selection per target type
 --------------------------------
 - "error"     (continuous, |true - predicted_probability| in [0,1])  -> OLS  (statsmodels)
-- "binary"    (true_interaction, 0/1)                                -> Logit (statsmodels)
+- "observed"    (true_interaction, 0/1)                                -> Logit (statsmodels)
 - "predicted" (predicted_interaction, 0/1)                           -> Logit (statsmodels)
 - "combined"  (0/1/2/3 nominal: TN/FN/FP/TP)                         -> MNLogit (statsmodels)
 
 We use statsmodels instead of sklearn's LinearRegression for the
 classification targets because:
-  * binary/combined targets are not continuous -> OLS on 0/1 data
+  * observed/combined targets are not continuous -> OLS on 0/1 data
     (the "linear probability model") gives unbounded predictions and
     heteroscedastic, non-normal residuals; logistic/multinomial-logit
     models the probabilities correctly.
@@ -46,7 +52,7 @@ except ImportError:  # pragma: no cover
 # Which statsmodels model class to fit for each target
 MODEL_KIND = {
     "error": "ols",
-    "binary": "logit",
+    "observed": "logit",
     "predicted": "logit",
     "combined": "mnlogit",
 }
@@ -99,7 +105,7 @@ def identify_column_types(df: pd.DataFrame) -> Tuple[dict, set]:
         if col in ["domain_a", "domain_b"]:
             column_types[col] = "domain"
         elif col in ["true_interaction", "predicted_interaction"]:
-            column_types[col] = "binary"
+            column_types[col] = "observed"
         elif col == "predicted_probability":
             column_types[col] = "probability"
         else:
@@ -397,7 +403,7 @@ def _extract_stats(kind: str, res, column_names: list, classes=None) -> dict:
             abs_coef_matrix[:, j] = np.abs(coefs_j)
 
         # Top-level summary: mean |coefficient| across the non-baseline equations,
-        # so this target still fits the same reporting shape as the binary targets.
+        # so this target still fits the same reporting shape as the observed targets.
         mean_abs_coef = abs_coef_matrix.mean(axis=1)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -508,15 +514,100 @@ def _warm_start_without(full_res, kind, sl):
     return reduced.ravel(order="F") if reduced.ndim == 2 else reduced
 
 
-def _score_task(kind, X, y, llnull, drop_slice=None, keep_slice=None, start_params=None):
-    """One auxiliary fit -> R^2/pseudo-R^2. Runs inside a joblib worker."""
+#: |beta| (natural log) above which a single-feature slope is treated as
+#: separation / non-convergence (exp(10) ~ 22,000-fold odds per unit).
+#: Same threshold as the "extreme_coefficients" check.
+LOG_ODDS_MAX_ABS = 10.0
+#: Minimum number of samples in a class for its MNLogit equation to be reported.
+MIN_EVENTS_PER_EQUATION = 30
+
+
+def _slope_params(kind, res):
+    """Slope coefficients (log odds) of a fitted single-feature model, intercept
+    row removed. None for OLS, for regularized fallback fits, and for fits that
+    did not converge or returned non-finite slopes."""
+    if kind not in ("logit", "mnlogit") or getattr(res, "_used_fallback", False):
+        return None
+    if not getattr(res, "_converged", True):
+        return None
+    params = np.asarray(res.params)
+    slopes = params[1:] if kind == "mnlogit" else params.ravel()[1:]
+    if not np.all(np.isfinite(slopes)):
+        return None
+    return slopes
+
+
+# ---------------------------------------------------------------------------
+# Leave-group-out: feature blocks instead of single features
+# ---------------------------------------------------------------------------
+#: Prefix -> group. Checked in order; anything that matches no prefix falls into
+#: DEFAULT_FEATURE_GROUP (the "biochem" block has no distinct prefix).
+FEATURE_GROUP_PREFIXES = (
+    ("af_", "af"),
+    ("interpro_", "interpro"),
+)
+DEFAULT_FEATURE_GROUP = "biochem"
+#: Display/processing order of the groups.
+FEATURE_GROUP_ORDER = ("af", "interpro", DEFAULT_FEATURE_GROUP)
+
+
+def assign_feature_group(feature: str) -> str:
+    """Group of a base feature name (without _a/_b suffix): AlphaFold (af_),
+    InterPro (interpro_), otherwise biochem."""
+    for prefix, group in FEATURE_GROUP_PREFIXES:
+        if feature.startswith(prefix):
+            return group
+    return DEFAULT_FEATURE_GROUP
+
+
+def build_feature_groups(feature_names) -> dict:
+    """{feature: group} for all features."""
+    return {f: assign_feature_group(f) for f in feature_names}
+
+
+def _group_columns(feature_groups: dict, feature_slices: dict) -> dict:
+    """{group: sorted list of design-matrix column indices} (both _a and _b
+    columns of domain-level features). Groups without any feature are omitted."""
+    cols = {}
+    for feat, group in feature_groups.items():
+        sl = feature_slices.get(feat)
+        if sl is None:
+            continue
+        cols.setdefault(group, []).extend(range(sl.start, sl.stop))
+    ordered = [g for g in FEATURE_GROUP_ORDER if g in cols] + sorted(set(cols) - set(FEATURE_GROUP_ORDER))
+    return {g: sorted(cols[g]) for g in ordered}
+
+
+def _warm_start_without_cols(full_res, kind, cols):
+    """Like _warm_start_without(), but for an arbitrary list of design columns."""
+    if kind not in ("logit", "mnlogit") or getattr(full_res, "_used_fallback", False):
+        return None
+    params = np.asarray(full_res.params)
+    keep = np.ones(params.shape[0], dtype=bool)
+    keep[[1 + c for c in cols]] = False  # +1: row 0 is the intercept
+    reduced = params[keep]
+    return reduced.ravel(order="F") if reduced.ndim == 2 else reduced
+
+
+def _score_task(kind, X, y, llnull, drop_slice=None, keep_slice=None, start_params=None,
+                return_params=False, drop_cols=None):
+    """One auxiliary fit -> R^2/pseudo-R^2 (and, with return_params=True,
+    (R^2, slope params)). Runs inside a joblib worker."""
     def _run():
         if keep_slice is not None:
             Xs = X[:, keep_slice]
+        elif drop_cols is not None:
+            Xs = np.delete(X, list(drop_cols), axis=1)
+            if Xs.shape[1] == 0:
+                # Every feature was dropped -> intercept-only model, R^2 = 0 by definition
+                return (0.0, None) if return_params else 0.0
         else:
             Xs = np.delete(X, slice(drop_slice.start, drop_slice.stop), axis=1)
         res = _fit_statsmodel(kind, Xs, y, start_params=start_params, light=True)
-        return _pseudo_or_real_r2(kind, y, res, llnull)
+        r2 = _pseudo_or_real_r2(kind, y, res, llnull)
+        if return_params:
+            return r2, _slope_params(kind, res)
+        return r2
 
     if threadpool_limits is not None:
         with threadpool_limits(limits=1):
@@ -524,19 +615,65 @@ def _score_task(kind, X, y, llnull, drop_slice=None, keep_slice=None, start_para
     return _run()
 
 
+def _collapse_log_odds(p):
+    """Mean log odds over a feature's design columns (_a/_b) = log of the
+    geometric mean of the odds ratios. None if nothing finite is available or if
+    any slope is implausibly large (quasi-/complete separation)."""
+    if p is None:
+        return None
+    p = np.asarray(p, dtype=float)
+    if p.size == 0 or not np.all(np.isfinite(p)) or np.any(np.abs(p) > LOG_ODDS_MAX_ABS):
+        return None
+    return float(p.mean())
+
+
+def _single_feature_log_odds(kind, feats, params_list, y):
+    """Arrange the per-feature slope params into the JSON layout:
+      logit   -> {feature: log_odds}
+      mnlogit -> {"class_<label>_vs_baseline": {feature: log_odds}, ...}
+      ols     -> {}
+    Equations whose class has fewer than MIN_EVENTS_PER_EQUATION samples are
+    skipped entirely (their slopes are not estimable reliably)."""
+    if kind == "logit":
+        return {f: _collapse_log_odds(p) for f, p in zip(feats, params_list)}
+    if kind == "mnlogit":
+        classes, counts = np.unique(np.asarray(y), return_counts=True)
+        out = {}
+        for j in range(len(classes) - 1):
+            if counts[j + 1] < MIN_EVENTS_PER_EQUATION:
+                print(f"[enrichment] Skipping single-feature log odds for class "
+                      f"{int(classes[j + 1])}: only {int(counts[j + 1])} samples.")
+                continue
+            key = f"class_{int(classes[j + 1])}_vs_baseline"
+            out[key] = {
+                f: _collapse_log_odds(None if p is None else np.asarray(p)[:, j])
+                for f, p in zip(feats, params_list)
+            }
+        return out
+    return {}
+
+
 def compute_single_feature_correlations(X, y, feature_names, feature_slices, target_name,
                                         llnull=None, n_jobs=1):
+    """Fit one model per feature. Returns (r2, log_odds):
+      r2       {feature: R^2 / McFadden pseudo-R^2 of the single-feature model}
+      log_odds {feature: slope} (logit) / {equation: {feature: slope}} (mnlogit)
+               / {} (ols) -- see _single_feature_log_odds()."""
     kind = MODEL_KIND[target_name]
     if kind != "ols" and llnull is None:
         llnull = _null_loglik(kind, y)
     feats = list(feature_names)
-    scores = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_score_task)(kind, X, y, llnull, keep_slice=feature_slices[f]) for f in feats
+    out = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(_score_task)(kind, X, y, llnull, keep_slice=feature_slices[f], return_params=True)
+        for f in feats
     )
-    return {
-        f: float(np.clip(r2, 0, 1)) if not np.isnan(r2) else float("nan")
-        for f, r2 in zip(feats, scores)
+    scores = [o[0] for o in out]
+    r2 = {
+        f: float(np.clip(s, 0, 1)) if not np.isnan(s) else float("nan")
+        for f, s in zip(feats, scores)
     }
+    log_odds = _single_feature_log_odds(kind, feats, [o[1] for o in out], y)
+    return r2, log_odds
 
 
 def compute_partial_correlation(X, y, feature_names, feature_slices, target_name,
@@ -594,6 +731,37 @@ def compute_partial_correlation(X, y, feature_names, feature_slices, target_name
         raise ValueError(f"[enrichment] Invalid method {method} for partial correlation. Choose 'drop_one' or 'permutation'.")
 
     return partial_corr_results
+
+
+def compute_group_partial_correlation(X, y, feature_groups, feature_slices, target_name,
+                                      full_res=None, llnull=None, n_jobs=1):
+    """Leave-group-out: R^2(full) - R^2(full without ALL columns of one group).
+
+    Unlike drop-one, collinear features inside a group no longer "cover" for each
+    other, so a group's value reflects what the whole block contributes beyond the
+    other blocks. Returns {group: value in [0, 1]} (same clipping as drop-one)."""
+    kind = MODEL_KIND[target_name]
+    if kind != "ols" and llnull is None:
+        llnull = _null_loglik(kind, y)
+    if full_res is None:
+        full_res = _fit_statsmodel(kind, X, y)
+    r2_full = _pseudo_or_real_r2(kind, y, full_res, llnull)
+    r2_full_clipped = np.clip(r2_full, 0, 1) if not np.isnan(r2_full) else 0.0
+
+    group_cols = _group_columns(feature_groups, feature_slices)
+    groups = list(group_cols)
+    scores = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(_score_task)(
+            kind, X, y, llnull, drop_cols=group_cols[g],
+            start_params=_warm_start_without_cols(full_res, kind, group_cols[g]),
+        )
+        for g in groups
+    )
+    out = {}
+    for g, r2_reduced in zip(groups, scores):
+        r2_reduced_clipped = np.clip(r2_reduced, 0, 1) if not np.isnan(r2_reduced) else 0.0
+        out[g] = float(np.clip(r2_full_clipped - r2_reduced_clipped, 0, 1))
+    return out
 
 
 def check_computations(result_dict):
@@ -720,7 +888,7 @@ def check_computations(result_dict):
 
 
 
-def write_results_to_json(results: dict, output_path: str, model_name: str):
+def write_results_to_json(results: dict, output_path: str, model_name: str, feature_groups: dict = None):
     # Write r2 / pseudo-r2 values for all models and the checks to a JSON file
     output_data = {"model_name": model_name}
 
@@ -749,7 +917,14 @@ def write_results_to_json(results: dict, output_path: str, model_name: str):
                 "pvalues": complete_model["pvalues"],
             },
             "partial_model_r2": results[target_var]["partial_model_r2"],
+            # Leave-group-out (af / interpro / biochem): R^2(full) - R^2(without group)
+            "group_partial_model_r2": results[target_var].get("group_partial_model_r2", {}),
+            # {feature: group}; kept inside the target entry because downstream readers
+            # treat every top-level dict in this JSON as a target.
+            "feature_groups": feature_groups or {},
             "single_feature_r2": results[target_var]["single_feature_r2"],
+            # Slope (log odds) of each single-feature model; empty for OLS targets.
+            "single_feature_log_odds": results[target_var].get("single_feature_log_odds", {}),
             "checks": results[target_var]["checks"],
         }
         if "feature_coefficients" in complete_model:
@@ -775,8 +950,9 @@ def main():
     parser.add_argument("--model_name", required=True)
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--standardize", action="store_true", default=False, help="Standardize features before regression.")
-    parser.add_argument("--partial_method", choices=["drop_one", "permutation"], default="drop_one",
-                         help="Method for computing partial (feature-dropped) explanatory power.")
+    parser.add_argument("--partial_method", choices=["drop_one", "permutation", "none"], default="drop_one",
+                         help="Method for the per-feature partial explanatory power. 'none' skips the "
+                              "per-feature leave-one-out entirely (leave-group-out is always computed).")
     parser.add_argument("--threads", type=int, default=1,
                          help="Parallel workers for the drop-one / single-feature fits (use ${task.cpus}).")
     parser.add_argument("--out", required=True)
@@ -790,12 +966,17 @@ def main():
 
     X, feature_names, X_cols, feature_slices = prepare_data_for_regression(combined_df, column_types, feature_names, args.standardize)
 
+    # Leave-group-out blocks: af_* / interpro_* / everything else (biochem)
+    feature_groups = build_feature_groups(feature_names)
+    group_sizes = {g: sum(1 for v in feature_groups.values() if v == g) for g in dict.fromkeys(feature_groups.values())}
+    print(f"[enrichment] Feature groups (n features): {group_sizes}")
+
     results = {}
 
     # Option 1: Use the prediction error as the target variable for regression (continuous -> OLS)
     y_error = (combined_df["true_interaction"] - combined_df["predicted_probability"].values).abs().values
     # Option 2: Use the true interaction as the target variable for regression (binary -> Logit)
-    y_binary = combined_df["true_interaction"].values
+    y_observed = combined_df["true_interaction"].values
     # Option 3: Use the predicted interaction as the target variable for regression (binary -> Logit)
     y_predicted = combined_df["predicted_interaction"].values
     # Option 4: Combine prediction and true interaction (nominal, 4 classes -> MNLogit)
@@ -803,15 +984,15 @@ def main():
     # 2 = false negative (FN: true 1, pred 0), 3 = true positive (TP)
     y_combined = (2 * combined_df["true_interaction"].astype(int).values
                   + combined_df["predicted_interaction"].astype(int).values).astype(int)
-    # Print out first 10 values of y_binary, y_predicted, and y_combined for sanity check
-    print("[enrichment] First 10 values of y_binary:", y_binary[:10])
+    # Print out first 10 values of y_observed, y_predicted, and y_combined for sanity check
+    print("[enrichment] First 10 values of y_observed:", y_observed[:10])
     print("[enrichment] First 10 values of y_predicted:", y_predicted[:10])
     print("[enrichment] First 10 values of y_combined:", y_combined[:10])
     
 
     y_dict = {
         "error": y_error,
-        "binary": y_binary,
+        "observed": y_observed,
         "predicted": y_predicted,
         "combined": y_combined,
     }
@@ -825,12 +1006,20 @@ def main():
             complete_model = fit_regression_models(
                 X, y, X_cols, target_name, feature_slices=feature_slices, llnull=llnull)
             print(f"[enrichment]   complete model: {time.perf_counter() - t0:.1f}s")
-            partial_model_r2 = compute_partial_correlation(
-                X, y, feature_names, feature_slices, target_name, method=args.partial_method,
+            if args.partial_method == "none":
+                partial_model_r2 = {}
+            else:
+                partial_model_r2 = compute_partial_correlation(
+                    X, y, feature_names, feature_slices, target_name, method=args.partial_method,
+                    full_res=complete_model["model"], llnull=llnull, n_jobs=args.threads,
+                )
+            print(f"[enrichment]   + partial R2:   {time.perf_counter() - t0:.1f}s")
+            group_partial_model_r2 = compute_group_partial_correlation(
+                X, y, feature_groups, feature_slices, target_name,
                 full_res=complete_model["model"], llnull=llnull, n_jobs=args.threads,
             )
-            print(f"[enrichment]   + partial R2:   {time.perf_counter() - t0:.1f}s")
-            single_feature_r2 = compute_single_feature_correlations(
+            print(f"[enrichment]   + group R2:     {time.perf_counter() - t0:.1f}s")
+            single_feature_r2, single_feature_log_odds = compute_single_feature_correlations(
                 X, y, feature_names, feature_slices, target_name, llnull=llnull, n_jobs=args.threads)
             print(f"[enrichment]   + single-feat:  {time.perf_counter() - t0:.1f}s")
         except ValueError as e:
@@ -843,13 +1032,15 @@ def main():
         results[target_name] = {
             "complete_model": complete_model,
             "partial_model_r2": partial_model_r2,
+            "group_partial_model_r2": group_partial_model_r2,
             "single_feature_r2": single_feature_r2,
+            "single_feature_log_odds": single_feature_log_odds,
         }
 
         checks = check_computations(results[target_name])
         results[target_name]["checks"] = checks
 
-    write_results_to_json(results, args.out, args.model_name)
+    write_results_to_json(results, args.out, args.model_name, feature_groups=feature_groups)
 
 
 

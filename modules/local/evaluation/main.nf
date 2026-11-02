@@ -61,13 +61,18 @@ process METADATA {
         path "versions.yml",                  emit: versions
 
     script:
+        // Define param --af which is added if params.structures is not empty
+        // This gives metadata the info to include af models in the metadata table
+        def af_arg = params.structures ? "--af" : ''
+
         """
         mkdir -p metadata_tables
 
         create_metadata.py \\
             --metadata ${metadata} \\
             --ddi ${ddi_dir}/${meta.split}_instances.csv \\
-            --out metadata_tables/${meta.id}.csv
+            --out metadata_tables/${meta.id}.csv \\
+            ${af_arg}
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":
