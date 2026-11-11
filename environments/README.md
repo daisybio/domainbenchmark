@@ -1,34 +1,26 @@
 # daisybio/domainbenchmark conda environments
 
-Two environments are the single source of truth for runtime dependencies.
+These two files are the single source of truth for runtime dependencies. The
+Dockerfiles install them directly, so the `conda` profile and the containers
+get the same versions.
 
-| File          | Purpose                          | Container tag                       |
-|---------------|----------------------------------|-------------------------------------|
-| `general.yml`    | CPU env (eval, graph models, IO) | `konstantinpelz/domainbenchmark-general:1.0.0` |
-| `ml.yml`      | GPU env (ML, RF, cuML, torch)    | `konstantinpelz/domainbenchmark-gpu:1.0.0`   |
+| File          | Purpose                          | Dockerfile                  | Container tag                                  |
+|---------------|----------------------------------|-----------------------------|------------------------------------------------|
+| `general.yml` | CPU env (eval, graph models, IO) | `docker/Dockerfile.general` | `konstantinpelz/domainbenchmark-general:1.0.1` |
+| `ml.yml`      | GPU env (NN, RF, cuML, torch)    | `docker/Dockerfile.gpu`     | `konstantinpelz/domainbenchmark-gpu:1.0.2`     |
 
-The `docker/Dockerfile.base` and `docker/Dockerfile.ml` images mirror these
-files. When pinning a package version here, update the corresponding line in
-the Dockerfile and re-tag the image (bump the patch component when the env
-changes).
+After changing a yml, bump the image's patch version in the Dockerfile label,
+in the module `container` directives and in the table above, then build from
+the repo root (`.dockerignore` limits the context to `environments/`):
 
-Module-local `environment.yml` duplicates were removed in favour of these
-canonical files. Modules now reference them via:
-
-```groovy
-conda "${projectDir}/environments/general.yml"   // or ml.yml
+```bash
+docker build -f docker/Dockerfile.general -t konstantinpelz/domainbenchmark-general:<ver> .
+docker build -f docker/Dockerfile.gpu     -t konstantinpelz/domainbenchmark-gpu:<ver> .
 ```
 
-## Reconciliation choices
+Creating `ml.yml` with conda on a machine without a GPU needs
+`CONDA_OVERRIDE_CUDA=13.4`.
 
-When the same package is in both files, versions match unless the GPU env
-needs a CUDA-built wheel. Notable picks:
-
-- `python=3.13.3` (base) / `python=3.12.2` (ml — pinned to match RAPIDS
-  wheel availability for cuda 12.8).
-- `pandas=2.3.0` (base) vs `pandas=2.2.3` (ml — pinned to RAPIDS-compatible
-  series).
-- `scikit-learn=1.7.2` (base) vs `1.6.1` (ml — pinned to cuML interop).
-- `pytorch=2.7.0` is installed via pip in the GPU env using the upstream
-  `https://download.pytorch.org/whl/cu128` index, since the conda channel
-  lags the cuda-12.8 wheels.
+`ml.yml` is pip-free: `pytorch` comes from conda-forge, not the PyTorch wheel
+index, because the wheels bundle their own CUDA libraries and their
+`libnvJitLink` shadowed the one cuML needs.

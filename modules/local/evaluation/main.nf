@@ -8,7 +8,7 @@ process EVAL_ONE {
     label 'process_eval_scatter'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.1"
 
     input:
         tuple val(meta), path(predictions), path(ddi_dir)
@@ -47,7 +47,7 @@ process EVALUATION {
     label 'process_eval'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.1"
 
     input:
         tuple val(meta), path(database), path(per_model_jsons)
@@ -96,7 +96,7 @@ process COMBINE_EVAL {
     label 'process_eval'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.0"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.1"
 
     input:
         // Every per-DB EVALUATION emits a dir literally named `evaluation/`, so

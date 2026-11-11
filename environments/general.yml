@@ -4,15 +4,17 @@ channels:
   - bioconda
 dependencies:
   - python=3.13.3
-  - h5py=3.14.0
   - numpy=2.2.6
   - pandas=2.3.0
-  - sqlite=3.50.4
-  - multiqc=1.32
-  - matplotlib=3.10.8
-  - scikit-learn=1.7.2
-  - networkx=3.5
-  - goatools=1.5.2
   - scipy=1.16.3
-  - tqdm
-  - psutil
+  - h5py=3.14.0
+  - scikit-learn=1.7.2
+  - matplotlib=3.10.8
+  - networkx=3.5
+  - sqlite=3.50.4
+  - goatools=1.5.2
+  - multiqc=1.32
+  - pyarrow=23.0.1
+  - fastparquet=2026.5.0
+  - tqdm=4.70.1
+  - psutil=7.2.2

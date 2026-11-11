@@ -36,7 +36,7 @@ Everything that can be checked before a task runs is checked at launch, in `PIPE
 
 **`-resume` does not see edits to imported helpers.** Nextflow hashes only the `bin/` scripts named in a process's command line, so editing `machine_learning.py`, `determinism.py`, `bin/features/*.py`, `eval_multiqc_functions.py`, `load_data_gm.py`, `kgiddi_functions.py` or `ddiparsimony_functions.py` and resuming reuses the cached outputs of the tasks that import them (verified with a two-file mini pipeline). Accepted, not fixed: after editing a helper, run without `-resume` — or delete the affected tasks' work dirs — for any stage whose outputs you want regenerated.
 
-Python deps managed via conda — `environments/general.yml` (extraction/RF/graph/eval) and `environments/ml.yml` (PyTorch CU128 + cuML for NN training). No `pyproject.toml` / `requirements.txt`.
+Python deps managed via conda — `environments/general.yml` (extraction/RF/graph/eval) and `environments/ml.yml` (conda-forge PyTorch CUDA 13.4 + cuML for NN training — one conda solve, no pip; Dockerfiles in `docker/` install these files; see `environments/README.md`). No `pyproject.toml` / `requirements.txt`.
 
 ## Architecture
 

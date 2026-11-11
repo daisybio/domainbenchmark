@@ -3,7 +3,7 @@ process NEURAL_NETWORK {
     label 'process_gpu'
 
     conda "${projectDir}/environments/ml.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.1"
+    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.2"
 
     input:
         tuple val(meta), path('DDI'), path('features/*'), path('config.json')
