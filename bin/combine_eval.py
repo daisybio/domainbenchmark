@@ -42,6 +42,9 @@ REPORT_NAME = "ddi_report"
 ID = "eval"
 DB_PREFIX = "db_"
 
+#: Reference row on the AUC heatmap -- not a model. See model_performance_heatmap.
+SELF_INDICATOR_ROW = "(self-pair indicator, no model)"
+
 
 def parse_arguments():
     p = argparse.ArgumentParser(
@@ -117,6 +120,8 @@ def write_multiqc_config(outdir, dataset_order=None) -> str:
     pr_curves_block = pick(r"combined_pr_curves")
     roc_heatmap_block = pick(r"model_performance_heatmap_roc$")
     roc_heatmap_ci = pick(r"model_performance_heatmap_roc_ci$")
+    hetero_heatmap_block = pick(r"model_performance_heatmap_hetero_roc$")
+    hetero_heatmap_ci = pick(r"model_performance_heatmap_hetero_roc_ci$")
     pr_heatmep_block = pick(r"model_performance_heatmap_pr$")
     pr_heatmap_ci = pick(r"model_performance_heatmap_pr_ci$")
 
@@ -136,15 +141,20 @@ def write_multiqc_config(outdir, dataset_order=None) -> str:
         metric_blocks = sort_by_dataset(metric_blocks, dataset_order)
         pairwise_blocks = sort_by_dataset(pairwise_blocks, dataset_order)
 
+    # Threshold-free heatmaps first: they are the primary comparison. The
+    # per-dataset metric tables depend on a threshold tuned at validation's
+    # ~1:1 balance (see THRESHOLD_CAVEAT in eval_multiqc.py) and come after.
     ordered = (
         white_tbl
+        + roc_heatmap_block
+        + roc_heatmap_ci
+        + hetero_heatmap_block
+        + hetero_heatmap_ci
+        + pr_heatmep_block
+        + pr_heatmap_ci
         + db_blocks
         + metric_blocks
         + pairwise_blocks
-        + roc_heatmap_block
-        + roc_heatmap_ci
-        + pr_heatmep_block
-        + pr_heatmap_ci
         + roc_curves_block
         + pr_curves_block
         + source_block
@@ -791,16 +801,24 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
 
     roc_mean, roc_ci = {}, {}
     pr_mean, pr_ci = {}, {}
+    het_mean, het_ci = {}, {}
     for block_id, block in combined_metrics.items():
         db_name = block_id.replace("combined_metrics_table_", "")
         metrics = block.get("data", {})
         for model, row in metrics.items():
             rv = _to_float(row.get("ROC AUC"))
             pv = _to_float(row.get("PR AP"))
+            hv = _to_float(row.get("Hetero ROC AUC"))
             if rv is not None:
                 roc_mean.setdefault(model, {})[db_name] = rv
             if pv is not None:
                 pr_mean.setdefault(model, {})[db_name] = pv
+            if hv is not None:
+                het_mean.setdefault(model, {})[db_name] = hv
+            hc = row.get("Hetero ROC AUC CI") or ""
+            het_ci.setdefault(model, {})[db_name] = (
+                f"{hv:.3f} {hc}".strip() if hv is not None else hc
+            )
             rc = row.get("ROC AUC CI") or ""
             pc = row.get("PR AP CI") or ""
             roc_ci.setdefault(model, {})[db_name] = (
@@ -811,15 +829,37 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
             )
 
     # Sort rows (models) alphabetically, columns (datasets) by --mqc_order.
+    # Every row carries every column (None where undefined or suppressed):
+    # MultiQC takes heatmap columns in first-seen order across rows, so a
+    # sparse first row would reorder the whole heatmap.
     def _rows(table):
-        return {
-            m: order_dataset_keys(table[m], dataset_order) for m in sorted(table)
-        }
+        cols = sort_by_dataset(
+            {db for row in table.values() for db in row}, dataset_order
+        )
+        return {m: {db: table[m].get(db) for db in cols} for m in sorted(table)}
+
+    # The self-pair indicator as a reference row on the full-set AUC heatmap:
+    # what "positive iff domain_a == domain_b" scores, with no features. Taken
+    # from the model with the most scored pairs (the trained models share the
+    # full test set; graph models cover a subset).
+    indicator = {}
+    for block_id, block in combined_metrics.items():
+        db_name = block_id.replace("combined_metrics_table_", "")
+        rows = [r for r in block.get("data", {}).values()
+                if _to_float(r.get("Self-indicator AUC")) is not None]
+        if rows:
+            best = max(rows, key=lambda r: r.get("Pairs") or 0)
+            indicator[db_name] = _to_float(best["Self-indicator AUC"])
+    if indicator:
+        roc_mean[SELF_INDICATOR_ROW] = indicator
+        roc_ci[SELF_INDICATOR_ROW] = {db: f"{v:.3f}" for db, v in indicator.items()}
 
     roc_mean = _rows(roc_mean)
     pr_mean = _rows(pr_mean)
     roc_ci = _rows(roc_ci)
     pr_ci = _rows(pr_ci)
+    het_mean = _rows(het_mean)
+    het_ci = _rows(het_ci)
 
     def _write_heatmap(block_id, title, data, fname):
         block = {
@@ -881,6 +921,20 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         roc_ci,
         "model_performance_heatmap_roc_ci_mqc.json",
     )
+
+    if het_mean:
+        _write_heatmap(
+            "model_performance_heatmap_hetero_roc",
+            "Hetero-pair AUC Heatmap (self-pairs removed)",
+            het_mean,
+            "model_performance_heatmap_hetero_roc_mqc.json",
+        )
+        _write_ci_table(
+            "model_performance_heatmap_hetero_roc_ci",
+            "Hetero-pair AUC Heatmap",
+            het_ci,
+            "model_performance_heatmap_hetero_roc_ci_mqc.json",
+        )
 
     _write_heatmap(
         "model_performance_heatmap_pr",

@@ -7,9 +7,15 @@ as a mid-point of real embedding dimensionalities (ESM/ProtT5 range
 encoders without leaking any signal.
 
 Rationale: a constant zero vector causes classifiers to collapse to
-the majority class. Per-row random values produce unique inputs;
-AUROC converges to ~0.5 (the true sanity floor). If a real model
-fails to beat this, something is wrong with the data or training loop.
+the majority class. Per-instance random values produce unique inputs.
+`seed` is already split-specific (extract_features.py), so the same
+instance gets unrelated vectors in train and test and nothing memorised
+in train transfers.
+
+The floor is *not* AUROC 0.5. A self-pair (domain_a == domain_b) can
+share an instance, and `concat(v, v)` has identical halves for any `v`,
+so the dummy still learns "is this a self-pair". Compare it with the
+report's self-indicator AUC, not with 0.5.
 """
 import h5py
 import numpy as np

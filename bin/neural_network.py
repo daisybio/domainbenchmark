@@ -278,9 +278,16 @@ class NeuralNetworkTrainer(DDIModelTrainer):
     # standardisation", which is what MLPModule's defaults give.
     _input_mean = None
     _input_std = None
+    _pos_weight = None
 
     def _fit_preprocessing(self, x_train, y_train):
         self._input_mean, self._input_std, n_const = standardisation_stats(x_train)
+        # BCE positive-class weight from the same training block. Used by the
+        # grid candidates *and* the refit; it used to reach only the refit, so
+        # the search ranked candidates under a different loss than it shipped.
+        n_pos = int(np.sum(y_train == 1))
+        n_neg = int(np.sum(y_train == 0))
+        self._pos_weight = torch.tensor([n_neg / max(n_pos, 1)])
         print(
             f"[standardise] fitted on {x_train.shape[0]} training rows x "
             f"{x_train.shape[1]} features ({n_const} zero-variance columns left "
@@ -310,6 +317,7 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             module__input_size=num_features,
             module__input_mean=self._input_mean,
             module__input_std=self._input_std,
+            criterion__pos_weight=self._pos_weight,
             iterator_train__shuffle=True,
             train_split=None,
             callbacks=[SeedFit(self._seed)],
@@ -337,10 +345,6 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         x_train, y_train = self._load_train_data(
             args, best_balance, args.seed
         )
-        n_pos = int(np.sum(y_train == 1))
-        n_neg = int(np.sum(y_train == 0))
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)])
-
         # Re-fitted here rather than reused from the search: `best_balance` need
         # not be the last balance method the grid loop tried, and the
         # standardisation has to describe the block this model is actually
@@ -371,7 +375,7 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             module__input_size=num_features,
             module__input_mean=self._input_mean,
             module__input_std=self._input_std,
-            criterion__pos_weight=pos_weight,
+            criterion__pos_weight=self._pos_weight,
             iterator_train__shuffle=True,
             train_split=predefined_split(valid_ds),
             callbacks=[

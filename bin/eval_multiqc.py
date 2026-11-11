@@ -32,6 +32,17 @@ REPORT_NAME = "ddi_report"
 ID = "eval"
 DB_PREFIX = "db_"
 
+#: Shown on every thresholded-metrics table. The trained models' threshold is
+#: the MCC argmax on the validation split, whose class balance is ~1:1; the
+#: MCC optimum moves with prevalence, so on 1:10 or 98%-positive test sets the
+#: confusion-based metrics reflect that mismatch as much as the model.
+THRESHOLD_CAVEAT = (
+    "Accuracy, precision, recall, F1 and MCC depend on a decision threshold "
+    "tuned for MCC on the validation split at its ~1:1 class balance and "
+    "applied unchanged to test sets of other prevalence. Compare models by "
+    "ROC AUC / PR AP (threshold-free); read these columns as secondary."
+)
+
 
 def parse_arguments():
     p = argparse.ArgumentParser(
@@ -211,19 +222,36 @@ def write_multiqc_json_metrics(
             text += f" ({n_valid}/{n_total} resamples)"
         return text
 
+    def _hetero(entry):
+        """(AUC, CI text, AP) on hetero-pairs; NaN + the reason when suppressed."""
+        h = (entry.get("STRATA") or {}).get("hetero")
+        if not h:
+            return float("nan"), "", float("nan")
+        if h.get("note"):
+            return float("nan"), f"n/a ({h['note']})", float("nan")
+        lo, hi = h["roc_auc_ci"]
+        return float(h["roc_auc"]), f"[{lo:.3f}, {hi:.3f}]", float(h["pr_ap"])
+
     # --- Block 1: AUC/AP table -----------------------------------------------
     # Numeric mean kept as float (enables table colour-scale + downstream
     # heatmap clustering); CI rendered in a sibling string column.
     table_id = f"{prefix}_metrics_table"
-    table_data = {
-        m: {
+    table_data = {}
+    for m in metrics_aucap:
+        h_auc, h_ci, h_ap = _hetero(metrics_aucap[m])
+        table_data[m] = {
+            "Pairs": int(metrics_aucap[m].get("SAMPLES", 0)),
             "ROC AUC": float(metrics_aucap[m]["ROC_AUC"]),
             "ROC AUC CI": _fmt_ci(metrics_aucap[m], "ROC_AUC"),
             "PR AP": float(metrics_aucap[m]["PR_AP"]),
             "PR AP CI": _fmt_ci(metrics_aucap[m], "PR_AP"),
+            "Hetero ROC AUC": h_auc,
+            "Hetero ROC AUC CI": h_ci,
+            "Hetero PR AP": h_ap,
+            "Self-indicator AUC": float(
+                metrics_aucap[m].get("SELF_INDICATOR_AUC", float("nan"))
+            ),
         }
-        for m in metrics_aucap
-    }
     table_block = {
         "id": table_id,
         "section_name": "Model performance (AUC / AP)",
@@ -234,6 +262,13 @@ def write_multiqc_json_metrics(
             "col1_header": "Model",
         },
         "headers": {
+            "Pairs": {
+                "title": "Pairs",
+                "description": "Test pairs this model scored (graph models "
+                "abstain on pairs without PPI evidence, so their rows differ).",
+                "scale": False,
+                "format": "{:,.0f}",
+            },
             "ROC AUC": {
                 "title": "ROC AUC",
                 "min": 0.0,
@@ -255,6 +290,36 @@ def write_multiqc_json_metrics(
             "PR AP CI": {
                 "title": "PR AP 95% CI",
                 "scale": False,
+            },
+            "Hetero ROC AUC": {
+                "title": "Hetero ROC AUC",
+                "description": "ROC AUC on pairs of two different domains only "
+                "(self-pairs removed).",
+                "min": 0.0,
+                "max": 1.0,
+                "scale": "RdYlGn",
+                "format": "{:,.3f}",
+            },
+            "Hetero ROC AUC CI": {
+                "title": "Hetero ROC AUC 95% CI",
+                "scale": False,
+            },
+            "Hetero PR AP": {
+                "title": "Hetero PR AP",
+                "min": 0.0,
+                "max": 1.0,
+                "scale": "RdYlGn",
+                "format": "{:,.3f}",
+            },
+            "Self-indicator AUC": {
+                "title": "Self-indicator AUC",
+                "description": "ROC AUC of predicting 'positive iff "
+                "domain_a == domain_b' on this model's pairs: the score "
+                "available with no features at all.",
+                "min": 0.0,
+                "max": 1.0,
+                "scale": "RdYlGn",
+                "format": "{:,.3f}",
             },
         },
         "data": table_data,
@@ -325,6 +390,7 @@ def write_multiqc_json_metrics(
     metrics_block = {
         "id": metrics_id,
         "section_name": "Overview Model Evaluation Metrics",
+        "description": THRESHOLD_CAVEAT,
         "plot_type": "table",
         "pconfig": {
             "id": metrics_id,

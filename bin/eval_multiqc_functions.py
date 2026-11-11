@@ -455,7 +455,8 @@ def aggregate_per_model_metrics(per_model_files):
     Each JSON file: {model_name, samples, metrics_summary, roc:[[fp,tp]...],
                      pr:[[recall,precision]...], roc_auc, pr_ap,
                      roc_auc_ci, pr_ap_ci, roc_auc_samples, pr_ap_samples,
-                     bootstrap_n, roc_auc_n_valid, pr_ap_n_valid, ranking_note}
+                     bootstrap_n, roc_auc_n_valid, pr_ap_n_valid, ranking_note,
+                     strata, self_indicator_auc}
     """
     metrics_rows = []
     metrics_aucap = {}
@@ -486,9 +487,12 @@ def aggregate_per_model_metrics(per_model_files):
             ("roc_auc_n_valid", "ROC_AUC_N_VALID"),
             ("pr_ap_n_valid", "PR_AP_N_VALID"),
             ("ranking_note", "RANKING_NOTE"),
+            ("strata", "STRATA"),
+            ("self_indicator_auc", "SELF_INDICATOR_AUC"),
         ):
             if obj.get(src) is not None:
                 entry[dst] = obj[src]
+        entry["SAMPLES"] = obj["metrics_summary"]["Samples"]
         metrics_aucap[name] = entry
         roc_pairs = obj["roc"]
         pr_pairs = obj["pr"]

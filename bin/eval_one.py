@@ -52,6 +52,10 @@ UNMATCHED_EXAMPLES = 10
 #: How many pairs a duplicate / non-finite-score message names.
 EXAMPLES = 5
 
+#: A stratum's AUC/AP is reported only with at least this many of each class.
+#: The self-pair stratum often holds 0-3 negatives, where AUC is noise.
+MIN_STRATUM_CLASS = 10
+
 
 def _examples(keys, limit: int = EXAMPLES) -> str:
     return ", ".join(k.replace("\t", " <-> ") for k in sorted(set(keys))[:limit])
@@ -384,6 +388,53 @@ def _summary(y_true, y_pred, model_name) -> dict:
     }
 
 
+def _strata_metrics(df: pd.DataFrame, bootstrap_n: int, seed: int) -> tuple:
+    """AUC/AP separately for hetero-pairs and self-pairs, plus the self-indicator AUC.
+
+    A self-pair (domain_a == domain_b) is answerable without any feature: the
+    model only has to notice that both halves of the input describe the same
+    family. Where self-pairs are mostly positive that alone scores well, so
+    the pooled AUC mixes "is this a homodimer" with real DDI prediction. The
+    hetero stratum is the latter; `self_indicator_auc` is what predicting
+    "positive iff self-pair" scores on this model's rows -- the free baseline.
+    """
+    y = df["true_interaction"].to_numpy()
+    score = df["predicted_probability"].to_numpy()
+    is_self = df["domain_a"].astype(str).to_numpy() == df["domain_b"].astype(str).to_numpy()
+
+    strata = {}
+    for name, mask in (("hetero", ~is_self), ("self", is_self)):
+        yt, ys = y[mask], score[mask]
+        n_pos = int(yt.sum())
+        n_neg = int(len(yt) - n_pos)
+        entry = {
+            "n": int(len(yt)), "n_pos": n_pos, "n_neg": n_neg,
+            "roc_auc": float("nan"), "roc_auc_ci": [float("nan")] * 2,
+            "pr_ap": float("nan"), "pr_ap_ci": [float("nan")] * 2,
+            "note": None,
+        }
+        if min(n_pos, n_neg) < MIN_STRATUM_CLASS:
+            entry["note"] = (
+                f"suppressed: {n_pos} positives / {n_neg} negatives "
+                f"(< {MIN_STRATUM_CLASS} of a class)"
+            )
+        else:
+            entry["roc_auc"], lo, hi, _ = bootstrap_metric(
+                yt, ys, roc_auc_score, n_resamples=bootstrap_n, seed=seed,
+            )
+            entry["roc_auc_ci"] = [lo, hi]
+            entry["pr_ap"], lo, hi, _ = bootstrap_metric(
+                yt, ys, average_precision_score, n_resamples=bootstrap_n, seed=seed,
+            )
+            entry["pr_ap_ci"] = [lo, hi]
+        strata[name] = entry
+
+    self_indicator_auc = (
+        float(roc_auc_score(y, is_self)) if len(np.unique(y)) == 2 else float("nan")
+    )
+    return strata, self_indicator_auc
+
+
 def _downsample_curve(xs, ys, max_points: int = 600):
     """Keep curves cheap to send through MultiQC (no perceptible quality loss)."""
     n = len(xs)
@@ -464,6 +515,8 @@ def main():
                                           precision.astype(np.float32),
                                           args.max_curve_points)
 
+    strata, self_indicator_auc = _strata_metrics(df, args.bootstrap_n, args.seed)
+
     payload = {
         "model_name": args.model_name,
         "metrics_summary": _summary(y_true, y_pred, args.model_name),
@@ -480,6 +533,8 @@ def main():
         "roc_auc_n_valid": count_valid(roc_samples),
         "pr_ap_n_valid": count_valid(pr_samples),
         "ranking_note": ranking_note,
+        "strata": strata,
+        "self_indicator_auc": self_indicator_auc,
         # Per-resample arrays are kept so eval_multiqc.py can run pairwise
         # comparisons without re-reading predictions. ~8KB per metric per model.
         "roc_auc_samples": [float(v) for v in roc_samples],

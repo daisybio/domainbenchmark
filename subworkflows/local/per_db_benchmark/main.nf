@@ -148,9 +148,11 @@ workflow PER_DB_BENCHMARK {
         def graph_model_names    = all_graph_models.findAll { !skip_features.contains(it) }
 
         // One run per feature (singleton) plus one all-feature concatenation
-        // run when more than one feature is available.
+        // run when more than one feature is available. `dummy` is a noise
+        // control, so it gets its singleton run but stays out of `all`.
         def feature_combos = ml_features.collect { [it] }
-        if (ml_features.size() >= 2) feature_combos << ml_features
+        def all_combo      = ml_features.findAll { it != 'dummy' }
+        if (all_combo.size() >= 2) feature_combos << all_combo
 
         // Every model scores every test split, so each (db, variant) receives
         // exactly this many predictions. Known up front, which lets the

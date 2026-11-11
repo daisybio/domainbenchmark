@@ -5,7 +5,7 @@ import importlib
 import sqlite3
 from pathlib import Path
 
-from determinism import seed_everything
+from determinism import derive_seed, seed_everything
 
 
 if __name__ == "__main__":
@@ -42,4 +42,9 @@ if __name__ == "__main__":
         feature_module = importlib.import_module(f"features.{args.feature}")
         # Every encoder takes the seed, whether or not it draws from it today:
         # an encoder that samples must not be able to reach the global RNG.
-        feature_module.extract_features(connection, output_file, args.seed)
+        # The seed is keyed on the split (the db file's stem: train,
+        # validation, test_realistic, ...). Keyed on --seed alone, `dummy` gave
+        # a domain instance the identical vector in every split, so a model
+        # could memorise instances in train and recognise them in test.
+        split_seed = derive_seed(args.seed, "split", args.db.stem)
+        feature_module.extract_features(connection, output_file, split_seed)
