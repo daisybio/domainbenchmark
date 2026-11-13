@@ -148,7 +148,8 @@ def test_smoke_fixture_end_to_end(tmp_path):
     run("create_metadata.py", "--metadata", str(METADATA), "--instances", str(inst),
         "--out_table", str(table), "--out_observed", str(observed))
     t = pd.read_csv(table, dtype={"domain_a": str, "domain_b": str})
-    assert len(t) == 21
+    assert len(t) == 151
+    assert json.loads(observed.read_text())["targets"]["observed"]["status"] == "ok"
 
     rng = np.random.default_rng(42)
     prob = rng.uniform(size=len(t))
@@ -161,19 +162,20 @@ def test_smoke_fixture_end_to_end(tmp_path):
 
     result = json.loads(out.read_text())
     assert list(result["targets"]) == ["predicted", "combined", "error_positive", "error_negative"]
-    assert result["counts"]["n_predictions"] == 21 and result["counts"]["n_complete"] <= 21
-    # 21 DDIs: every class sits under MIN_CLASS_SIZE or the parameter count, so
-    # each target is skipped with its reason rather than fit on noise.
-    for target in result["targets"].values():
-        assert target["status"] == "skipped" and target["reason"]
+    assert result["counts"]["n_predictions"] == 151 and result["counts"]["n_complete"] == 150
+    # The test split is sized for 7 parameters x 10 rows per class; the 4-class
+    # MNLogit needs 21 x 10 and still skips with its reason.
+    status = {name: t["status"] for name, t in result["targets"].items()}
+    assert status == {"predicted": "ok", "combined": "skipped", "error_positive": "ok", "error_negative": "ok"}
+    assert "per parameter" in result["targets"]["combined"]["reason"]
 
     inputs = load_inputs([str(out), str(observed)])
     assert "observed" in inputs["observed"]["targets"]
     ids = write_enrichment_blocks({"random_balanced": inputs}, str(tmp_path))
     assert ids[0] == "enrichment_status"
     status = json.loads((tmp_path / "enrichment_status_mqc.json").read_text())
-    assert status["data"]["nn_aacomp"]["DDIs / predictions"] == 21
-    assert tidy({"random_balanced": inputs}).empty
+    assert status["data"]["nn_aacomp"]["DDIs / predictions"] == 151
+    assert not tidy({"random_balanced": inputs}).empty
 
 
 def test_report_blocks_are_deterministic(tmp_path):

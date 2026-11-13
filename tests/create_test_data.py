@@ -37,6 +37,10 @@ Deliberate properties the pipeline depends on:
 * instance ids are domainsplit's `<pfam>_<uniprot>_<start>_<end>`, because its
   structure writer derives the structures.h5 group from that prefix;
 * one homodimer DDI (family 1 with itself) per split;
+* test splits hold 151 DDIs (train/validation 21), enough for the enrichment
+  regressions to fit rather than skip (see N_DDI_TEST);
+* every CYS in a complex has an SG atom, and CYS pairs in reach are bridged
+  into disulfides, so disulfide_bond_count has positive cases;
 * structure coverage is partial: `has_structure = 0` on one pair of a positive
   (the DDI keeps its other pairs) and on every pair of a negative (the DDI has
   no structure at all), so the structure features' coverage logging and drop
@@ -84,6 +88,15 @@ FIXTURE_RUN_ID = "fixture-run-0001"
 N_DOMAINS = 12
 N_PROTEINS = 10
 N_DDI = 20  # half positive, half negative
+# Test splits are larger so the enrichment fits run instead of skipping:
+# eval_enrichment needs MIN_ROWS_PER_PARAMETER (10) complete rows per parameter,
+# and the fixture metadata gives 6 non-constant covariates + intercept = 7, so
+# >= 70 complete rows *per class* for error_positive / error_negative. 150 DDIs
+# (+ the homodimer) leave 76 positives and 74 structure-covered negatives.
+# Families other than 1 carry one instance there, so a DDI is one complex and
+# the SASA/structure cost stays small.
+N_DOMAINS_TEST = 25
+N_DDI_TEST = 150
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -182,6 +195,9 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
     """
     rng = np.random.default_rng(SEED + offset)
     pyrng = random.Random(SEED + offset)
+    test = split.startswith("test")
+    n_domains = N_DOMAINS_TEST if test else N_DOMAINS
+    n_ddi = N_DDI_TEST if test else N_DDI
 
     if path.exists():
         path.unlink()
@@ -189,7 +205,7 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
     conn.executescript(SCHEMA)
 
     # ---- domains ---------------------------------------------------------
-    domains = [(i + 1, f"PF{offset + i:05d}", f"domain_{offset + i}") for i in range(N_DOMAINS)]
+    domains = [(i + 1, f"PF{offset + i:05d}", f"domain_{offset + i}") for i in range(n_domains)]
     conn.executemany("INSERT INTO domain VALUES (?, ?, ?)", domains)
     conn.executemany(
         "INSERT INTO domain_go_terms VALUES (?, ?)",
@@ -220,7 +236,8 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
     # Every family gets one instance in each of two proteins. Family 1 gets a
     # SECOND instance inside its first protein (a tandem repeat): two rows with
     # the same (domain_id, protein_id), distinguished only by start/end. That
-    # pair is what collides unless the HDF5 key is the instance.
+    # pair is what collides unless the HDF5 key is the instance. In test splits
+    # the other families keep only their first carrier (see N_DDI_TEST).
     dpm_rows = []
     instances_by_domain = {}
     instance_info = {}  # instance_id -> (pfam_id, uniprot_id, domain sequence)
@@ -229,6 +246,8 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
             ((domain_id - 1) % N_PROTEINS) + 1,
             (domain_id % N_PROTEINS) + 1,
         ]
+        if test and domain_id != 1:
+            carriers = carriers[:1]
         placements = [(protein_id, 0, 25) for protein_id in carriers]
         if domain_id == 1:
             placements.append((carriers[0], 30, 55))
@@ -270,8 +289,8 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
     pairs = []
     a = 1
     b = 2
-    while len(pairs) < N_DDI and a <= N_DOMAINS:
-        if b > N_DOMAINS:
+    while len(pairs) < n_ddi and a <= n_domains:
+        if b > n_domains:
             a += 1
             b = a + 1
             continue
@@ -355,31 +374,69 @@ def _key_rng(*tokens) -> np.random.Generator:
     return np.random.default_rng(SEED + int.from_bytes(digest[:8], "big"))
 
 
+SG_BOND = 1.81  # CB-SG
+SS_BOND = 2.05  # SG-SG of a disulfide
+SS_REACH = 2 * SG_BOND + SS_BOND  # CBs closer than this can be bridged
+
+
+def _bridge(cb_p, cb_q):
+    """SG positions 1.81 A from each CB and 2.05 A from each other."""
+    d = float(np.linalg.norm(cb_q - cb_p))
+    u = (cb_q - cb_p) / d
+    a = (d - SS_BOND) / 2  # along the CB-CB axis
+    w = np.array([0.0, 0.0, -1.0]) + u[2] * u  # -z, made perpendicular to u
+    w /= np.linalg.norm(w)
+    h = np.sqrt(SG_BOND ** 2 - a ** 2)
+    return cb_p + a * u + h * w, cb_q - a * u + h * w
+
+
 def pdb_text(chains) -> str:
-    """Two-chain PDB with backbone + CB per residue (no CB on GLY).
+    """Two-chain PDB: backbone + CB per residue (no CB on GLY), SG on CYS.
 
     `chains` is `[(chain_id, sequence, y_offset, rng)]`. Residues run along x
     with a little jitter, one chain per y offset, so the chains touch: enough
     for Shrake-Rupley, contacts and backbone angles to give non-trivial values.
     Same layout as domainsplit's tests/python/test_structure_scoring.py.
+
+    Every CYS gets an SG 1.81 A below its CB. Two CYS whose CBs are in reach
+    (adjacent in a chain, or facing across a narrow chain gap) are bridged
+    instead, closest first, each CYS at most once: SG-SG 2.05 A, a disulfide.
     """
-    lines, serial = [], 1
+    residues = []
     for chain_id, seq, y, rng in chains:
         for resseq, aa in enumerate(seq, start=1):
             x = 3.8 * resseq
             jitter = rng.normal(0.0, 0.3, size=3)
-            atoms = [("N", -1.2, 0.0, "N"), ("CA", 0.0, 0.0, "C"),
-                     ("C", 1.2, 0.0, "C"), ("O", 1.2, 1.2, "O")]
+            atoms = [("N", -1.2, 0.0), ("CA", 0.0, 0.0), ("C", 1.2, 0.0), ("O", 1.2, 1.2)]
             if aa != "G":
-                atoms.append(("CB", 0.0, -1.5, "C"))
-            for name, dx, dz, element in atoms:
-                lines.append(
-                    f"ATOM  {serial:5d} {name:<4s} {THREE_LETTER[aa]} {chain_id}{resseq:4d}    "
-                    f"{x + dx + jitter[0]:8.3f}{y + jitter[1]:8.3f}{dz + jitter[2]:8.3f}"
-                    f"{1.0:6.2f}{90.0:6.2f}          {element:>2s}"
-                )
-                serial += 1
-        lines.append("TER")
+                atoms.append(("CB", 0.0, -1.5))
+            coords = {name: np.array([x + dx, y, dz]) + jitter for name, dx, dz in atoms}
+            residues.append((chain_id, resseq, aa, coords))
+
+    cys = [coords for _c, _r, aa, coords in residues if aa == "C"]
+    reach = sorted(
+        (float(np.linalg.norm(p["CB"] - q["CB"])), i, j)
+        for i, p in enumerate(cys) for j, q in enumerate(cys) if i < j
+    )
+    for d, i, j in reach:
+        if d < SS_REACH and "SG" not in cys[i] and "SG" not in cys[j]:
+            cys[i]["SG"], cys[j]["SG"] = _bridge(cys[i]["CB"], cys[j]["CB"])
+    for coords in cys:
+        coords.setdefault("SG", coords["CB"] + np.array([0.0, 0.0, -SG_BOND]))
+
+    lines, serial, chain = [], 1, residues[0][0]
+    for chain_id, resseq, aa, coords in residues:
+        if chain_id != chain:
+            lines.append("TER")
+            chain = chain_id
+        for name, (cx, cy, cz) in coords.items():
+            lines.append(
+                f"ATOM  {serial:5d} {name:<4s} {THREE_LETTER[aa]} {chain_id}{resseq:4d}    "
+                f"{cx:8.3f}{cy:8.3f}{cz:8.3f}"
+                f"{1.0:6.2f}{90.0:6.2f}          {name[0]:>2s}"
+            )
+            serial += 1
+    lines.append("TER")
     lines.append("END")
     return "\n".join(lines) + "\n"
 

@@ -130,26 +130,9 @@ def _rewrite_structures(src_path, dst_path, transform):
                 dst.require_group(g)[d] = np.frombuffer(blob, dtype=np.uint8)
 
 
-def _add_sg(group, dataset, lines):
-    out = []
-    for ln in lines:
-        out.append(ln)
-        if ln.startswith("ATOM") and ln[17:20] == "CYS" and ln[12:16].strip() == "CB":
-            z = float(ln[46:54]) - 1.8
-            out.append(ln[:12] + " SG " + ln[16:46] + f"{z:8.3f}" + ln[54:76] + " S")
-    return group, dataset, out
-
-
 @pytest.fixture(scope="session")
-def outputs(cache, tmp_path_factory):
-    # The fixture's complexes carry backbone + CB only, and disulfide_bond_count
-    # rightly refuses a CYS without SG; give it SG atoms.
-    with_sg = tmp_path_factory.mktemp("sg") / "structures.h5"
-    _rewrite_structures(STRUCTURES, with_sg, _add_sg)
-    return {
-        feature: run(feature, structures=with_sg) if feature == "disulfide_bond_count" else run(feature, cache=cache)
-        for feature in EXPECTED
-    }
+def outputs(cache):
+    return {feature: run(feature, cache=cache) for feature in EXPECTED}
 
 
 def test_variants_file_covers_expected():
@@ -225,9 +208,19 @@ def test_swapped_storage_orientation(outputs, tmp_path):
         assert all(np.array_equal(again[k], outputs[feature][k]) for k in again)
 
 
-def test_missing_atom_raises():
+def test_disulfide_fixture_has_bonds(outputs):
+    assert any(v[0] > 0 for v in outputs["disulfide_bond_count"].values())
+
+
+def _drop_sg(group, dataset, lines):
+    return group, dataset, [ln for ln in lines if not (ln.startswith("ATOM") and ln[12:16].strip() == "SG")]
+
+
+def test_missing_atom_raises(tmp_path):
+    no_sg = tmp_path / "structures.h5"
+    _rewrite_structures(STRUCTURES, no_sg, _drop_sg)
     with pytest.raises(ValueError, match="has no SG atom"):
-        run("disulfide_bond_count")
+        run("disulfide_bond_count", structures=no_sg)
 
 
 @pytest.mark.parametrize(
