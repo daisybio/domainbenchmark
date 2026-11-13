@@ -48,6 +48,7 @@ params {
     seed: Integer
     ppi_score_cutoff: Integer
     min_embedding_coverage: Float
+    sasa_cache_shards: Integer
     allow_cpu_ml: Boolean
     validate_params: Boolean
     monochrome_logs: Boolean

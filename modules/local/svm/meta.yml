@@ -1,0 +1,65 @@
+name: svm
+description: |
+  Train a support vector machine DDI classifier (RAPIDS cuML SVC on the GPU,
+  scikit-learn SVC under --allow_cpu) behind a StandardScaler fitted on the
+  training rows. Hyperparameters and balance method are chosen by an explicit
+  randomised search over the model JSON grid, ranked by DDI-level average
+  precision on the validation split; the refitted model scores every test
+  split.
+keywords:
+  - svm
+  - cuml
+  - scikit-learn
+  - ddi
+  - classifier
+tools:
+  - scikit-learn:
+      description: SVC (CPU path) and input standardisation.
+      homepage: https://scikit-learn.org
+      documentation: https://scikit-learn.org/stable/
+      licence:
+        - "BSD-3-Clause"
+  - cuml:
+      description: GPU-accelerated SVC.
+      homepage: https://rapids.ai/cuml
+      documentation: https://docs.rapids.ai/api/cuml/stable/
+      licence:
+        - "Apache-2.0"
+input:
+  - - meta:
+        type: map
+        description: |
+          Groovy Map with database and feature-combo information,
+          e.g. [ id:'random_denoise', combo_id:'aacomp', features:['aacomp'], tests:[balanced:'test_balanced'] ]
+    - ddi_dir:
+        type: directory
+        description: DDI tables from `DDI_EXTRACTION`.
+        pattern: "DDI"
+    - features_dir:
+        type: directory
+        description: Per-feature `.h5` files.
+        pattern: "features/*"
+    - config_json:
+        type: file
+        description: Model hyperparameter JSON from `assets/SVM.json`.
+        pattern: "*.json"
+output:
+  predictions:
+    - - meta:
+          type: map
+          description: Groovy Map with database and feature-combo info.
+      - "svm_*/predictions_*.parquet":
+          type: file
+          description: One canonical row per DDI and test variant.
+          pattern: "*.parquet"
+  model:
+    - - meta:
+          type: map
+          description: Groovy Map with database and feature-combo info.
+      - "svm_*/model/":
+          type: directory
+          description: Pickled scaler+SVC pipeline (SVM.pkl) and model_parameters.json.
+authors:
+  - "@konstantinpelz"
+maintainers:
+  - "@konstantinpelz"

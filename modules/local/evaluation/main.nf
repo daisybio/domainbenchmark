@@ -8,7 +8,7 @@ process EVAL_ONE {
     label 'process_eval_scatter'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.1"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.2"
 
     input:
         tuple val(meta), path(predictions), path(ddi_dir)
@@ -47,10 +47,12 @@ process EVALUATION {
     label 'process_eval'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.1"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.2"
 
     input:
-        tuple val(meta), path(database), path(per_model_jsons)
+        // enrichment_jsons: METADATA's observed.json + every ENRICHMENT
+        // <model>.enrichment.json of this variant, or [] for no enrichment.
+        tuple val(meta), path(database), path(per_model_jsons), path(enrichment_jsons, stageAs: 'enrichment/*')
 
     output:
         tuple val(meta), path('evaluation/'), emit: report
@@ -63,6 +65,9 @@ process EVALUATION {
         // One report per (database, test variant): the train and validation
         // splits are shared, only the test set differs.
         def test_split = meta.split ?: 'test'
+        def enrichment_list = (enrichment_jsons instanceof java.util.List ? enrichment_jsons : [enrichment_jsons])
+            .collect { it.toString() }.toSorted()
+        def enrichment_arg = enrichment_list ? "--enrichment ${enrichment_list.join(' ')}" : ''
         // No --mqc_order: a single-dataset report has nothing to order, and
         // passing it anyway put it in this task's hash, so editing the order
         // reran every EVALUATION. COMBINE_EVAL is where it applies.
@@ -80,6 +85,7 @@ process EVALUATION {
             --variant ${meta.variant ?: 'test'} \\
             --test_split ${test_split} \\
             --ppi_score_cutoff ${params.ppi_score_cutoff} \\
+            ${enrichment_arg} \\
             --out_dir evaluation/
         """
 
@@ -96,7 +102,7 @@ process COMBINE_EVAL {
     label 'process_eval'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.1"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.2"
 
     input:
         // Every per-DB EVALUATION emits a dir literally named `evaluation/`, so

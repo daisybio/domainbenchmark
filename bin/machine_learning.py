@@ -430,7 +430,8 @@ def load_embedding_data(
             embeddings_file = resolve_feature_file(features_path, feature, dataset)
             print(f"Loading feature file: {embeddings_file}")
             embeddings_file = stack.enter_context(h5py.File(embeddings_file, "r"))
-            if feature in interaction_encodings:
+            # Structure encoders mark their files instead of being listed.
+            if feature in interaction_encodings or embeddings_file.attrs.get("layout") == "interaction":
                 interaction_encoding_files.append(embeddings_file)
                 interaction_encoding_names.append(feature)
             else:

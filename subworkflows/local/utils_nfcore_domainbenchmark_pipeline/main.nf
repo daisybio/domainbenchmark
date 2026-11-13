@@ -299,8 +299,15 @@ def validateDatasets(datasets) {
 // random_forrest` silently trained nothing and the run "succeeded" without a
 // report.
 //
+//
+// Parameterised variants of feature encoders: feature name -> [module, params].
+//
+def featureVariants() {
+    new groovy.json.JsonSlurper().parse(file("${workflow.projectDir}/assets/feature_variants.json").toFile()) as Map
+}
+
 def validateModelParams() {
-    def ml_known  = ['neural_network', 'random_forest']
+    def ml_known  = ['neural_network', 'random_forest', 'svm']
     def ml_models = csvToList(params.machine_learning_models)
     def bad_ml    = ml_models.findAll { !ml_known.contains(it) }
     if (bad_ml) {
@@ -325,7 +332,26 @@ def validateModelParams() {
         )
     }
 
-    def skippable = features + ml_models + graph_models
+    // A structure feature is an encoder module or a variant of one
+    // (assets/feature_variants.json).
+    def structure = csvToList(params.machine_learning_features_structure)
+    def variants  = featureVariants()
+    def bad_struct = structure.findAll {
+        def module = variants[it]?.module ?: it
+        !file("${workflow.projectDir}/bin/features/${module}.py").exists()
+    }
+    if (bad_struct) {
+        error(
+            "Unknown machine_learning_features_structure: ${bad_struct.join(', ')}. A structure " +
+            "feature needs bin/features/<name>.py or an entry in assets/feature_variants.json."
+        )
+    }
+    def both = structure.findAll { features.contains(it) }
+    if (both) {
+        error("Listed in both machine_learning_features and machine_learning_features_structure: ${both.join(', ')}.")
+    }
+
+    def skippable = features + structure + ml_models + graph_models
     def bad_skip  = csvToList(params.skip).findAll { !skippable.contains(it) }
     if (bad_skip) {
         error("--skip names nothing that would run: ${bad_skip.join(', ')}. Skippable: ${skippable.join(', ')}.")

@@ -23,10 +23,12 @@ include { DDI_EXTRACTION                                } from '../../../modules
 include { FEATURE_EXTRACTION                            } from '../../../modules/local/feature_extraction/main.nf'
 include { NEURAL_NETWORK                                } from '../../../modules/local/neural_network/main.nf'
 include { RANDOM_FOREST                                 } from '../../../modules/local/random_forest/main.nf'
+include { SVM                                           } from '../../../modules/local/svm/main.nf'
 include { GRAPH_MODEL                                   } from '../../../modules/local/graph_model/main.nf'
 include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 include { VERIFY_EMBEDDINGS                             } from '../../../modules/local/verify_embeddings/main.nf'
-include { csvToList; runLabel                           } from '../utils_nfcore_domainbenchmark_pipeline'
+include { METADATA; ENRICHMENT                          } from '../../../modules/local/enrichment/main.nf'
+include { csvToList; runLabel; featureVariants          } from '../utils_nfcore_domainbenchmark_pipeline'
 
 
 def embeddingsDir(features) {
@@ -100,6 +102,35 @@ def publishedEmbeddingFile(dir, feature) {
     found
 }
 
+def structuresFile(features) {
+    // domainsplit's structures.h5, found like embeddingsDir(): `--structures`
+    // names it, otherwise it is `structures/structures.h5` beside --input's
+    // databases/ directory, which is where domainsplit publishes it.
+    if (params.structures) {
+        return file(params.structures, checkIfExists: true)
+    }
+    def remedy =
+        "Set --structures to domainsplit's results/structures/structures.h5, or " +
+        "drop the structure feature(s) with --machine_learning_features_structure '' " +
+        "or --skip ${features.join(',')}."
+    def input_path = params.input ? file(params.input) : null
+    if (!input_path || !input_path.isDirectory()) {
+        error(
+            "Structure feature(s) ${features.join(', ')} need domainsplit's structures.h5. " +
+            "--structures is not set, and it can only be derived from a directory --input. ${remedy}"
+        )
+    }
+    def candidate = input_path.getParent() / 'structures' / 'structures.h5'
+    if (!candidate.exists()) {
+        error(
+            "Structure feature(s) ${features.join(', ')} need domainsplit's structures.h5, " +
+            "and none exists next to --input (looked for ${candidate}). ${remedy}"
+        )
+    }
+    log.info("[structures] --structures not set; using ${candidate} (sibling of --input)")
+    return candidate
+}
+
 workflow PER_DB_BENCHMARK {
 
     take:
@@ -116,13 +147,20 @@ workflow PER_DB_BENCHMARK {
         def ml_model_names       = all_ml_models.findAll { !skip_features.contains(it) }
         def nn_enabled           = ml_model_names.contains('neural_network')
         def rf_enabled           = ml_model_names.contains('random_forest')
+        def svm_enabled          = ml_model_names.contains('svm')
+        def any_ml               = nn_enabled || rf_enabled || svm_enabled
 
-        // Features exist only to feed NN/RF. With neither enabled (a graph-only
+        // Features exist only to feed the ML models. With none enabled (a graph-only
         // run) every FEATURE_EXTRACTION and VERIFY_EMBEDDINGS task would be
         // wasted, and a samplesheet run without --embeddings would even fail in
         // embeddingsDir() asking for a directory nothing reads.
-        def all_features         = (nn_enabled || rf_enabled) ? csvToList(params.machine_learning_features) : []
-        def ml_features          = all_features.findAll { !skip_features.contains(it) }
+        def all_features         = any_ml ? csvToList(params.machine_learning_features) : []
+        // Structure features read domainsplit's AF3 complexes. They take part
+        // in every combo like any other feature, `_all` included -- so `_all`
+        // scores only the DDIs with at least one structure-covered instance pair.
+        def all_structure        = any_ml ? csvToList(params.machine_learning_features_structure) : []
+        def structure_features   = all_structure.findAll { !skip_features.contains(it) }
+        def ml_features          = all_features.findAll { !skip_features.contains(it) } + structure_features
 
         // Split the feature list by where the h5 comes from.
         //
@@ -158,7 +196,7 @@ workflow PER_DB_BENCHMARK {
         // exactly this many predictions. Known up front, which lets the
         // EVALUATION group below emit as soon as its own models are done
         // instead of waiting for the slowest model of every database.
-        def models_per_variant = feature_combos.size() * ((nn_enabled ? 1 : 0) + (rf_enabled ? 1 : 0)) +
+        def models_per_variant = feature_combos.size() * ((nn_enabled ? 1 : 0) + (rf_enabled ? 1 : 0) + (svm_enabled ? 1 : 0)) +
             graph_model_names.size()
         if (models_per_variant == 0) {
             error(
@@ -169,6 +207,7 @@ workflow PER_DB_BENCHMARK {
 
         def ml_config = file(params.modeljson) / 'NeuralNetwork.json'
         def rf_config = file(params.modeljson) / 'RandomForest.json'
+        def svm_config = file(params.modeljson) / 'SVM.json'
 
         // ---------------------------------------------------------------
         // DDI + Feature extraction (per-DB)
@@ -176,7 +215,20 @@ workflow PER_DB_BENCHMARK {
         DDI_EXTRACTION(db_ch)
         ddi_ch = DDI_EXTRACTION.out.ddi   // tuple(meta, ddi_dir)
 
-        FEATURE_EXTRACTION(Channel.from(extracted_features), db_ch)
+        // A feature name may be a parameterised variant of an encoder module
+        // (assets/feature_variants.json); anything not listed there is its own
+        // module with no parameters.
+        def variants = featureVariants()
+        def feature_specs = extracted_features.collect { name ->
+            def v = variants[name]
+            [name: name, module: v ? v.module : name, params: v ? v.params : [:],
+             structure: structure_features.contains(name)]
+        }
+        FEATURE_EXTRACTION(
+            Channel.fromList(feature_specs),
+            db_ch,
+            structure_features ? Channel.value(structuresFile(structure_features)) : Channel.empty()
+        )
 
         // Gate the published files against the databases they will be paired
         // with, and hand them on renamed to `<feature>.h5`. NN/RF consume this
@@ -263,6 +315,24 @@ workflow PER_DB_BENCHMARK {
             } : Channel.empty()
         RANDOM_FOREST(rf_input_ch)
 
+        svm_input_ch = svm_enabled ? ddi_keyed
+            .join(feature_files_per_db)
+            .combine(Channel.fromList(feature_combos.collect { [it] }))
+            .combine(Channel.value(svm_config))
+            .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
+                def combo_id = combo.size() == 1 ? combo[0] : 'all'
+                def m = [
+                    id      : "${meta.id}_svm_${combo_id}",
+                    db      : meta.db,
+                    model   : 'svm',
+                    features: combo,
+                    combo_id: combo_id,
+                    tests   : meta.tests
+                ]
+                tuple(m, ddi_dir, feature_files, cfg)
+            } : Channel.empty()
+        SVM(svm_input_ch)
+
         // ---------------------------------------------------------------
         // Graph models
         // ---------------------------------------------------------------
@@ -291,6 +361,7 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
         all_predictions_ch = NEURAL_NETWORK.out.predictions
             .mix(RANDOM_FOREST.out.predictions)
+            .mix(SVM.out.predictions)
             .mix(GRAPH_MODEL.out.predictions)
             .flatMap { meta, pred ->
                 def files = pred instanceof java.util.List ? pred : [pred]
@@ -358,6 +429,39 @@ workflow PER_DB_BENCHMARK {
                 }
             }
 
+        // ---------------------------------------------------------------
+        // Enrichment (only with --metadata): regress each model's errors on
+        // DDI metadata. METADATA builds one table per (db, variant) and fits
+        // the model-independent `observed` target once; ENRICHMENT runs per
+        // prediction. Everything lands in that variant's EVALUATION report.
+        // ---------------------------------------------------------------
+        if (params.metadata) {
+            def metadata_dir = file(params.metadata, checkIfExists: true)
+            METADATA(
+                db_variant_ch
+                    .map { _key, m, _db_path -> tuple(m.db, m) }
+                    .combine(ddi_keyed.map { id, _meta, ddi_dir -> tuple(id, ddi_dir) }, by: 0)
+                    .map { _db_id, m, ddi_dir -> tuple(m, metadata_dir, ddi_dir) }
+            )
+            def by_variant = { m, f -> tuple("${m.db}::${m.variant}".toString(), f) }
+            ENRICHMENT(
+                all_predictions_ch
+                    .map { m, pf -> tuple("${m.db}::${m.variant}".toString(), m, pf) }
+                    .combine(METADATA.out.table.map(by_variant), by: 0)
+                    .map { _key, m, pf, table -> tuple(m, table, pf) }
+            )
+            // Sorted like the EVAL_ONE group, for the same reasons.
+            enrichment_ch = ENRICHMENT.out.json
+                .map(by_variant)
+                .groupTuple(size: models_per_variant, remainder: true)
+                .join(METADATA.out.observed.map(by_variant))
+                .map { key, jsons, observed ->
+                    tuple(key, (jsons + [observed]).toSorted { a, b -> a.name <=> b.name })
+                }
+        } else {
+            enrichment_ch = Channel.empty()
+        }
+
         // `remainder: true` and an explicit error: a plain join dropped a
         // (db, variant) that received no predictions without a word, and with
         // none at all COMBINE_EVAL never ran and the run "succeeded" with no
@@ -368,8 +472,11 @@ workflow PER_DB_BENCHMARK {
                 if (meta == null || jsons == null) {
                     error("No predictions reached evaluation for ${key}: every model for this test split failed or was skipped.")
                 }
-                tuple(meta, db_path, jsons)
+                tuple(key, meta, db_path, jsons)
             }
+            // Without --metadata there is no enrichment entry: stage nothing.
+            .join(enrichment_ch, remainder: true)
+            .map { _key, meta, db_path, jsons, enrichment -> tuple(meta, db_path, jsons, enrichment ?: []) }
         EVALUATION(evaluation_input_ch)
 
     emit:

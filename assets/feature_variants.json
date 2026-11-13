@@ -1,0 +1,110 @@
+{
+  "angles_phi": {
+    "module": "angles",
+    "params": {
+      "angle_type": "phi"
+    }
+  },
+  "angles_psi": {
+    "module": "angles",
+    "params": {
+      "angle_type": "psi"
+    }
+  },
+  "bsa_structure": {
+    "module": "bsa_structure",
+    "params": {
+      "normalize": false
+    }
+  },
+  "bsa_structure_norm": {
+    "module": "bsa_structure",
+    "params": {
+      "normalize": true
+    }
+  },
+  "k_closest_distance_10k": {
+    "module": "k_closest_distance",
+    "params": {
+      "res_num": 10
+    }
+  },
+  "k_closest_distance_5k": {
+    "module": "k_closest_distance",
+    "params": {
+      "res_num": 5
+    }
+  },
+  "patch_max_size_10A": {
+    "module": "patch_max_size",
+    "params": {
+      "threshold_distance": 10.0
+    }
+  },
+  "patch_max_size_5A": {
+    "module": "patch_max_size",
+    "params": {
+      "threshold_distance": 5.0
+    }
+  },
+  "patch_max_size_7.5A": {
+    "module": "patch_max_size",
+    "params": {
+      "threshold_distance": 7.5
+    }
+  },
+  "patch_mean_contacts_10A": {
+    "module": "patch_mean_contacts",
+    "params": {
+      "threshold_distance": 10.0
+    }
+  },
+  "patch_mean_contacts_5A": {
+    "module": "patch_mean_contacts",
+    "params": {
+      "threshold_distance": 5.0
+    }
+  },
+  "patch_mean_contacts_7.5A": {
+    "module": "patch_mean_contacts",
+    "params": {
+      "threshold_distance": 7.5
+    }
+  },
+  "rasa_residue": {
+    "module": "rasa_residue",
+    "params": {
+      "complex": false
+    }
+  },
+  "rasa_residue_complex": {
+    "module": "rasa_residue",
+    "params": {
+      "complex": true
+    }
+  },
+  "sasa_residue": {
+    "module": "sasa_residue",
+    "params": {
+      "complex": false
+    }
+  },
+  "sasa_residue_complex": {
+    "module": "sasa_residue",
+    "params": {
+      "complex": true
+    }
+  },
+  "sasa_structure": {
+    "module": "sasa_structure",
+    "params": {
+      "normalize": false
+    }
+  },
+  "sasa_structure_norm": {
+    "module": "sasa_structure",
+    "params": {
+      "normalize": true
+    }
+  }
+}

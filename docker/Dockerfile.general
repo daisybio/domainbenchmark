@@ -1,8 +1,8 @@
 FROM mambaorg/micromamba:1.5.10
 
-# Build from the repo root: docker build -f docker/Dockerfile.general -t konstantinpelz/domainbenchmark-general:1.0.1 .
+# Build from the repo root: docker build -f docker/Dockerfile.general -t konstantinpelz/domainbenchmark-general:1.0.2 .
 LABEL org.opencontainers.image.source="https://github.com/daisybio/domainbenchmark"
-LABEL org.opencontainers.image.version="1.0.1"
+LABEL org.opencontainers.image.version="1.0.2"
 LABEL org.opencontainers.image.description="general CPU container (multiqc, scikit-learn, networkx, h5py)"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

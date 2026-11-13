@@ -23,6 +23,11 @@ from eval_multiqc_functions import (
     variant_of_split,
 )
 from load_data_gm import DEFAULT_PPI_SCORE_CUTOFF
+from enrichment_plots import (
+    ENRICHMENT_SIDECAR,
+    load_inputs as load_enrichment_inputs,
+    write_enrichment_blocks,
+)
 import logging
 
 
@@ -92,6 +97,14 @@ def parse_arguments():
         default=DEFAULT_PPI_SCORE_CUTOFF,
         help="PPIs scoring below this are left out of the database analysis -- "
              "pass params.ppi_score_cutoff, the cutoff the graph models use.",
+    )
+    p.add_argument(
+        "--enrichment",
+        nargs="+",
+        default=None,
+        help="Metadata enrichment JSONs for this dataset: one per model from "
+             "eval_enrichment.py plus the observed one from create_metadata.py. "
+             "Omitted: no enrichment section.",
     )
     p.add_argument(
         "--id", dest="run_id", default=None,
@@ -446,7 +459,7 @@ def write_multiqc_json_metrics(
     logging.info("[OK] Wrote MultiQC JSON (ROC + PR)")
 
 
-def write_multiqc_config(outdir) -> str:
+def write_multiqc_config(outdir, enrichment_ids=()) -> str:
     # Write MultiQC config file to specify module order
     # @outdir: output directory where MultiQC JSON files are located
     # Returns path to written multiqc_config.yaml
@@ -493,6 +506,7 @@ def write_multiqc_config(outdir) -> str:
         + pairwise_blocks
         + roc_blocks
         + pr_blocks
+        + list(enrichment_ids)
         + db_blocks
     )
 
@@ -721,8 +735,19 @@ def main():
         db_id=args.db_id, variant=args.variant,
     )
 
+    # Enrichment travels as a sidecar too: combine_eval.py rebuilds its blocks
+    # across every dataset with the same builder used here.
+    enrichment_ids = []
+    if args.enrichment:
+        enrichment = load_enrichment_inputs(args.enrichment)
+        with open(os.path.join(args.out_dir, ENRICHMENT_SIDECAR), "w", encoding="utf-8") as fh:
+            json.dump({"db_name": db_name, "db_id": args.db_id or db_name,
+                       "variant": args.variant or variant_of_split(args.test_split),
+                       **enrichment}, fh, indent=1)
+        enrichment_ids = write_enrichment_blocks({db_name: enrichment}, args.out_dir)
+
     # Part5: Config + run MultiQC
-    cfg_path = write_multiqc_config(args.out_dir)
+    cfg_path = write_multiqc_config(args.out_dir, enrichment_ids)
     final_report = run_multiqc(args.out_dir, args.out_dir, cfg_path)
     fix_trailing_punctuation_in_report(final_report)
 

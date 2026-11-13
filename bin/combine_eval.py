@@ -20,6 +20,12 @@ from eval_multiqc_functions import (
     sort_by_dataset,
     variant_of_split,
 )
+from enrichment_plots import (
+    ENRICHMENT_SIDECAR,
+    PREFIX as ENRICHMENT_PREFIX,
+    tidy as tidy_enrichment,
+    write_enrichment_blocks,
+)
 import logging
 
 import matplotlib.pyplot as plt
@@ -77,7 +83,7 @@ def parse_arguments():
     return p.parse_args()
 
 
-def write_multiqc_config(outdir, dataset_order=None) -> str:
+def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
     # Write MultiQC config file to specify module order
     # @outdir: output directory where MultiQC JSON files are located
     # @dataset_order: resolved --mqc_order, applied to the per-dataset blocks
@@ -157,6 +163,7 @@ def write_multiqc_config(outdir, dataset_order=None) -> str:
         + pairwise_blocks
         + roc_curves_block
         + pr_curves_block
+        + list(enrichment_ids)
         + source_block
     )
 
@@ -986,6 +993,7 @@ def main():
     all_blocks = []
     db_names = []
     source_sidecars = []
+    enrichment = {}
 
     # Collect and relabel all blocks from each report
     for report_dir in args.reports:
@@ -1000,6 +1008,10 @@ def main():
         if sidecar:
             sidecar.setdefault("db_name", db_name)
             source_sidecars.append(sidecar)
+        enrichment_path = os.path.join(report_dir, ENRICHMENT_SIDECAR)
+        if os.path.isfile(enrichment_path):
+            with open(enrichment_path, "r", encoding="utf-8") as fh:
+                enrichment[db_name] = json.load(fh)
 
         for fn in os.listdir(report_dir):
             if fn.endswith("_mqc.json"):
@@ -1018,6 +1030,9 @@ def main():
                 # every block of a dataset whose name merely contains `pr` or
                 # `roc` (`protein_x`, `pr_bench`).
                 stem = block.get("id", "")
+                # Rebuilt below from the enrichment sidecars, across datasets.
+                if stem.startswith(ENRICHMENT_PREFIX):
+                    continue
                 block = relabel_multiqc_block(block, db_name)
                 # Write to output dir with new name
                 # delete the old _mqc.json suffix and add the db_name and _mqc.json back
@@ -1052,11 +1067,16 @@ def main():
     cross_db_comparison(all_blocks, outdir_json, dataset_order)
     source_accuracy_bargraph(source_sidecars, outdir_json, dataset_order)
 
+    enrichment = order_dataset_keys(enrichment, dataset_order)
+    enrichment_ids = write_enrichment_blocks(enrichment, outdir_json)
+    if enrichment:
+        tidy_enrichment(enrichment).to_csv(os.path.join(outdir, "enrichment_data.csv"), index=False)
+
     # create_section_header("models_header", "Models Results", outdir_json)
     # create_section_header("db_header", "Database Results", outdir_json)
 
     # Write MultiQC config and run MultiQC as before
-    cfg_path = write_multiqc_config(outdir_json, dataset_order)
+    cfg_path = write_multiqc_config(outdir_json, dataset_order, enrichment_ids)
     final_report = run_multiqc(outdir_json, outdir, cfg_path)
     fix_trailing_punctuation_in_report(final_report)
 

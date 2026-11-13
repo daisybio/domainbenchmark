@@ -48,6 +48,30 @@
                     "fa_icon": "fas fa-percent",
                     "hidden": true
                 },
+                "structures": {
+                    "type": "string",
+                    "format": "file-path",
+                    "exists": true,
+                    "description": "domainsplit's results/structures/structures.h5 (AF3 complexes, one per instance pair).",
+                    "help_text": "Read only when --machine_learning_features_structure names a feature. Left unset it is derived like --embeddings: structures/structures.h5 beside --input's databases/ directory. A samplesheet input needs it explicitly.",
+                    "fa_icon": "fas fa-cubes"
+                },
+                "sasa_cache_shards": {
+                    "type": "integer",
+                    "default": 12,
+                    "minimum": 1,
+                    "description": "Number of parallel SASA_CACHE_SHARD tasks computing per-residue SASA once per complex for the structure features.",
+                    "fa_icon": "fas fa-th",
+                    "hidden": true
+                },
+                "metadata": {
+                    "type": "string",
+                    "format": "directory-path",
+                    "exists": true,
+                    "description": "Directory holding domain_metadata.csv and ddi_metadata.csv for the enrichment report.",
+                    "help_text": "When set, every model's predictions are regressed on DDI metadata (error per class, predicted label, confusion class; the label itself once per test split) and the results appear in each dataset's report and the combined report. domain_metadata.csv: instance_id, pfam_id, uniprot_id plus numeric columns (aggregated per DDI as <col>_min/<col>_max). ddi_metadata.csv: pfam_id_a, pfam_id_b, uniprot_id_a, uniprot_id_b, instance_id_a, instance_id_b, source plus numeric af_* columns. A prediction without a metadata row fails the task.",
+                    "fa_icon": "fas fa-table"
+                },
                 "email": {
                     "type": "string",
                     "description": "Email address for completion summary.",
@@ -98,6 +122,14 @@
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of feature encodings to compute and feed into the ML / RF classifiers.",
                     "fa_icon": "fas fa-vector-square"
+                },
+                "machine_learning_features_structure": {
+                    "type": "string",
+                    "default": "compactness,bsa_residue,sasa_structure,radius_of_gyration,polar_residue_fraction,k_closest_distance,depth_index,interface_arearatio,contact_map,aacomp_interface",
+                    "pattern": "^(|\\s*[\\w.]+\\s*(,\\s*[\\w.]+\\s*)*)$",
+                    "description": "Comma-separated structure features, computed on the AF3 complex of each instance pair. Empty disables them.",
+                    "help_text": "Each name is an encoder in bin/features/ or a parameterised variant from assets/feature_variants.json. They join every feature combo, `_all` included; a combo containing one scores only DDIs with at least one structure-covered instance pair. Caveat: positives come from PDB co-crystals that are in AF3's training data, so interface features partly measure AF3 recall.",
+                    "fa_icon": "fas fa-cubes"
                 },
                 "large_features": {
                     "type": "string",

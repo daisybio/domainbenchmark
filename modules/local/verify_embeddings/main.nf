@@ -38,7 +38,7 @@ process VERIFY_EMBEDDINGS {
     label 'process_low'
 
     conda "${projectDir}/environments/general.yml"
-    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.1"
+    container "docker.io/konstantinpelz/domainbenchmark-general:1.0.2"
 
     input:
         tuple val(meta), path(database_dir), val(features), path(embedding_files)

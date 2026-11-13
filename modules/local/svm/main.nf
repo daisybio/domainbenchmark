@@ -1,0 +1,48 @@
+process SVM {
+    tag "${meta.id}"
+    label 'process_gpu'
+
+    conda "${projectDir}/environments/ml.yml"
+    container "docker.io/konstantinpelz/domainbenchmark-gpu:1.0.2"
+
+    input:
+        tuple val(meta), path('DDI'), path('features/*'), path('config.json')
+
+    output:
+        tuple val(meta), path("svm_${meta.combo_id}/predictions_*.parquet"), emit: predictions
+        tuple val(meta), path("svm_${meta.combo_id}/model/"),               emit: model
+
+    script:
+        def output_base        = "svm_${meta.combo_id}"
+        def output_model_dir   = "${output_base}/model"
+        // One trained model, scored against every test split of this database
+        // (test_balanced + test_realistic, or a single test).
+        def test_splits        = meta.tests.values().join(' ')
+        // Without --allow_cpu the script exits 140 when its CUDA smoke test
+        // fails, so Nextflow retries on a healthy GPU node.
+        def allow_cpu          = params.allow_cpu_ml ? '--allow_cpu' : ''
+        """
+        mkdir -p ${output_model_dir}
+
+        svm.py \\
+            --features ${meta.features.join(' ')} \\
+            --features_path features/ \\
+            --ddi_path DDI/ \\
+            --config config.json \\
+            --out_predictions_dir ${output_base} \\
+            --test_splits ${test_splits} \\
+            --out_model_dir ${output_model_dir} \\
+            --seed ${params.seed} ${allow_cpu}
+        """
+
+    stub:
+        def output_base = "svm_${meta.combo_id}"
+        def variants    = meta.tests.keySet().join(' ')
+        """
+        mkdir -p ${output_base}/model
+        for v in ${variants}; do
+            touch ${output_base}/predictions_\${v}.parquet
+        done
+        touch ${output_base}/model/model_parameters.json
+        """
+}
