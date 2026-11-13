@@ -15,6 +15,12 @@ per-run embedding files domainsplit publishes:
     <embeddings-out>/esmc_domain_embeddings.h5
     <embeddings-out>/prott5_domain_embeddings.h5
 
+and, beside `databases/`, the AF3 structures and the enrichment metadata:
+
+    structures/structures.h5          domainsplit's ENRICH_STRUCTURAL layout
+    metadata/domain_metadata.csv      per-instance numeric metadata
+    metadata/ddi_metadata.csv         per-instance-pair af_* metadata
+
 Everything is synthesised — no real database is needed, and the generator is
 deterministic (fixed seed), so re-running it produces byte-identical content
 for the non-blob columns.
@@ -28,6 +34,13 @@ Deliberate properties the pipeline depends on:
   instance-level keys;
 * `ddi_split_membership` names the exact instance pairs of each split, which is
   what the ML loader instantiates;
+* instance ids are domainsplit's `<pfam>_<uniprot>_<start>_<end>`, because its
+  structure writer derives the structures.h5 group from that prefix;
+* one homodimer DDI (family 1 with itself) per split;
+* structure coverage is partial: `has_structure = 0` on one pair of a positive
+  (the DDI keeps its other pairs) and on every pair of a negative (the DDI has
+  no structure at all), so the structure features' coverage logging and drop
+  path both run;
 * the databases carry **no embedding BLOBs at all**. domainsplit embeds the
   cut domain sequence outside the database now, so `protein.*_per_residue` and
   `domain_protein_map.*_per_domain` are gone from the schema and the encoders
@@ -47,6 +60,7 @@ Usage:
 """
 
 import argparse
+import gzip
 import hashlib
 import random
 import sqlite3
@@ -114,6 +128,8 @@ CREATE TABLE ddi_split_membership (
     ddi_id REFERENCES domain_domain_interaction ON DELETE CASCADE,
     method, split,
     instance_id_a, instance_id_b,
+    has_structure INTEGER NOT NULL DEFAULT 0,
+    z_score REAL,
     UNIQUE(ddi_id, method, split, instance_id_a, instance_id_b)
 );
 CREATE INDEX idx_domain_domain_interaction_domain_id_a
@@ -141,6 +157,10 @@ def sequence(rng, length):
 POSITIVE_SOURCES = ["3did", "single_domain_ppi,PPIDM,PPIDM_Gold", "PPIDM"]
 NEGATIVE_SOURCES = ["sampled_negative", "negatome"]
 UNSOURCED_DDI_INDEX = 4
+# Structure coverage holes (see build_split): a positive with one pair missing,
+# a negative with every pair missing.
+PARTIAL_STRUCTURE_DDI_INDEX = 0
+NO_STRUCTURE_DDI_INDEX = 7
 
 
 def ddi_source(idx: int, negative: int):
@@ -203,6 +223,7 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
     # pair is what collides unless the HDF5 key is the instance.
     dpm_rows = []
     instances_by_domain = {}
+    instance_info = {}  # instance_id -> (pfam_id, uniprot_id, domain sequence)
     for domain_id, _pfam, _name in domains:
         carriers = [
             ((domain_id - 1) % N_PROTEINS) + 1,
@@ -215,8 +236,13 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
         instance_ids = []
         for protein_id, start, end in placements:
             protein_seq = proteins[protein_id - 1][2]
-            instance_id = f"inst_{offset}_{domain_id}_{protein_id}_{start}"
+            # domainsplit's `<family>_<uniprot>_<start>_<end>`: its structure
+            # writer derives the structures.h5 group from this prefix.
+            instance_id = f"{_pfam}_{proteins[protein_id - 1][1]}_{start}_{end}"
             instance_ids.append(instance_id)
+            instance_info[instance_id] = (
+                _pfam, proteins[protein_id - 1][1], protein_seq[start:end]
+            )
             dpm_rows.append(
                 (
                     domain_id,
@@ -251,6 +277,8 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
             continue
         pairs.append((a, b))
         b += 2
+    # One homodimer: family 1 with itself, over its distinct instances.
+    pairs.append((1, 1))
 
     ddi_rows = []
     membership_rows = []
@@ -258,16 +286,31 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
         ddi_id = idx + 1
         negative = 1 if idx % 2 else 0
         ddi_rows.append((ddi_id, domain_a, domain_b, negative, ddi_source(idx, negative)))
-        for instance_a in instances_by_domain[domain_a]:
-            for instance_b in instances_by_domain[domain_b]:
-                first, second = sorted((instance_a, instance_b))
-                membership_rows.append((ddi_id, method, split, first, second))
+        instance_pairs = sorted({
+            tuple(sorted((instance_a, instance_b)))
+            for instance_a in instances_by_domain[domain_a]
+            for instance_b in instances_by_domain[domain_b]
+            if instance_a != instance_b
+        })
+        for row, (first, second) in enumerate(instance_pairs):
+            # Structure coverage is partial on purpose, as AF3 coverage is:
+            # one positive keeps a structure on all but its first pair (the DDI
+            # survives), one negative has none at all (the DDI drops out of
+            # every structure-feature run).
+            missing = (idx == PARTIAL_STRUCTURE_DDI_INDEX and row == 0) or (
+                idx == NO_STRUCTURE_DDI_INDEX
+            )
+            has_structure = 0 if missing else 1
+            z_score = None if missing else round(float(rng.normal()), 4)
+            membership_rows.append(
+                (ddi_id, method, split, first, second, has_structure, z_score)
+            )
 
     conn.executemany(
         "INSERT INTO domain_domain_interaction VALUES (?, ?, ?, ?, ?)", ddi_rows
     )
     conn.executemany(
-        "INSERT OR IGNORE INTO ddi_split_membership VALUES (?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO ddi_split_membership VALUES (?, ?, ?, ?, ?, ?, ?)",
         membership_rows,
     )
 
@@ -281,7 +324,13 @@ def build_split(path: Path, method: str, split: str, offset: int) -> list:
     # `(domain.pfam_id, COALESCE(instance_id, 'r' || rowid))` -- every fixture
     # row has an instance_id, so the second half is the instance_id itself.
     pfam_by_id = {d[0]: d[1] for d in domains}
-    return [(str(pfam_by_id[row[0]]), str(row[5])) for row in dpm_rows]
+    instances = [(str(pfam_by_id[row[0]]), str(row[5])) for row in dpm_rows]
+    sources = {r[0]: r[4] for r in ddi_rows}
+    memberships = [
+        (instance_a, instance_b, has_structure, sources[ddi_id])
+        for ddi_id, _m, _s, instance_a, instance_b, has_structure, _z in membership_rows
+    ]
+    return instances, instance_info, memberships
 
 
 # dataset -> its splits. `random` has an internal test set and therefore two
@@ -290,6 +339,113 @@ DATASETS = {
     "random": ["train", "validation", "test_balanced", "test_realistic"],
     "external_test": ["train", "validation", "test"],
 }
+
+
+THREE_LETTER = {
+    "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE", "G": "GLY",
+    "H": "HIS", "I": "ILE", "K": "LYS", "L": "LEU", "M": "MET", "N": "ASN",
+    "P": "PRO", "Q": "GLN", "R": "ARG", "S": "SER", "T": "THR", "V": "VAL",
+    "W": "TRP", "Y": "TYR",
+}
+
+
+def _key_rng(*tokens) -> np.random.Generator:
+    """RNG seeded on a string key -- sha256, because `hash()` is salted."""
+    digest = hashlib.sha256("/".join(tokens).encode()).digest()
+    return np.random.default_rng(SEED + int.from_bytes(digest[:8], "big"))
+
+
+def pdb_text(chains) -> str:
+    """Two-chain PDB with backbone + CB per residue (no CB on GLY).
+
+    `chains` is `[(chain_id, sequence, y_offset, rng)]`. Residues run along x
+    with a little jitter, one chain per y offset, so the chains touch: enough
+    for Shrake-Rupley, contacts and backbone angles to give non-trivial values.
+    Same layout as domainsplit's tests/python/test_structure_scoring.py.
+    """
+    lines, serial = [], 1
+    for chain_id, seq, y, rng in chains:
+        for resseq, aa in enumerate(seq, start=1):
+            x = 3.8 * resseq
+            jitter = rng.normal(0.0, 0.3, size=3)
+            atoms = [("N", -1.2, 0.0, "N"), ("CA", 0.0, 0.0, "C"),
+                     ("C", 1.2, 0.0, "C"), ("O", 1.2, 1.2, "O")]
+            if aa != "G":
+                atoms.append(("CB", 0.0, -1.5, "C"))
+            for name, dx, dz, element in atoms:
+                lines.append(
+                    f"ATOM  {serial:5d} {name:<4s} {THREE_LETTER[aa]} {chain_id}{resseq:4d}    "
+                    f"{x + dx + jitter[0]:8.3f}{y + jitter[1]:8.3f}{dz + jitter[2]:8.3f}"
+                    f"{1.0:6.2f}{90.0:6.2f}          {element:>2s}"
+                )
+                serial += 1
+        lines.append("TER")
+    lines.append("END")
+    return "\n".join(lines) + "\n"
+
+
+def write_structure_file(path: Path, instance_info, memberships) -> None:
+    """`structures.h5` in domainsplit's ENRICH_STRUCTURAL layout.
+
+    One AF3-like complex per instance pair with `has_structure = 1`:
+    `h5["<pfamA>_<pfamB>"]["<instA>__<instB>"]` -> uint8 gzip'd PDB text,
+    chain A = instance A, keyed in the membership row's own orientation
+    (domainsplit's `structure_h5_keys`). gzip mtime is pinned so the file is
+    byte-identical between generator runs.
+    """
+    if path.exists():
+        path.unlink()
+    n = 0
+    with h5py.File(path, "w") as out_h5:
+        for instance_a, instance_b, has_structure, _src in sorted(set(memberships)):
+            if not has_structure:
+                continue
+            pfam_a, _uni_a, seq_a = instance_info[instance_a]
+            pfam_b, _uni_b, seq_b = instance_info[instance_b]
+            rng = _key_rng("structure", instance_a, instance_b)
+            gap = float(rng.uniform(5.0, 10.0))
+            text = pdb_text([("A", seq_a, 0.0, rng), ("B", seq_b, gap, rng)])
+            blob = gzip.compress(text.encode(), mtime=0)
+            out_h5.require_group(f"{pfam_a}_{pfam_b}").create_dataset(
+                f"{instance_a}__{instance_b}",
+                data=np.frombuffer(blob, dtype="uint8"), compression=None,
+            )
+            n += 1
+    print(f"  {path.name}: {n} complexes")
+
+
+def write_metadata(out: Path, instance_info, memberships) -> None:
+    """The two CSVs `--metadata` expects (bin/create_metadata.py).
+
+    Real ones are produced outside both repos; these follow the column contract
+    the code reads: `domain_metadata.csv` is one row per instance with numeric
+    domain-level columns, `ddi_metadata.csv` one row per instance pair with
+    numeric `af_*` columns (only for pairs with a structure).
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "domain_metadata.csv", "w") as fh:
+        fh.write("instance_id,pfam_id,uniprot_id,length,hydrophobic_fraction,interpro_n_sites\n")
+        for instance_id in sorted(instance_info):
+            pfam_id, uniprot_id, seq = instance_info[instance_id]
+            hydrophobic = sum(aa in "AVILMFWY" for aa in seq) / len(seq)
+            n_sites = int(_key_rng("interpro", instance_id).integers(0, 6))
+            fh.write(f"{instance_id},{pfam_id},{uniprot_id},{len(seq)},"
+                     f"{hydrophobic:.4f},{n_sites}\n")
+    rows = 0
+    with open(out / "ddi_metadata.csv", "w") as fh:
+        fh.write("pfam_id_a,pfam_id_b,uniprot_id_a,uniprot_id_b,instance_id_a,"
+                 "instance_id_b,source,af_iptm,af_pae_mean\n")
+        for instance_a, instance_b, has_structure, source in sorted(set(memberships)):
+            if not has_structure:
+                continue
+            pfam_a, uni_a, _ = instance_info[instance_a]
+            pfam_b, uni_b, _ = instance_info[instance_b]
+            rng = _key_rng("ddi_metadata", instance_a, instance_b)
+            fh.write(f"{pfam_a},{pfam_b},{uni_a},{uni_b},{instance_a},{instance_b},"
+                     f"\"{source or ''}\",{rng.uniform(0.2, 0.95):.4f},"
+                     f"{rng.uniform(2.0, 25.0):.4f}\n")
+            rows += 1
+    print(f"  domain_metadata.csv: {len(instance_info)} rows, ddi_metadata.csv: {rows} rows")
 
 
 def write_embedding_file(path: Path, model: str, instances) -> None:
@@ -354,6 +510,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     instances = []
+    instance_info = {}
+    memberships = []
     offset = 0
     for dataset, splits in DATASETS.items():
         print(f"\n[{dataset}]")
@@ -361,9 +519,12 @@ def main():
         dataset_dir.mkdir(parents=True, exist_ok=True)
         for split in splits:
             offset += 100
-            instances += build_split(
+            split_instances, split_info, split_memberships = build_split(
                 dataset_dir / f"{split}.sqlite3", dataset, split, offset
             )
+            instances += split_instances
+            instance_info.update(split_info)
+            memberships += split_memberships
 
     embeddings_out = Path(args.embeddings_out) if args.embeddings_out else out.parent / "embeddings"
     embeddings_out.mkdir(parents=True, exist_ok=True)
@@ -373,7 +534,15 @@ def main():
             embeddings_out / f"{model}_domain_embeddings.h5", model, instances
         )
 
-    print(f"\nWrote fixture to {out} and {embeddings_out}")
+    print("\n[structures]")
+    structures_out = out.parent / "structures"
+    structures_out.mkdir(parents=True, exist_ok=True)
+    write_structure_file(structures_out / "structures.h5", instance_info, memberships)
+
+    print("\n[metadata]")
+    write_metadata(out.parent / "metadata", instance_info, memberships)
+
+    print(f"\nWrote fixture to {out.parent}")
 
 
 if __name__ == "__main__":
