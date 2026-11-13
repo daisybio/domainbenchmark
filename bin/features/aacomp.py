@@ -5,6 +5,8 @@ import sqlite3
 from features import embeddings
 
 AA = "ACDEFGHIKLMNPQRSTVWY"
+SEQUENCE_QUERY = embeddings.SEQUENCE_SQL
+MIN_SEQUENCE_LENGTH = 1
 
 
 def get_aa_comp(seq: str) -> list[float]:
@@ -19,21 +21,12 @@ def get_aa_comp(seq: str) -> list[float]:
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
     # Deterministic encoder: `seed` is part of the encoder ABI so that a
     # sampling encoder cannot be added without one. Unused here.
-    domain_sequence_df = pd.read_sql(
-        f"""
-                SELECT {embeddings.DOMAIN_KEY_SQL},
-                       {embeddings.INSTANCE_KEY_SQL},
-                       UPPER(domain_sequence) AS sequence
-                FROM domain_protein_map
-                {embeddings.DOMAIN_JOIN_SQL};
-            """,
-        conn,
-    )
+    domain_sequence_df = pd.read_sql(SEQUENCE_QUERY, conn)
 
     domain_sequence_df["domain_key"] = domain_sequence_df["domain_key"].astype(str)
     domain_sequence_df["instance_key"] = domain_sequence_df["instance_key"].astype(str)
     domain_sequence_df["aacomp"] = [
-        get_aa_comp(embeddings.clean_sequence(sequence, domain_key, instance_key))
+        get_aa_comp(embeddings.clean_sequence(sequence, domain_key, instance_key, min_length=MIN_SEQUENCE_LENGTH))
         for domain_key, instance_key, sequence in domain_sequence_df.itertuples(index=False)
     ]
 

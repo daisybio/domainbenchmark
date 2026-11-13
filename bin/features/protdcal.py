@@ -30,6 +30,12 @@ PAIR_QUERY = f"""
     JOIN domain AS d2 ON dpm_2.domain_id = d2.id
     ORDER BY domain_1_key, instance_1_key, domain_2_key, instance_2_key
 """
+# Both sides of PAIR_QUERY, for bin/preflight.py (see embeddings.SEQUENCE_SQL).
+SEQUENCE_QUERY = (
+    f"SELECT domain_1_key, instance_1_key, sequence_1 FROM ({PAIR_QUERY}) UNION "
+    f"SELECT domain_2_key, instance_2_key, sequence_2 FROM ({PAIR_QUERY})"
+)
+MIN_SEQUENCE_LENGTH = 1
 
 
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
@@ -62,7 +68,7 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
 
     def single_mean(domain_key, instance_key, sequence):
         if instance_key not in single_means:
-            cleaned = embeddings.clean_sequence(sequence, domain_key, instance_key)
+            cleaned = embeddings.clean_sequence(sequence, domain_key, instance_key, min_length=MIN_SEQUENCE_LENGTH)
             single_means[instance_key] = (cleaned, e_state_mean(cleaned))
         return single_means[instance_key]
 

@@ -87,21 +87,19 @@ def complete_cases(df, features):
     A column with no value at all in this split is dropped (it would otherwise
     remove every row); any other missing value drops its row, and both are
     counted, never imputed.
+
+    No usable column, or no complete row, is not an error: it depends on which
+    DDI subset a model scored (a structure combo scores only covered DDIs), so
+    `analyse()` records every target as skipped instead.
     """
     dropped = {c: "no values in this split" for c in features if df[c].isna().all()}
     used = [c for c in features if c not in dropped]
-    if not used:
-        raise SystemExit("[enrichment] No metadata column has any value in this split.")
-    complete = df.dropna(subset=used)
+    complete = df.dropna(subset=used) if used else df.iloc[:0]
     counts = {
         "n_with_metadata": int(len(df)),
         "n_complete": int(len(complete)),
         "n_missing_by_column": {c: int(df[c].isna().sum()) for c in used},
     }
-    if complete.empty:
-        raise SystemExit(
-            f"[enrichment] No row has every metadata value ({counts['n_missing_by_column']})."
-        )
     return complete, used, dropped, counts
 
 
@@ -176,6 +174,10 @@ def analyse(target, X, y, threads=1):
     X = X[sorted(X.columns)]
     out = {"model_kind": kind, "cov_type": COV_TYPE[kind], "n_rows": int(len(y))}
     try:
+        if X.shape[1] == 0:
+            raise Degenerate("no metadata column has any value in these rows")
+        if len(y) == 0:
+            raise Degenerate("no row of this target has every metadata value")
         classes = None
         if kind != "ols":
             classes, counts = np.unique(y, return_counts=True)

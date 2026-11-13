@@ -134,6 +134,7 @@ workflow FEATURE_EXTRACTION {
         feature_ch     // queue of feature specs: [name, module, params (Map), structure (bool)]
         db_ch          // channel: tuple(meta, db_path)  — multi-DB capable
         structures     // value channel: structures.h5, or Channel.empty() without structure features
+        sasa_db_ch     // db_ch gated on PREFLIGHT: the SASA build waits for every database to pass
 
     main:
         // Build per-(db, feature, split) tasks. The split list is per-database
@@ -160,7 +161,7 @@ workflow FEATURE_EXTRACTION {
         // value every structure task combines with.
         sasa_cache = MERGE_SASA_CACHE(
             SASA_CACHE_SHARD(
-                db_ch.map { _meta, db_path -> db_path }.collect(sort: true),
+                sasa_db_ch.map { _meta, db_path -> db_path }.collect(sort: true),
                 structures,
                 (0..<params.sasa_cache_shards).toList()
             ).shard.collect(sort: true)

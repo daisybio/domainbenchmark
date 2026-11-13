@@ -66,6 +66,21 @@ def test_missing_values_are_counted_not_imputed():
     assert not complete[used].isna().any().any()
 
 
+@pytest.mark.parametrize("x, reason", [([np.nan] * 4, "no metadata column"), ([np.nan, 1.0, np.nan, np.nan], "no row")])
+def test_no_complete_rows_is_a_recorded_skip(x, reason):
+    """Depends on the DDI subset a model scored, so it must not fail the task."""
+    df = pd.DataFrame({"domain_a": list("abcd"), "domain_b": list("abcd"), "label": [0, 1, 0, 1],
+                       "x": x, "y": [np.nan, np.nan, 1.0, 2.0]})
+    if reason == "no metadata column":
+        df["y"] = np.nan
+    complete, used, _dropped, counts = ee.complete_cases(df, ee.feature_columns(df))
+    assert counts["n_complete"] == 0
+    for target in ("observed", "error_positive"):
+        out = ee.analyse(target, complete[used], complete["label"].to_numpy())
+        assert out["status"] == "skipped" and reason in out["reason"]
+    assert create_metadata.observed_result(df)["targets"]["observed"]["status"] == "skipped"
+
+
 def test_domain_features_are_symmetric_and_sorted():
     inst = _instances()
     swapped = inst.rename(columns={"domain_1": "domain_2", "domain_2": "domain_1",

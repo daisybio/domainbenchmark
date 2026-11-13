@@ -20,6 +20,7 @@
 ----------------------------------------------------------------------------*/
 
 include { DDI_EXTRACTION                                } from '../../../modules/local/ddi_extraction/main.nf'
+include { PREFLIGHT                                     } from '../../../modules/local/preflight/main.nf'
 include { FEATURE_EXTRACTION                            } from '../../../modules/local/feature_extraction/main.nf'
 include { NEURAL_NETWORK                                } from '../../../modules/local/neural_network/main.nf'
 include { RANDOM_FOREST                                 } from '../../../modules/local/random_forest/main.nf'
@@ -224,10 +225,30 @@ workflow PER_DB_BENCHMARK {
             [name: name, module: v ? v.module : name, params: v ? v.params : [:],
              structure: structure_features.contains(name)]
         }
+        def structures_file = structure_features ? structuresFile(structure_features) : null
+
+        // Everything that would otherwise only fail after training (see
+        // bin/preflight.py). Its output gates the ML inputs (through ddi_keyed
+        // below) and SASA_CACHE_SHARD, so a broken database costs minutes.
+        PREFLIGHT(
+            db_ch.map { meta, db_path -> tuple(meta, db_path, published_features, published_files) },
+            structures_file ?: [],
+            params.metadata ? file(params.metadata, checkIfExists: true) : [],
+            [
+                combos   : feature_combos,
+                extracted: feature_specs.findAll { !it.structure }.collectEntries { [(it.name): it.module] },
+                structure: feature_specs.findAll { it.structure }.collectEntries { [(it.name): it.module] },
+            ]
+        )
+        preflight_ok = PREFLIGHT.out.report.map { meta, report -> tuple(meta.id, report) }
+
         FEATURE_EXTRACTION(
             Channel.fromList(feature_specs),
             db_ch,
-            structure_features ? Channel.value(structuresFile(structure_features)) : Channel.empty()
+            structures_file ? Channel.value(structures_file) : Channel.empty(),
+            db_ch.map { meta, db_path -> tuple(meta.id, meta, db_path) }
+                .join(preflight_ok)
+                .map { _id, meta, db_path, _report -> tuple(meta, db_path) }
         )
 
         // Gate the published files against the databases they will be paired
@@ -273,7 +294,11 @@ workflow PER_DB_BENCHMARK {
         // emits: tuple(db_id, [aacomp__train.h5, ..., esm3_embeddings.h5, ...])
 
         // Key DDI outputs by db_id so we can join with feature_files_per_db.
+        // Joined on PREFLIGHT: every ML input is built from this channel, so
+        // no model trains on a database that failed it.
         ddi_keyed = ddi_ch.map { meta, ddi_dir -> tuple(meta.id, meta, ddi_dir) }
+            .join(preflight_ok)
+            .map { id, meta, ddi_dir, _report -> tuple(id, meta, ddi_dir) }
 
         // ---------------------------------------------------------------
         // NN / RF (per-feature singletons + one all-concat run, gated by

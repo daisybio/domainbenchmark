@@ -328,6 +328,28 @@ def validateModelParams() {
         error("Unknown machine_learning_models: ${bad_ml.join(', ')}. Known: ${ml_known.join(', ')}.")
     }
 
+    // Keys the ML scripts read from assets/<Model>.json. Some are read only at
+    // refit, after the whole grid search (neural_network.py: retrain_epochs),
+    // so a missing one used to cost the search before it surfaced.
+    def ml_json  = [neural_network: 'NeuralNetwork', random_forest: 'RandomForest', svm: 'SVM']
+    def required = ['model_parameters', 'search_parameters.models_to_evaluate',
+                    'search_parameters.balance_positive_and_negative_interactions_opt_set']
+    def nn_extra = ['device', 'jobs', 'search_parameters.grid_search_epochs', 'search_parameters.retrain_epochs']
+    ml_models.findAll { !csvToList(params.skip).contains(it) }.each { model ->
+        def json = file("${params.modeljson}/${ml_json[model]}.json")
+        if (!json.exists()) {
+            error("machine_learning_models names ${model}, but ${json} does not exist.")
+        }
+        def config  = new groovy.json.JsonSlurper().parse(json.toFile())
+        def keys    = required + (model == 'neural_network' ? nn_extra : [])
+        def missing = keys.findAll { key ->
+            key.tokenize('.').inject(config) { node, k -> node instanceof Map ? node[k] : null } == null
+        }
+        if (missing) {
+            error("${json} lacks key(s) ${missing.join(', ')}, which ${model} reads during training.")
+        }
+    }
+
     def graph_models = csvToList(params.graph_models)
     def bad_graph    = graph_models.findAll { !file("${params.modeljson}/${it}.json").exists() }
     if (bad_graph) {
