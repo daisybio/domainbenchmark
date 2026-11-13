@@ -41,7 +41,7 @@ process VERIFY_EMBEDDINGS {
     container "docker.io/konstantinpelz/domainbenchmark-general:1.0.2"
 
     input:
-        tuple val(meta), path(database_dir), val(features), path(embedding_files)
+        tuple val(meta), path(database_dir, stageAs: "input_db"), val(features), path(embedding_files)
 
     output:
         tuple val(meta), path("verified/*.h5"), emit: h5

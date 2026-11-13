@@ -95,7 +95,7 @@
                 },
                 "graph_models": {
                     "type": "string",
-                    "default": "kgiddi,ddiparsimony,kgiddi_random",
+                    "default": "",
                     "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
                     "description": "Comma-separated list of graph-based DDI models to run. Pass 'none' (or an empty string) to disable.",
                     "fa_icon": "fas fa-project-diagram"
@@ -111,7 +111,7 @@
                 },
                 "machine_learning_models": {
                     "type": "string",
-                    "default": "neural_network,random_forest",
+                    "default": "neural_network,random_forest,svm",
                     "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
                     "description": "Comma-separated list of machine-learning models to run (subset of: neural_network, random_forest). Pass 'none' to disable all ML models.",
                     "fa_icon": "fas fa-brain"

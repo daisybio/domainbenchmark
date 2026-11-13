@@ -361,11 +361,9 @@ def _summary(y_true, y_pred, model_name) -> dict:
     TNR = _safe(TN, neg)
     Precision = _safe(TP, TP + FP)
     BA = (TPR + TNR) / 2 if not (np.isnan(TPR) or np.isnan(TNR)) else float("nan")
-    F1 = (
-        2 * Precision * TPR / (Precision + TPR)
-        if (Precision + TPR)
-        else float("nan")
-    )
+    # From counts, not via Precision/TPR: those are NaN or 0/0 exactly when
+    # F1 is still defined (no predicted positives, or all predictions wrong).
+    F1 = _safe(2 * TP, 2 * TP + FP + FN)
     # MCC: returns 0 when one predicted class is absent (sklearn convention).
     try:
         MCC = float(matthews_corrcoef(y_true, y_pred))

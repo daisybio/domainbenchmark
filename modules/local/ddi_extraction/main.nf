@@ -6,14 +6,18 @@ process DDI_EXTRACTION {
     container "docker.io/konstantinpelz/domainbenchmark-general:1.0.2"
 
     input:
-        tuple val(meta), path(database_dir)
+        tuple val(meta), path(database_dir, stageAs: "input_db")
 
     output:
         // NOT `${meta.id}/DDI`: the input database directory is staged under its
         // own basename, which for a directory input *is* `${meta.id}`, so writing
         // there followed the stage symlink and dumped the CSVs straight into the
         // caller's domainsplit output (and into the test fixture, whose stale
-        // copies are still tracked). `ddi_out/` cannot collide with a staged input.
+        // copies are still tracked). `ddi_out/` alone did not fix it: a database
+        // directory *named* `ddi_out` staged onto the same path, so the input is
+        // now staged under the fixed name `input_db` (same in VERIFY_EMBEDDINGS,
+        // FEATURE_EXTRACTION_ONE and EVALUATION, whose outputs are `verified/`
+        // and `evaluation/`).
         tuple val(meta), path("ddi_out/DDI"), emit: ddi
 
     script:

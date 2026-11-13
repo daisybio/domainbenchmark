@@ -317,6 +317,22 @@ def resolve_feature_file(features_path: Path, feature: str, dataset: str) -> Pat
     return features_path / f"{feature}.h5"
 
 
+def _vector(group, key, width):
+    """One feature vector, flattened; refuses a width other than the column's.
+
+    Without the check numpy broadcasts a 1-element vector across the slice and
+    invents columns instead of failing.
+    """
+    v = np.asarray(group[key]).ravel()
+    if v.size != width:
+        raise ValueError(
+            f"{group.file.filename}: {group.name}/{key} has {v.size} values, "
+            f"expected {width} like the first resolved instance. Every vector "
+            "of one feature must have the same width."
+        )
+    return v
+
+
 def load_embedding_data(
     features_path: Path,
     features: List[str],
@@ -654,17 +670,15 @@ def load_embedding_data(
                 row = x[at]
                 col = 0
                 for group, width in zip(groups_a, domain_widths):
-                    row[col:col + width] = np.asarray(group[instance_a]).ravel()
+                    row[col:col + width] = _vector(group, instance_a, width)
                     col += width
                 for group, width in zip(groups_b, domain_widths):
-                    row[col:col + width] = np.asarray(group[instance_b]).ravel()
+                    row[col:col + width] = _vector(group, instance_b, width)
                     col += width
                 if interaction_groups:
                     joined_instance = f"{instance_a}_{instance_b}"
                     for group, width in zip(interaction_groups, interaction_widths):
-                        row[col:col + width] = np.asarray(
-                            group[joined_instance]
-                        ).ravel()
+                        row[col:col + width] = _vector(group, joined_instance, width)
                         col += width
 
                 y[at] = interaction

@@ -260,6 +260,20 @@ def runLabel(db_id, variant) {
 // by COMBINE_EVAL -- the last task of the run, after every model had trained.
 //
 def validateDatasets(datasets) {
+    // Ids and split names are interpolated unquoted into task scripts and
+    // publish paths: `$(...)`, quotes or `../` in a directory name or a
+    // samplesheet id would execute or escape. Same rule for both input forms.
+    datasets.each { ds ->
+        def meta = ds[0]
+        if (!(meta.id ==~ /[A-Za-z0-9][A-Za-z0-9_.-]*/)) {
+            error("Dataset id '${meta.id}' (from ${ds[1]}) may contain only letters, digits, '_', '.' and '-', and must start with a letter or digit.")
+        }
+        def bad_splits = meta.splits.findAll { !(it ==~ /[A-Za-z0-9_]+/) }
+        if (bad_splits) {
+            error("Database ${ds[1]} has split file name(s) ${bad_splits.collect { it + '.sqlite3' }.join(', ')}; split names may contain only letters, digits and '_'.")
+        }
+    }
+
     def ids = datasets.collect { it[0].id }
     def dup_ids = ids.countBy { it }.findAll { _id, n -> n > 1 }.keySet().sort()
     if (dup_ids) {

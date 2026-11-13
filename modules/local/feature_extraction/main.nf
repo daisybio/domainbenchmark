@@ -92,7 +92,7 @@ process FEATURE_EXTRACTION_ONE {
 
     input:
         // `structures` / `sasa_cache` are [] for a non-structure feature.
-        tuple val(meta), path(database_dir), path(structures, stageAs: 'structures.h5'), path(sasa_cache, stageAs: 'sasa_cache.h5')
+        tuple val(meta), path(database_dir, stageAs: "input_db"), path(structures, stageAs: 'structures.h5'), path(sasa_cache, stageAs: 'sasa_cache.h5')
 
     output:
         // optional: a split absent from this database produces no file at all.

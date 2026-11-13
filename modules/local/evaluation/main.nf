@@ -52,7 +52,7 @@ process EVALUATION {
     input:
         // enrichment_jsons: METADATA's observed.json + every ENRICHMENT
         // <model>.enrichment.json of this variant, or [] for no enrichment.
-        tuple val(meta), path(database), path(per_model_jsons), path(enrichment_jsons, stageAs: 'enrichment/*')
+        tuple val(meta), path(database, stageAs: "input_db"), path(per_model_jsons), path(enrichment_jsons, stageAs: 'enrichment/*')
 
     output:
         tuple val(meta), path('evaluation/'), emit: report

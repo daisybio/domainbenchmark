@@ -137,3 +137,22 @@ def test_predictions_canonical_and_rf_differs_from_nn():
             assert not np.allclose(a["predicted_probability"].to_numpy(),
                                    b["predicted_probability"].to_numpy(), atol=1e-4), pq
     assert compared, "no NN/RF prediction pair compared"
+
+
+# --- codex audit AUD-10 / AUD-11 ----------------------------------------------
+
+def test_f1_is_zero_not_nan_when_defined():
+    assert eval_one._summary([0, 1], [1, 0], "m")["F1 Score"] == 0.0
+    assert eval_one._summary([1, 1, 0], [0, 0, 0], "m")["F1 Score"] == 0.0
+    assert np.isnan(eval_one._summary([0, 0], [0, 0], "m")["F1 Score"])
+
+
+def test_feature_width_mismatch_is_rejected(tmp_path):
+    from machine_learning import _vector
+
+    with h5py.File(tmp_path / "f.h5", "w") as h5:
+        h5["PF00001/a"] = np.array([1.0, 2.0])
+        h5["PF00002/b"] = np.array([9.0])
+        assert _vector(h5["PF00001"], "a", 2).tolist() == [1.0, 2.0]
+        with pytest.raises(ValueError, match="PF00002/b has 1 values, expected 2"):
+            _vector(h5["PF00002"], "b", 2)

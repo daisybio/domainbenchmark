@@ -168,6 +168,9 @@ class InstanceLookup:
         self.h5_file = h5_file
         self.groups = {}
         self.verdicts = {}
+        # (width, first instance with it): every vector must have one width,
+        # or the loader's fixed-width row slices broadcast a short one.
+        self.width = None
 
     def __call__(self, pfam_id, instance_key):
         """Return "ok", "missing" or "non-finite"."""
@@ -183,6 +186,16 @@ class InstanceLookup:
                 verdict = "non-finite"
             else:
                 verdict = "ok"
+                width = int(dataset.size)
+                if self.width is None:
+                    self.width = (width, f"{pfam_id}/{instance_key}")
+                elif width != self.width[0]:
+                    sys.exit(
+                        f"[verify] {self.h5_file.filename}: {pfam_id}/{instance_key} "
+                        f"has {width} values but {self.width[1]} has "
+                        f"{self.width[0]}. Every vector of one feature must "
+                        "have the same width."
+                    )
             self.verdicts[key] = verdict
         return self.verdicts[key]
 
