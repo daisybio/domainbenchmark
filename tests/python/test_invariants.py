@@ -156,3 +156,14 @@ def test_feature_width_mismatch_is_rejected(tmp_path):
         assert _vector(h5["PF00001"], "a", 2).tolist() == [1.0, 2.0]
         with pytest.raises(ValueError, match="PF00002/b has 1 values, expected 2"):
             _vector(h5["PF00002"], "b", 2)
+
+
+def test_feature_width_must_agree_across_splits():
+    import machine_learning as ml
+
+    ml._feature_widths.clear()
+    ml._check_feature_widths(["f", "g"], [2, 1], "train")
+    ml._check_feature_widths(["f", "g"], [2, 1], "validation")
+    with pytest.raises(ValueError, match="'f' has width 1 on split 'test'"):
+        ml._check_feature_widths(["f", "g"], [1, 2], "test")
+    ml._feature_widths.clear()

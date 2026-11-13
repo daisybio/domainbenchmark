@@ -46,6 +46,25 @@ _LOAD_CACHE_MAX = 1
 _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 
 
+# Feature name -> (vector width, split it was first seen on). Each load infers
+# widths from its own split's files, so without this a feature extracted at
+# width 2 on train and 1 on validation (beside one going 1 -> 2) loads both
+# splits at the same total width and silently shifts columns. Survives
+# clear_load_cache(): it is a contract across every split of one process.
+_feature_widths: dict = {}
+
+
+def _check_feature_widths(names, widths, dataset) -> None:
+    for name, width in zip(names, widths):
+        seen = _feature_widths.setdefault(name, (width, dataset))
+        if seen[0] != width:
+            raise ValueError(
+                f"Feature '{name}' has width {width} on split '{dataset}' but "
+                f"{seen[0]} on split '{seen[1]}'. Every split of one feature "
+                "must have the same vector width."
+            )
+
+
 def clear_load_cache() -> None:
     """Drop every cached embedding array. Call between training phases."""
     _load_cache.clear()
@@ -645,6 +664,8 @@ def load_embedding_data(
             int(np.prod(f[f"{first_a}_{first_b}"][f"{first_ia}_{first_ib}"].shape))
             for f in interaction_encoding_files
         ]
+        _check_feature_widths(domain_encoding_names, domain_widths, dataset)
+        _check_feature_widths(interaction_encoding_names, interaction_widths, dataset)
         n_cols = 2 * sum(domain_widths) + sum(interaction_widths)
 
         # Exact size: non-finite rows were already filtered out of `plan`, so
