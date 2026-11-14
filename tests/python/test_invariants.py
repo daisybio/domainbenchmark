@@ -162,8 +162,9 @@ def test_feature_width_must_agree_across_splits():
     import machine_learning as ml
 
     ml._feature_widths.clear()
-    ml._check_feature_widths(["f", "g"], [2, 1], "train")
-    ml._check_feature_widths(["f", "g"], [2, 1], "validation")
+    ml._check_feature_widths("d", ["f", "g"], [2, 1], "train")
+    ml._check_feature_widths("d", ["f", "g"], [2, 1], "validation")
+    ml._check_feature_widths("other_dir", ["f"], [4], "train")  # independent source
     with pytest.raises(ValueError, match="'f' has width 1 on split 'test'"):
-        ml._check_feature_widths(["f", "g"], [1, 2], "test")
+        ml._check_feature_widths("d", ["f", "g"], [1, 2], "test")
     ml._feature_widths.clear()

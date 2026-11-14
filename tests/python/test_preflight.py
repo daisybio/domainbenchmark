@@ -170,3 +170,39 @@ def test_single_class_test_only_warns(tmp_path):
     rc, report = run(tmp_path, db_dir=db_copy(tmp_path, "test_realistic", SINGLE_CLASS))
     assert rc == 0, report
     assert "WARNING test_realistic [aacomp]: one class only" in report
+
+
+def _poison_test_vectors(tmp_path, value):
+    """esm3 copy whose test_balanced instances hold `value` (NaN, or a float64
+    that overflows float32): the keys resolve, the loader drops every row."""
+    test_keys = {(p, i) for _d, pa, ia, pb, ib in verify_embeddings.read_pairs(DB_DIR / "test_balanced.sqlite3")
+                 for p, i in ((pa, ia), (pb, ib))}
+    bad = tmp_path / "esm3.h5"
+    with h5py.File(ESM3, "r") as src, h5py.File(bad, "w") as dst:
+        for k, v in src.attrs.items():
+            dst.attrs[k] = v
+        for g in src:
+            for d in src[g]:
+                vec = src[g][d][()].astype("float64")
+                if (g, d) in test_keys:
+                    vec[:] = value
+                dst.require_group(g)[d] = vec
+    return bad
+
+
+@pytest.mark.parametrize("value", [float("nan"), 1e39])
+def test_unusable_vectors_do_not_count_as_resolved(tmp_path, value):
+    rc, report = run(tmp_path, esm3=_poison_test_vectors(tmp_path, value))
+    assert rc == 1
+    assert "test_balanced [esm3_embeddings]: no membership instance pair resolves" in report
+
+
+def test_metadata_without_feature_column(tmp_path):
+    metadata = tmp_path / "metadata"
+    shutil.copytree(METADATA, metadata)
+    for name in ("domain_metadata.csv", "ddi_metadata.csv"):
+        df = pd.read_csv(metadata / name)
+        keep = [c for c in df.columns if c.startswith(("instance_id", "pfam_id", "uniprot_id"))]
+        df[keep].to_csv(metadata / name, index=False)
+    rc, report = run(tmp_path, metadata=metadata)
+    assert rc == 1 and "no feature column" in report

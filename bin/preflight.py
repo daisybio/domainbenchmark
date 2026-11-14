@@ -74,18 +74,17 @@ def ddi_labels(db):
         return {ddi: 1 - int(neg) for ddi, neg in conn.execute("SELECT id, negative FROM domain_domain_interaction")}
 
 
-class KeyPresence:
-    """`(pfam, instance) in` one published h5, cached. No vector is read."""
+class Usable:
+    """`(pfam, instance) in` one published h5: present, finite as float32 and of
+    the file's one width -- `verify_embeddings.InstanceLookup`, i.e. the rows
+    the loader keeps. Key presence alone passed a subset whose vectors are NaN.
+    """
 
     def __init__(self, path):
-        self.h5 = h5py.File(path, "r")
-        self.memo = {}
+        self.lookup = verify_embeddings.InstanceLookup(h5py.File(path, "r"))
 
     def __contains__(self, key):
-        if key not in self.memo:
-            group = self.h5.get(key[0])
-            self.memo[key] = group is not None and key[1] in group
-        return self.memo[key]
+        return self.lookup(*key) == "ok"
 
 
 def check_structures(db, structures, check_sg):
@@ -150,6 +149,8 @@ def check_metadata(metadata_dir, pairs, labels):
         pd.read_csv(metadata_dir / "ddi_metadata.csv"),
         instances,
     )
+    # METADATA's observed fit needs one; identifier-only files pass the join.
+    eval_enrichment.feature_columns(table)
     canon = {load_data_gm.canonical_pair(a, b) + (y,) for a, b, y in
              zip(instances.domain_1, instances.domain_2, instances.interaction)}
     pred = pd.DataFrame(sorted(canon), columns=["domain_a", "domain_b", "true_interaction"])
@@ -189,7 +190,7 @@ def main(argv=None):
     check("toolchain", check_toolchain)
     log(f"toolchain: multiqc + {len(TOOLCHAIN)} module import(s)")
 
-    published = {f: KeyPresence(p) for f, p in sorted(published_paths.items())}
+    published = {f: Usable(p) for f, p in sorted(published_paths.items())}
     sequence_modules = sorted({m for m in extracted.values()
                                if hasattr(importlib.import_module(f"features.{m}"), "SEQUENCE_QUERY")})
     check_sg = "disulfide_bond_count" in structure.values()

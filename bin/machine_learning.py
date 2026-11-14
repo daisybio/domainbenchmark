@@ -46,7 +46,7 @@ _LOAD_CACHE_MAX = 1
 _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 
 
-# Feature name -> (vector width, split it was first seen on). Each load infers
+# (features dir, feature name) -> (vector width, split it was first seen on). Each load infers
 # widths from its own split's files, so without this a feature extracted at
 # width 2 on train and 1 on validation (beside one going 1 -> 2) loads both
 # splits at the same total width and silently shifts columns. Survives
@@ -54,9 +54,9 @@ _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 _feature_widths: dict = {}
 
 
-def _check_feature_widths(names, widths, dataset) -> None:
+def _check_feature_widths(features_path, names, widths, dataset) -> None:
     for name, width in zip(names, widths):
-        seen = _feature_widths.setdefault(name, (width, dataset))
+        seen = _feature_widths.setdefault((str(features_path), name), (width, dataset))
         if seen[0] != width:
             raise ValueError(
                 f"Feature '{name}' has width {width} on split '{dataset}' but "
@@ -664,8 +664,8 @@ def load_embedding_data(
             int(np.prod(f[f"{first_a}_{first_b}"][f"{first_ia}_{first_ib}"].shape))
             for f in interaction_encoding_files
         ]
-        _check_feature_widths(domain_encoding_names, domain_widths, dataset)
-        _check_feature_widths(interaction_encoding_names, interaction_widths, dataset)
+        _check_feature_widths(features_path, domain_encoding_names, domain_widths, dataset)
+        _check_feature_widths(features_path, interaction_encoding_names, interaction_widths, dataset)
         n_cols = 2 * sum(domain_widths) + sum(interaction_widths)
 
         # Exact size: non-finite rows were already filtered out of `plan`, so

@@ -156,6 +156,11 @@ def read_pairs(db_path: Path):
     return [(ddi, str(pa), str(ia), str(pb), str(ib)) for ddi, pa, ia, pb, ib in rows]
 
 
+def _finite_f32(dataset) -> bool:
+    with np.errstate(over="ignore", invalid="ignore"):
+        return bool(np.isfinite(np.asarray(dataset[()], dtype=np.float32)).all())
+
+
 class InstanceLookup:
     """Per-(pfam_id, instance_key) verdict, cached across pairs and splits.
 
@@ -182,7 +187,9 @@ class InstanceLookup:
             dataset = group.get(instance_key) if group is not None else None
             if not isinstance(dataset, h5py.Dataset):
                 verdict = "missing"
-            elif not np.isfinite(dataset[()]).all():
+            # float32 like the loader (machine_learning.py `finite`): a finite
+            # float64 above ~3.4e38 overflows to inf there.
+            elif not _finite_f32(dataset):
                 verdict = "non-finite"
             else:
                 verdict = "ok"
