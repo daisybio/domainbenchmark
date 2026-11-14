@@ -56,7 +56,7 @@ _feature_widths: dict = {}
 
 def _check_feature_widths(features_path, names, widths, dataset) -> None:
     for name, width in zip(names, widths):
-        seen = _feature_widths.setdefault((str(features_path), name), (width, dataset))
+        seen = _feature_widths.setdefault((str(Path(features_path).resolve()), name), (width, dataset))
         if seen[0] != width:
             raise ValueError(
                 f"Feature '{name}' has width {width} on split '{dataset}' but "

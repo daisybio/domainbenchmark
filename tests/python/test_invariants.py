@@ -158,9 +158,15 @@ def test_feature_width_mismatch_is_rejected(tmp_path):
             _vector(h5["PF00002"], "b", 2)
 
 
-def test_feature_width_must_agree_across_splits():
+def test_feature_width_must_agree_across_splits(tmp_path):
     import machine_learning as ml
 
+    ml._feature_widths.clear()
+    (tmp_path / "d").mkdir()
+    (tmp_path / "alias").symlink_to(tmp_path / "d")
+    with pytest.raises(ValueError, match="'f' has width 1"):  # symlink alias, same dir
+        ml._check_feature_widths(tmp_path / "d", ["f"], [2], "train")
+        ml._check_feature_widths(tmp_path / "alias", ["f"], [1], "validation")
     ml._feature_widths.clear()
     ml._check_feature_widths("d", ["f", "g"], [2, 1], "train")
     ml._check_feature_widths("d", ["f", "g"], [2, 1], "validation")
