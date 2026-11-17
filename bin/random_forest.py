@@ -10,6 +10,7 @@ from sklearn.model_selection import ParameterSampler
 
 from machine_learning import (
     DDIModelTrainer,
+    check_positive_column,
     clear_load_cache,
     ddi_row_groups,
     load_embedding_data,
@@ -170,6 +171,7 @@ class RandomForestTrainer(DDIModelTrainer):
         # scikit-learn, float32 from cuML); it makes no difference downstream,
         # because `_aggregate_to_ddi_level` casts every score to float32 before
         # the DDI mean, the threshold tuning and the parquet see it.
+        check_positive_column(classifier)
         head = classifier.predict_proba(
             np.asarray(x[:self._PREDICT_CHUNK_ROWS], dtype=np.float32)
         )[:, 1]

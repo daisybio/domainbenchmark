@@ -62,6 +62,8 @@ def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
         )
 
     pair_df = pd.read_sql(PAIR_QUERY, conn)
+    # How machine_learning.load_embedding_data recognises the layout.
+    out_file.attrs["layout"] = "interaction"
 
     # Per-instance means are reused by every pair the instance appears in.
     single_means = {}

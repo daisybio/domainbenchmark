@@ -13,7 +13,12 @@ from skorch.dataset import Dataset
 from skorch.helper import predefined_split
 
 from determinism import seed_everything
-from machine_learning import DDIModelTrainer, load_embedding_data, probe_cuda
+from machine_learning import (
+    DDIModelTrainer,
+    check_positive_column,
+    load_embedding_data,
+    probe_cuda,
+)
 
 # TF32 off. It was on, which rounds every fp32 matmul/conv input to a 10-bit
 # mantissa on Ampere+ -- so the same model scored differently on an A40 than on
@@ -436,6 +441,7 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         # external_test_neural_network_all at the *prediction* step, after the
         # grid search and refit had both completed. skorch batches internally
         # from here, so nothing else needs chunking on this path.
+        check_positive_column(classifier)
         return classifier.predict_proba(np.asarray(x, dtype=np.float32))[:, 1]
 
 

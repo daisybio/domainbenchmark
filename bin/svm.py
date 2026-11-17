@@ -29,7 +29,7 @@ from sklearn.model_selection import ParameterSampler
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from machine_learning import DDIModelTrainer, probe_cuda
+from machine_learning import DDIModelTrainer, check_positive_column, probe_cuda
 from random_forest import _cupy_smoke_test, _load_train_with_balance
 
 _CUML_KERNELCACHE_BUG_MARKER = "Working set has already been initialized"
@@ -122,7 +122,8 @@ class SVMTrainer(DDIModelTrainer):
     _PREDICT_CHUNK_ROWS = 65536
 
     def _predict_proba(self, classifier, x):
-        out = np.empty(len(x), dtype=np.float64)
+        check_positive_column(classifier)
+        out =np.empty(len(x), dtype=np.float64)
         for start in range(0, len(x), self._PREDICT_CHUNK_ROWS):
             stop = min(start + self._PREDICT_CHUNK_ROWS, len(x))
             out[start:stop] = classifier.predict_proba(

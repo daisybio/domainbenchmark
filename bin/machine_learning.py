@@ -8,7 +8,6 @@ base class that neural_network.py and random_forest.py extend.
 import argparse
 import collections
 import gc
-import itertools
 import json
 import math
 import random
@@ -27,6 +26,7 @@ from typing import List
 from determinism import seed_everything
 
 
+# Fallback only, for files written before protdcal set attrs["layout"].
 interaction_encodings = ["protdcal"]
 
 # B3 / A2: bounded cache (was unbounded dict — held every (features, dataset,
@@ -191,7 +191,20 @@ class DDIAveragePrecision:
                 "DDI scorer was handed rows other than the validation block it "
                 "was built for; it can only score the single PredefinedSplit fold."
             )
+        check_positive_column(estimator)
         return self.score(estimator.predict_proba(X)[:, 1])
+
+
+def check_positive_column(classifier) -> None:
+    """`predict_proba(x)[:, 1]` is P(interaction) only if `classes_ == [0, 1]`."""
+    classes = classifier.classes_
+    # tolist() also copies a cuML/cupy device array to the host.
+    classes = classes.tolist() if hasattr(classes, "tolist") else list(classes)
+    if classes != [0, 1]:
+        raise ValueError(
+            f"{type(classifier).__name__}.classes_ is {classes}, not [0, 1]: "
+            "predict_proba column 1 would not be the interaction probability."
+        )
 
 
 def variant_of(test_split: str) -> str:
@@ -227,24 +240,56 @@ def _aggregate_to_ddi_level(ddi_pairs, y_true, y_score):
     domain pair, and the graph models -- which read the database directly -- have
     always reported Pfam. `bin/load_data_gm.canonical_pair` is the same rule on
     the graph side.
+
+    Raises instead of averaging around bad input: a group mean skips NaN, so
+    one failed row among finite ones used to publish a plausible score, and
+    'first' picked whichever label came first for a pair labelled both ways.
     """
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    if not len(ddi_pairs) == len(y_true) == len(y_score):
+        raise ValueError(
+            f"DDI aggregation got {len(ddi_pairs)} pairs, {len(y_true)} labels "
+            f"and {len(y_score)} scores; they must be the same rows."
+        )
+    # Before the int8 cast, which would turn 257 into 1.
+    if not np.isin(y_true, (0, 1)).all():
+        raise ValueError(
+            f"DDI aggregation: labels must be 0/1, got {sorted(set(np.unique(y_true).tolist()) - {0, 1})[:5]}"
+        )
     df = pd.DataFrame(ddi_pairs, columns=["domain_a", "domain_b"])
     a = df["domain_a"].astype(str)
     b = df["domain_b"].astype(str)
     lo = a <= b
     df["domain_a"] = a.where(lo, b)
     df["domain_b"] = b.where(lo, a)
-    df["true_interaction"] = np.asarray(y_true).astype(np.int8)
-    df["predicted_probability"] = np.asarray(y_score).astype(np.float32)
-    return (
-        # sort=False: row order is first-appearance order over the *sorted*
-        # `labeled_domain_pairs`, so it is a function of the data and not of
-        # dict iteration -- see the note on set ordering in load_embedding_data.
-        df.groupby(["domain_a", "domain_b"], sort=False)
-        .agg(true_interaction=("true_interaction", "first"),
-             predicted_probability=("predicted_probability", "mean"))
-        .reset_index()
-    )
+    df["true_interaction"] = y_true.astype(np.int8)
+    df["predicted_probability"] = y_score.astype(np.float32)
+    bad = ~np.isfinite(df["predicted_probability"].to_numpy())
+    if bad.any():
+        first = df[bad].iloc[0]
+        raise ValueError(
+            f"DDI aggregation: {int(bad.sum())} of {len(df)} instance-pair "
+            f"scores are NaN/inf (first: {first.domain_a}/{first.domain_b}). "
+            "The model produced non-finite output; refusing to average it away."
+        )
+    # sort=False: row order is first-appearance order over the *sorted*
+    # `labeled_domain_pairs`, so it is a function of the data and not of
+    # dict iteration -- see the note on set ordering in load_embedding_data.
+    grouped = df.groupby(["domain_a", "domain_b"], sort=False)
+    agg = grouped.agg(
+        true_interaction=("true_interaction", "first"),
+        n_labels=("true_interaction", "nunique"),
+        predicted_probability=("predicted_probability", "mean"),
+    ).reset_index()
+    conflicting = agg[agg["n_labels"] > 1]
+    if len(conflicting):
+        raise ValueError(
+            f"DDI aggregation: {len(conflicting)} DDI(s) carry both labels "
+            f"(first: {conflicting.iloc[0].domain_a}/{conflicting.iloc[0].domain_b}). "
+            "A canonical pair must have exactly one truth."
+        )
+    return agg.drop(columns="n_labels")
 
 
 def _tune_threshold_mcc(y_true, y_score, n_candidates: int = 200):
@@ -286,12 +331,16 @@ def load_instance_pairs(ddi_path: Path, dataset: str):
     pairs the splitter assigned to this split. Instantiating anything else
     would reintroduce pairs the split deliberately excluded.
 
-    Returns None when the file is absent, in which case the caller falls back
-    to the full cross-product of the instances present in the feature files.
+    A missing file raises: the old fallback, the cross-product of every
+    instance in the feature files, pulls in instances of other splits.
     """
     instances_csv = ddi_path / f"{dataset}_instances.csv"
     if not instances_csv.exists():
-        return None
+        raise FileNotFoundError(
+            f"{dataset}: {instances_csv} does not exist. DDI_EXTRACTION writes "
+            "it from ddi_split_membership; without it the split's instance "
+            "pairs are unknown."
+        )
 
     pairs = collections.defaultdict(set)
     # dtype=str: the ids are opaque keys. Inferred dtypes would turn an
@@ -410,23 +459,32 @@ def load_embedding_data(
     # -- it was the single largest source of run-to-run drift.
     labeled_domain_pairs = set()
     ddi_df = pd.read_csv(ddi_csv_path, dtype={"domain_1": str, "domain_2": str})
+    # Checked before int(), which would turn 1.5 into 1.
+    if not ddi_df["interaction"].isin([0, 1]).all():
+        raise ValueError(
+            f"{ddi_csv_path}: interaction must be 0 or 1, got "
+            f"{ddi_df.loc[~ddi_df['interaction'].isin([0, 1]), 'interaction'].unique()[:5].tolist()}"
+        )
+    canonical_label = {}
     for row in ddi_df.itertuples(index=False):
         domain_a = str(row.domain_1)
         domain_b = str(row.domain_2)
         interaction = int(row.interaction)
+        # One truth per undirected pair: both labels would otherwise both be
+        # trained on, and aggregation would have to pick one.
+        pair = canonical_ddi(domain_a, domain_b, None)[:2]
+        if canonical_label.setdefault(pair, interaction) != interaction:
+            raise ValueError(
+                f"{ddi_csv_path}: DDI {pair[0]}/{pair[1]} is labelled both 0 "
+                "and 1 (across rows or orientations)."
+            )
 
         labeled_domain_pairs.add((domain_a, domain_b, interaction))
         labeled_domain_pairs.add((domain_b, domain_a, interaction))
     labeled_domain_pairs = sorted(labeled_domain_pairs)
 
-    # The domain-instance pairs this split assigns, when the database carries
-    # `ddi_split_membership`. None = fall back to the cross-product.
+    # The domain-instance pairs this split assigns (`ddi_split_membership`).
     instance_pairs = load_instance_pairs(ddi_path, dataset)
-    if instance_pairs is None:
-        print(
-            f"No {dataset}_instances.csv found — falling back to the full "
-            "instance cross-product per DDI pair."
-        )
 
     result_ddi_pairs = []
     result_protein_pairs = []
@@ -465,8 +523,17 @@ def load_embedding_data(
             embeddings_file = resolve_feature_file(features_path, feature, dataset)
             print(f"Loading feature file: {embeddings_file}")
             embeddings_file = stack.enter_context(h5py.File(embeddings_file, "r"))
-            # Structure encoders mark their files instead of being listed.
-            if feature in interaction_encodings or embeddings_file.attrs.get("layout") == "interaction":
+            # Interaction encoders mark their files with attrs["layout"].
+            layout = embeddings_file.attrs.get("layout")
+            if layout is None and feature in interaction_encodings:
+                print(
+                    f"WARNING: {embeddings_file.filename} has no 'layout' attribute; "
+                    f"treating '{feature}' as interaction layout by name. "
+                    "Re-extract it to record the layout in the file.",
+                    file=sys.stderr,
+                )
+                layout = "interaction"
+            if layout == "interaction":
                 interaction_encoding_files.append(embeddings_file)
                 interaction_encoding_names.append(feature)
             else:
@@ -533,23 +600,9 @@ def load_embedding_data(
 
             # Candidate instance pairs for this DDI. Instance keys are opaque
             # strings and are never parsed apart — they are looked up whole.
-            if instance_pairs is not None:
-                candidate_combinations = set(
-                    instance_pairs.get((domain_a, domain_b, interaction), [])
-                )
-            elif domain_encoding_files:
-                candidate_combinations = set(
-                    itertools.product(
-                        domain_encoding_files[0][domain_a].keys(),
-                        domain_encoding_files[0][domain_b].keys(),
-                    )
-                )
-            else:
-                raise ValueError(
-                    f"{dataset}: interaction encodings alone need "
-                    f"{dataset}_instances.csv — instance keys cannot be "
-                    "recovered from an interaction-encoding group name."
-                )
+            candidate_combinations = set(
+                instance_pairs.get((domain_a, domain_b, interaction), [])
+            )
 
             # Keep only the combinations every feature file actually carries.
             def combination_available(combo):
@@ -907,6 +960,7 @@ class DDIModelTrainer(ABC):
 
     def _predict_proba(self, classifier, x):
         """Get predicted probabilities. Override if dtype casting needed."""
+        check_positive_column(classifier)
         return classifier.predict_proba(x)[:, 1]
 
     @classmethod
@@ -963,6 +1017,15 @@ class DDIModelTrainer(ABC):
 
         with model_json_path.open("r") as f:
             model_parameters = json.load(f)
+        # The columns are the features in this order; two equal-width features
+        # swapped load fine and silently change what every column means.
+        if args.predict_only and model_parameters.get("features") != list(args.features):
+            raise ValueError(
+                f"[{self.MODEL_NAME}] --features {list(args.features)} does not "
+                f"match the features the model was trained on "
+                f"({model_parameters.get('features')}, from {model_json_path}). "
+                "Pass exactly the saved list, in order."
+            )
         threshold = model_parameters.get("threshold", 0.5)
         self.predict(args, classifier, threshold)
 
