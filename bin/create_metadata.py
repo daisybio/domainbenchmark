@@ -86,6 +86,16 @@ def build_table(domain_md, ddi_md, instances):
         members = {tuple(sorted(p)) for p in zip(inst["instance_1"], inst["instance_2"])}
         keep = [tuple(sorted(p)) in members for p in zip(ddi_md["instance_id_a"], ddi_md["instance_id_b"])]
         ddi = _canonical(ddi_md[keep], "pfam_id_a", "pfam_id_b")
+        # The instance pair is the join key; its Pfam columns must agree with it.
+        pair_domains = {tuple(sorted(p)): (a, b) for p, a, b in
+                        zip(zip(inst["instance_1"], inst["instance_2"]), inst["domain_a"], inst["domain_b"])}
+        wrong = [(ia, ib, a, b) for ia, ib, a, b in zip(ddi["instance_id_a"], ddi["instance_id_b"],
+                                                       ddi["domain_a"], ddi["domain_b"])
+                 if pair_domains[tuple(sorted((ia, ib)))] != (a, b)]
+        if wrong:
+            raise SystemExit(f"[metadata] ddi_metadata.csv: {len(wrong)} row(s) whose pfam_id_a/b are not "
+                             f"their instance pair's domains (instance_a, instance_b, pfam_a, pfam_b), "
+                             f"e.g. {wrong[:5]}")
         per_ddi = ddi.groupby(["domain_a", "domain_b"])[ddi_cols].mean().reset_index()
         table = table.merge(per_ddi, on=["domain_a", "domain_b"], how="left")
         # The mean runs over the pairs that have a value (e.g. only the
@@ -106,6 +116,14 @@ def build_table(domain_md, ddi_md, instances):
         n_partial = 0
 
     table = table[["domain_a", "domain_b", "label"] + sorted(table.columns[3:])]
+    # A column without a single value means its file's keys missed this split
+    # (e.g. another instance-id scheme); every target would skip and the run
+    # would "succeed" with an empty section.
+    empty = [c for c in table.columns[3:] if table[c].isna().all()]
+    if empty:
+        raise SystemExit(f"[metadata] {len(empty)} column(s) have no value for any DDI of this split "
+                         f"(key mismatch? <col>_min/_max come from domain_metadata.csv, the rest from "
+                         f"ddi_metadata.csv): {empty}")
     return table, n_partial
 
 

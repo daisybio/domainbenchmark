@@ -45,16 +45,24 @@ DOMAIN_KEY_SQL = f"{domain_key_sql()} AS domain_key"
 #: Every extractor needs it, so it lives here rather than being retyped.
 DOMAIN_JOIN_SQL = "JOIN domain ON domain_protein_map.domain_id = domain.id"
 
-#: (domain_key, instance_key, sequence) of every instance: what the
-#: per-instance sequence encoders read, and what bin/preflight.py cleans ahead
-#: of them. A sequence encoder exposes its query as `SEQUENCE_QUERY` and its
+#: (domain_key, instance_key, sequence) of every instance `ddi_split_membership`
+#: assigns to the split -- the only ones the loader reads, like protdcal's
+#: PAIR_QUERY: what the per-instance sequence encoders read, and what
+#: bin/preflight.py cleans ahead of them, so a bad unused sequence fails nothing.
+#: A sequence encoder exposes its query as `SEQUENCE_QUERY` and its
 #: `clean_sequence` floor as `MIN_SEQUENCE_LENGTH`.
 SEQUENCE_SQL = f"""
                 SELECT {DOMAIN_KEY_SQL},
                        {INSTANCE_KEY_SQL},
                        UPPER(domain_sequence) AS sequence
                 FROM domain_protein_map
-                {DOMAIN_JOIN_SQL};
+                {DOMAIN_JOIN_SQL}
+                WHERE domain_protein_map.instance_id IN (
+                    SELECT instance_id_a FROM ddi_split_membership
+                    UNION SELECT instance_id_b FROM ddi_split_membership)
+                -- Fixed row order: the HDF5 write order would otherwise follow
+                -- the query plan.
+                ORDER BY domain_key, instance_key;
             """
 
 

@@ -69,9 +69,28 @@ def connect(db):
 
 
 def ddi_labels(db):
-    """{ddi_id: interaction (1 = positive)}; DDI_EXTRACTION has validated `negative`."""
+    """{ddi_id: interaction (1 = positive)}. Same rules as DDI_EXTRACTION, which
+    runs in parallel: `negative` is integer 0/1 and one label per canonical pair."""
     with connect(db) as conn:
-        return {ddi: 1 - int(neg) for ddi, neg in conn.execute("SELECT id, negative FROM domain_domain_interaction")}
+        rows = conn.execute(
+            "SELECT ddi.id, ddi.negative, typeof(ddi.negative), d1.pfam_id, d2.pfam_id "
+            "FROM domain_domain_interaction AS ddi "
+            "LEFT JOIN domain AS d1 ON ddi.domain_id_a = d1.id "
+            "LEFT JOIN domain AS d2 ON ddi.domain_id_b = d2.id ORDER BY ddi.id"
+        ).fetchall()
+    bad = [(ddi, neg, kind) for ddi, neg, kind, _, _ in rows if kind != "integer" or neg not in (0, 1)]
+    if bad:
+        raise ValueError(f"{len(bad)} DDI row(s) have a `negative` that is not integer 0/1 "
+                         f"(id, negative, typeof), e.g. {bad[:5]}")
+    by_pair = {}
+    for ddi, neg, _, a, b in rows:
+        # key=str: a NULL pfam_id is DDI_EXTRACTION's failure, not a TypeError here
+        by_pair.setdefault(tuple(sorted((a, b), key=str)), set()).add(1 - neg)
+    conflict = sorted((p for p, ys in by_pair.items() if len(ys) > 1), key=str)
+    if conflict:
+        raise ValueError(f"{len(conflict)} DDI(s) carry both labels across their two "
+                         f"orientations, e.g. {conflict[:5]}")
+    return {ddi: 1 - neg for ddi, neg, *_ in rows}
 
 
 class Usable:
@@ -218,10 +237,10 @@ def main(argv=None):
                 log(f"{split}: {len(structure_pairs)} complex(es) parsed"
                     + (", every CYS has SG" if check_sg else ""))
 
+        labels = check(f"{split} labels", ddi_labels, db)
         if not combos and args.metadata is None:
             continue
         pairs = check(f"{split} membership", verify_embeddings.read_pairs, db)
-        labels = check(f"{split} labels", ddi_labels, db)
         if pairs is None or labels is None:
             continue
 

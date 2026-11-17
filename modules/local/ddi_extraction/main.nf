@@ -137,6 +137,19 @@ process DDI_EXTRACTION {
             ORDER BY id;
         '''
 
+        # A DDI is undirected: one family pair stored in both orientations
+        # with different labels has no single truth, and downstream code would
+        # pick one by row order. Runs after BAD_NEGATIVE_QUERY, so 0/1 only.
+        CONFLICTING_LABEL_QUERY = '''
+            SELECT MIN(d1.pfam_id, d2.pfam_id) AS pa, MAX(d1.pfam_id, d2.pfam_id) AS pb,
+                   GROUP_CONCAT(ddi.id || ':' || ddi.negative)
+            FROM domain_domain_interaction AS ddi
+            JOIN domain AS d1 ON ddi.domain_id_a = d1.id
+            JOIN domain AS d2 ON ddi.domain_id_b = d2.id
+            GROUP BY pa, pb HAVING COUNT(DISTINCT ddi.negative) > 1
+            ORDER BY pa, pb;
+        '''
+
         # domainsplit's SUBSET_SPLIT_DB copies exactly one (method, split) into
         # each split database. More than one would mix splits into one CSV.
         MEMBERSHIP_SPLITS_QUERY = '''
@@ -216,8 +229,15 @@ process DDI_EXTRACTION {
                      "    SQLite reads any text as 0 in `NOT negative`, so 'True' "
                      "would become a positive. Fix the database rather than "
                      "guess the label.")
+            rows = conn.execute(CONFLICTING_LABEL_QUERY).fetchall()
+            if rows:
+                fail(path,
+                     f"{len(rows)} DDI(s) carry both labels across their two "
+                     "orientations (pfam_a, pfam_b, 'ddi_id:negative,...'):",
+                     rows,
+                     "    A DDI is undirected; one label per family pair.")
 
-        def assert_membership(conn, path):
+        def assert_membership(conn, path, split):
             rows = conn.execute(MEMBERSHIP_SPLITS_QUERY).fetchall()
             if len(rows) > 1:
                 fail(path,
@@ -226,6 +246,13 @@ process DDI_EXTRACTION {
                      rows,
                      "    A split database carries exactly one split; more would "
                      "merge several splits' instance pairs into one CSV.")
+            if rows and rows[0][1] != split:
+                fail(path,
+                     f"ddi_split_membership says split '{rows[0][1]}', but the "
+                     f"file is '{split}' (method, split, rows):",
+                     rows,
+                     "    A copied or misnamed split database would e.g. select "
+                     "models on training data.")
             rows = conn.execute(DANGLING_MEMBERSHIP_QUERY).fetchall()
             if rows:
                 fail(path,
@@ -259,7 +286,7 @@ process DDI_EXTRACTION {
                     f"{out_dir}/{split}_sources.csv", index=False
                 )
                 if has_table(conn, "ddi_split_membership"):
-                    assert_membership(conn, path)
+                    assert_membership(conn, path, split)
                     pd.read_sql(INSTANCE_QUERY, conn).to_csv(
                         f"{out_dir}/{split}_instances.csv", index=False
                     )
