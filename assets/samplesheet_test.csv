@@ -1,3 +1,0 @@
-id,db_path
-random,tests/data/databases/random
-external_test,tests/data/databases/external_test

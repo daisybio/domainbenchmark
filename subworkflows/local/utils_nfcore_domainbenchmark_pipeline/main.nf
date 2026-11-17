@@ -194,7 +194,7 @@ workflow PIPELINE_COMPLETION {
 // daisybio/domainsplit publishes `databases/<dataset>/<split>.sqlite3` with
 // `train`, `validation`, and one or more `test*` splits: `test` for a dataset
 // whose test set comes from BUILD_EXTERNAL_TEST, `test_<variant>`
-// splits (currently `test_1_1` + `test_1_10`) for one with an internal test set. Each test split is
+// splits (currently `test_matched_1_1`/`test_uniform_1_1` + `test_uniform_1_10`) for one with an internal test set. Each test split is
 // benchmarked separately against the same trained models.
 //
 // Returns [ splits, tests ]:
@@ -246,8 +246,8 @@ def csvToList(s) {
 }
 
 //
-// A database with an internal test set produces one run per test variant (`random_1_1`,
-// `random_1_10`); one with a single `test` keeps its bare name. The label
+// A database with an internal test set produces one run per test variant (`random_uniform_1_1`,
+// `random_uniform_1_10`); one with a single `test` keeps its bare name. The label
 // identifies the run everywhere downstream -- process tags, the evaluation
 // directory, and the entry in the combined cross-database report.
 //

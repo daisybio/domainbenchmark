@@ -156,7 +156,7 @@
                 },
                 "mqc_order": {
                     "type": "string",
-                    "description": "Comma-separated dataset (run label) order for the MultiQC reports, e.g. random_1_1,minimal_leakage_hcni_1_10,external_test.",
+                    "description": "Comma-separated dataset (run label) order for the MultiQC reports, e.g. random_uniform_1_1,minimal_leakage_hrni_uniform_1_10,external_test.",
                     "help_text": "A dataset is one (database, test variant) run label. Several report sections exist once per dataset and several more carry every dataset inside one block (the tabs of the combined ROC/PR and by-source plots, the columns of the AUC/AP heatmaps); left unset all of them come out alphabetically. A name that does not exist in the data is a hard failure. A dataset present in the data but missing from the list warns and is appended alphabetically after the ordered ones.",
                     "fa_icon": "fas fa-sort-amount-down"
                 },

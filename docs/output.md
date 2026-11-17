@@ -13,8 +13,9 @@ fitting is shared across a database's test variants, so it sits directly under
 A `<variant>` is the name of a test split without its `test_` prefix: a
 database may ship any number of `test_<variant>.sqlite3`, and each is reported
 as its own dataset `<db_name>_<variant>`. The current domainsplit layout has
-`test_1_1` (in distribution, 1:1) and `test_1_10` (out of distribution, 1:10),
-both scored by the same trained model. A database with a single `test.sqlite3`
+an in-distribution 1:1 set (`test_matched_1_1`, or `test_uniform_1_1` for
+`random`) and an out-of-distribution 1:10 set (`test_uniform_1_10`), both
+scored by the same trained model. A database with a single `test.sqlite3`
 (e.g. `external_test`) has the variant `test` and reports under its bare name.
 
 ## Pipeline overview

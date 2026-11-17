@@ -189,7 +189,7 @@ def is_retired_block(name) -> bool:
 ### Dataset ordering (params.mqc_order) ###
 #
 # A "dataset" is one (database, test variant) run label -- `random_1_1`,
-# `minimal_leakage_hcni_1_10`, `external_test`. Several report sections
+# `minimal_leakage_hrni_uniform_1_10`, `external_test`. Several report sections
 # exist once per dataset (`db_database_analysis_<ds>`, `model_eval_metrics_<ds>`)
 # and several more carry every dataset inside one block (the tabs of the
 # combined ROC/PR line graphs and the by-source bar graph, the columns of the

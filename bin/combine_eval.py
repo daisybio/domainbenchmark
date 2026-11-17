@@ -94,7 +94,7 @@ def parse_arguments():
         "--mqc_order",
         default=None,
         help="Comma-separated dataset (run label) order, e.g. "
-             "'random_1_1,minimal_leakage_hcni_1_10,external_test' (a run "
+             "'random_uniform_1_1,minimal_leakage_hrni_uniform_1_10,external_test' (a run "
              "label is `<db>_<variant>` for each `test_<variant>` split, bare "
              "`<db>` for a single `test`). "
              "Drives the section order of the per-dataset blocks, the tab order "
@@ -357,7 +357,7 @@ AVERAGE_CAT = "Mean over shown models"
 
 #: Extra tabs: datasets pooled per test variant, as an unweighted macro mean of
 #: per-dataset accuracy. Summing counts let the largest dataset dominate and
-#: counted overlapping datasets (e.g. `<db>` and `<db>_hcni`, same test pairs)
+#: counted overlapping datasets (e.g. `<db>` and `<db>_hrni`, same test pairs)
 #: twice.
 #:
 #: One pool per variant, never one over everything: the variants of a database

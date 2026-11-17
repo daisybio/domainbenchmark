@@ -26,12 +26,13 @@ and graph-based predictors, evaluates each one against every held-out test
 split, and produces a unified MultiQC report comparing them.
 
 A database may ship several test splits, each a `test_<variant>.sqlite3`; the
-variant name is free. The current domainsplit layout has two,
-`test_1_1.sqlite3` (in distribution, 1:1) and `test_1_10.sqlite3` (out of
-distribution, 1:10). All of them are benchmarked against the *same* trained
+variant name is free. The current domainsplit layout has two per database:
+an in-distribution 1:1 set (`test_matched_1_1.sqlite3`, or
+`test_uniform_1_1.sqlite3` for `random`) and an out-of-distribution 1:10 set
+(`test_uniform_1_10.sqlite3`). All of them are benchmarked against the *same* trained
 models: DDI extraction, feature extraction and model fitting run once per
 database, and only scoring and evaluation fan out. Each test split is then
-reported as its own dataset — `random_1_1`, `random_1_10` — with its own
+reported as its own dataset — `random_uniform_1_1`, `random_uniform_1_10` — with its own
 curves, table rows and heatmap entries. A database with a single `test.sqlite3`
 (e.g. `external_test`) keeps its bare name.
 
@@ -79,16 +80,19 @@ flowchart LR
 > [!NOTE]
 > If you are new to Nextflow and nf-core, please refer to [this page](https://nf-co.re/docs/get_started/environment_setup/overview) on how to set-up Nextflow. Make sure to [test your setup](https://nf-co.re/docs/get_started/run-your-first-pipeline) with `-profile test` before running the workflow on actual data.
 
-### Samplesheet (recommended entry)
+### Samplesheet
 
 ```bash
 nextflow run . \
     -profile <docker/apptainer/singularity/conda> \
-    --input assets/samplesheet.csv \
+    --input my_samplesheet.csv \
+    --embeddings /path/to/domainsplit/results/embeddings \
+    --structures /path/to/domainsplit/results/structures/structures.h5 \
     --outdir results
 ```
 
-The samplesheet is a CSV with one row per database split:
+No samplesheet ships with the pipeline; the directory form below is the usual
+entry. A samplesheet is a CSV with one row per database:
 
 ```csv
 id,db_path
@@ -99,7 +103,7 @@ random_ddi,/path/to/random_ddi
 Schema in `assets/schema_input.json`. Each `db_path` must contain
 `train.sqlite3`, `validation.sqlite3`, and one or more `test*.sqlite3`.
 
-### Directory (no samplesheet)
+### Directory (recommended entry)
 
 `--input` also accepts a directory — every immediate subdirectory holding a
 `train.sqlite3` becomes a dataset named after the directory, which is exactly
@@ -114,16 +118,17 @@ nextflow run . \
 
 ```
 databases/
-├── random/                    train, validation, test_1_1, test_1_10
-├── random_hcni/               same positives, high-confidence negatives
-├── minimal_leakage/           train, validation, test_1_1, test_1_10
-├── minimal_leakage_hcni/
+├── random/                    train, validation, test_uniform_1_1, test_uniform_1_10
+├── random_ilp/                train, validation, test_matched_1_1, test_uniform_1_10
+├── random_hrni/               same positives, redrawn negatives
+├── minimal_leakage/           train, validation, test_matched_1_1, test_uniform_1_10
+├── minimal_leakage_hrni/
 ├── external_test/             train, validation, test
-└── external_test_hcni/
+└── external_test_hrni/
 ```
 
-A `<method>` / `<method>_hcni` pair is the same positive split with the
-negatives redrawn from a high-confidence candidate network, so the two runs
+A `<method>` / `<method>_hrni` pair is the same positive split with the
+negatives redrawn from a candidate network, so the two runs
 differ in their input only in the negatives. They are not a fixed-model
 comparison: each database refits its models and retunes hyperparameters and
 thresholds on its own train/validation splits, so a difference between the two
@@ -175,6 +180,9 @@ export made by a different run over the same domains resolves like a native one.
 Nothing guards against that, deliberately — with `--embeddings` derived from
 `--input` the pairing is right by construction, and if you set `--embeddings`
 yourself, or use a samplesheet, pointing it at the matching run is on you.
+The same holds for `structures.h5`: one file serves every database, keyed by
+Pfam accession and instance id, so a samplesheet mixing runs can reuse another
+run's complex for matching keys without any error.
 
 ### Cluster
 
@@ -187,13 +195,13 @@ DaiSyBio that is `daisybio.config` (also available as a `daisybio` profile from
 nextflow run . \
     -c daisybio.config \
     -profile apptainer,gpu,keep_work \
-    --input assets/samplesheet.csv \
+    --input /path/to/domainsplit/results/databases \
     --outdir /nfs/scratch/cobinet/results \
     -resume
 ```
 
 `gpu` adds `--nv` to the container runtime and is what routes `process_gpu`
-tasks (NEURAL_NETWORK, RANDOM_FOREST) to the GPU queue. `keep_work` is
+tasks (NEURAL_NETWORK, RANDOM_FOREST, SVM) to the GPU queue. `keep_work` is
 important: `daisybio.config` sets `cleanup = true`, which deletes the work
 directory on a successful run and makes a later `-resume` start from scratch.
 
@@ -207,7 +215,7 @@ two parsimony graph models:
 nextflow run . \
     -c daisybio.config \
     -profile apptainer,gpu,keep_work \
-    --input assets/samplesheet.csv \
+    --input /path/to/domainsplit/results/databases \
     --skip "kgiddi,ddiparsimony,esm3_embeddings,esmc_embeddings,prott5_embeddings"
 ```
 
@@ -240,7 +248,7 @@ Used by CI and by `nf-test`.
 | `--seed` | `42` | Master RNG seed. Reaches every randomised step, including workers in a process pool -- see [Reproducibility](#reproducibility). |
 | `--allow_cpu_ml` | `false` | Let `RANDOM_FOREST` train with scikit-learn when no GPU is usable, instead of exiting 140 for a retry on another GPU node. For GPU-less machines (CI, laptops); the `test` profile sets it. |
 | `--ppi_score_cutoff` | `400` | Minimum STRING `combined_score` a PPI must reach to enter the interactome every graph model builds on. |
-| `--mqc_order` | `null` | Comma-separated dataset order for the MultiQC reports, e.g. `random_1_1,minimal_leakage_hcni_1_10,external_test` (a dataset is `<db>_<variant>` for a `test_<variant>` split, bare `<db>` for a single `test`). Orders the per-dataset sections, the dataset tabs inside the combined plots, and the heatmap columns. A name that matches no dataset is a hard failure; a dataset missing from the list warns and is appended alphabetically. |
+| `--mqc_order` | `null` | Comma-separated dataset order for the MultiQC reports, e.g. `random_uniform_1_1,minimal_leakage_hrni_uniform_1_10,external_test` (a dataset is `<db>_<variant>` for a `test_<variant>` split, bare `<db>` for a single `test`). Orders the per-dataset sections, the dataset tabs inside the combined plots, and the heatmap columns. A name that matches no dataset is a hard failure; a dataset missing from the list warns and is appended alphabetically. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
 
 Full schema with defaults, types, and descriptions: `nextflow_schema.json`.

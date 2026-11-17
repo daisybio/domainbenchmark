@@ -4,15 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-DomainBenchmark is a Nextflow DSL2 pipeline for benchmarking domain-domain interaction (DDI) prediction methods. Built from the `nf-core/tools 4.0.2` template. For each database it runs feature extraction → ML classifiers (RF, NN) → graph-based models (KGIDDI, DDIParsimony) → MultiQC evaluation, then aggregates across databases. A database ships one or more `test_<variant>` splits (currently `test_1_1`, in distribution, and `test_1_10`, out of distribution) or a single `test`; all are scored by the same trained models and reported as separate datasets.
+DomainBenchmark is a Nextflow DSL2 pipeline for benchmarking domain-domain interaction (DDI) prediction methods. Built from the `nf-core/tools 4.0.2` template. For each database it runs feature extraction → ML classifiers (NN, RF, SVM) → MultiQC evaluation (the graph models KGIDDI/DDIParsimony are deprecated, still wired but off everywhere), then aggregates across databases. A database ships one or more `test_<variant>` splits (currently an in-distribution 1:1 set, `test_matched_1_1` or for `random` `test_uniform_1_1`, and an out-of-distribution 1:10 set, `test_uniform_1_10`) or a single `test`; all are scored by the same trained models and reported as separate datasets.
 
 ## Common commands
 
 ```bash
 # full run across every database in the samplesheet (cluster: executor/queues/
 # workDir/GPU clusterOptions all come from the -c config, not from this repo).
-# A samplesheet input needs --embeddings for the published embedding features.
-nextflow run . --input assets/samplesheet.csv --embeddings /path/to/domainsplit/results/embeddings -c daisybio.config -profile apptainer,gpu,keep_work -resume
+# A samplesheet input needs --embeddings and --structures for the published and structure features.
+nextflow run . --input my_samplesheet.csv --embeddings /path/to/domainsplit/results/embeddings --structures /path/to/domainsplit/results/structures/structures.h5 -c daisybio.config -profile apptainer,gpu,keep_work -resume
 
 # same, straight off a domainsplit output directory
 nextflow run . --input /path/to/domainsplit/results/databases -c daisybio.config -profile apptainer,gpu,keep_work -resume
@@ -114,6 +114,8 @@ Nothing raises when a file does not fit. `machine_learning.load_embedding_data` 
 - `bin/verify_embeddings.py` (run by `VERIFY_EMBEDDINGS`, before any model trains) measures, for each split in `meta.splits`, the fraction of `ddi_split_membership` instance **pairs** whose two sides are both in the HDF5 with all-finite vectors — exactly what the loader will look up — and fails under `params.min_embedding_coverage` (default 0.95). It also logs DDI-level coverage and missing / non-finite counts, and rejects a file still declaring the retired `key_layout = {domain_id}/{instance_id}`. It used to count every `domain_protein_map` instance by key presence alone: at the old 0.5 that let ~25% pair coverage through (pair ≈ instance²), and an all-NaN file scored 100%. Because NN/RF consume its output, an unverified file cannot reach a GPU.
 - `machine_learning.load_embedding_data` tallies per-feature hits and raises naming the feature when one resolves no domain pair at all, or when every domain pair resolves but no instance pair does. Partial resolution is logged per split, not fatal.
 
+The same blind spot holds for **structures**: one `structures.h5` serves every database of a run, keyed by Pfam accession and instance id, so a samplesheet mixing domainsplit runs (or an explicit `--structures` from another run) can silently reuse a foreign run's complex for matching keys. Documented, deliberately not guarded, like embeddings.
+
 Note what the coverage check cannot do — this inverted when the key changed. Pfam accessions are **stable across runs**, so it catches a wrong or stale *export* (wrong dataset, made before domains were added, truncated) but **not a foreign run** over the same domain universe: that resolves ~100%. There is deliberately no guard for it. `params.domainsplit_run` used to be one and was removed: with `--embeddings` derived from `--input`'s own directory the right pairing happens by construction, and for a samplesheet run — or an explicit `--embeddings` — pointing at the matching run is the caller's job. Getting it wrong shows up as a coverage failure only if the two runs also disagree on domains.
 
 ### Numeric params on the command line
@@ -147,7 +149,7 @@ Do not re-add entries to `tests/.nftignore` to make a snapshot pass: that hides 
 
 ### Report ordering
 
-`params.mqc_order` is a comma-separated list of dataset (run label) names — `random_1_1,minimal_leakage_hcni_1_10,external_test`. A *dataset* is one (database, test variant), the same label `runLabel()` builds. It drives three things, all via the helpers in `bin/eval_multiqc_functions.py` (`parse_dataset_order`, `resolve_dataset_order`, `sort_by_dataset`, `order_dataset_keys`):
+`params.mqc_order` is a comma-separated list of dataset (run label) names — `random_uniform_1_1,minimal_leakage_hrni_uniform_1_10,external_test`. A *dataset* is one (database, test variant), the same label `runLabel()` builds. It drives three things, all via the helpers in `bin/eval_multiqc_functions.py` (`parse_dataset_order`, `resolve_dataset_order`, `sort_by_dataset`, `order_dataset_keys`):
 
 - the MultiQC section order of the blocks that exist once per dataset (`db_database_analysis_<ds>`, `model_eval_metrics_<ds>`);
 - the tab/series order inside blocks that carry every dataset (combined ROC/PR line graphs, the by-source bar graph);
@@ -169,11 +171,12 @@ The degree, betweenness and clustering-coefficient box plots are gone, in both t
 - `conda` / `mamba`: environments from `environments/*.yml`.
 - `apptainer` / `singularity` / `docker`: container engine, with a 2 h pull timeout (the GPU image is large).
 - `gpu`: adds `--nv` / `--gpus all`; on a cluster it is also the profile the institutional config keys on to send `process_gpu` tasks to the GPU queue.
-- `test` / `test_full`: minimal SQLite triplet under `tests/data/`. Features are `aacomp,dummy,esm3_embeddings` — one cheap extracted encoder, the one encoder that draws from the RNG, and one published embedding, so the singleton and all-concat combos each mix extracted and published sources. `graph_models = ''`: the graph models are deliberately **not** covered, so changes to `ddiparsimony.py` / `kgiddi.py` / `load_data_gm.py` carry no snapshot signal and have to be argued for by hand.
+- `test_full`: the pipeline defaults (every sequence and structure feature, `dummy` included; NN/RF/SVM; graph models off) on the current domainsplit `databases/` directory on the cluster.
+- `test`: minimal SQLite triplet under `tests/data/`. Features are `aacomp,dummy,esm3_embeddings` — one cheap extracted encoder, the one encoder that draws from the RNG, and one published embedding, so the singleton and all-concat combos each mix extracted and published sources. `graph_models = ''`: the graph models are deliberately **not** covered, so changes to `ddiparsimony.py` / `kgiddi.py` / `load_data_gm.py` carry no snapshot signal and have to be argued for by hand.
   The test profile also runs `svm`, the structure features `sasa_residue` (chain-ordered, reads the SASA cache) and `k_closest_distance_5k` (a variant) from `tests/data/structures/structures.h5`, and enrichment from `tests/data/metadata/`. The fixture has partial structure coverage on purpose (one positive missing one pair, one negative missing all) and one same-family pair per split.
 - `daisybio`: site-specific defaults from nf-core/configs. `daisybio.config` sets `cleanup = true`, so pair it with `keep_work` if you want `-resume` to work.
 
-The cluster DB paths (`/nfs/data/CoBiNet_Masterpraktikum/...`) live in `assets/samplesheet*.csv`, not in `nextflow.config`; point `--input` at your own samplesheet or `databases/` directory for local runs.
+No samplesheet is tracked (the old `assets/samplesheet*.csv` pointed at stale cluster paths and were deleted); the samplesheet *format* is still supported. Run-specific values (`--input`, `--outdir`, `--mqc_order`) live in an untracked `-params-file`, not in `nextflow.config`. `test_full` points at the current domainsplit output on the cluster.
 
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph

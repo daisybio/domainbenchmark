@@ -315,11 +315,11 @@ def _sidecar(name, variant, correct, n_scored):
 
 
 def test_pool_is_unweighted_macro_mean():
-    sc = [_sidecar("a_1_1", "1_1", 9, 10), _sidecar("a_hcni_1_1", "1_1", 9, 10),
+    sc = [_sidecar("a_1_1", "1_1", 9, 10), _sidecar("a_hrni_1_1", "1_1", 9, 10),
           _sidecar("b_1_1", "1_1", 0, 100)]
     (pool,) = combine_eval._pool_by_variant(sc)
     assert pool["models"]["m"]["s"]["accuracy"] == pytest.approx((0.9 + 0.9 + 0.0) / 3)
-    assert pool["members"] == ["a_1_1", "a_hcni_1_1", "b_1_1"]
+    assert pool["members"] == ["a_1_1", "a_hrni_1_1", "b_1_1"]
 
 
 def test_pools_derived_from_variants_single_test_joins_none():

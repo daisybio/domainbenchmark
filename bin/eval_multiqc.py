@@ -102,8 +102,9 @@ def parse_arguments():
         "--test_split",
         default="test",
         help="Test split of --database to profile: `test` or any "
-             "`test_<variant>` (currently test_1_1, in distribution, and "
-             "test_1_10, out of distribution). Each test set of a database is "
+             "`test_<variant>` (currently test_matched_1_1 or test_uniform_1_1, "
+             "in distribution, and test_uniform_1_10, out of distribution). "
+             "Each test set of a database is "
              "reported as its own dataset.",
     )
     p.add_argument(

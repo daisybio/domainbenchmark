@@ -30,6 +30,14 @@ lint:
     - .github/ISSUE_TEMPLATE/config.yml
     - .github/workflows/awstest.yml
     - .github/workflows/awsfulltest.yml
+    # Template workflows deleted 2026-11-17: unused, and fix_linting /
+    # template-version-comment ran PR content with privileged tokens.
+    - .github/workflows/branch.yml
+    - .github/workflows/clean-up.yml
+    - .github/workflows/download_pipeline.yml
+    - .github/workflows/fix_linting.yml
+    - .github/workflows/linting_comment.yml
+    - .github/workflows/template-version-comment.yml
 nf_core_version: 4.0.2
 repository_type: pipeline
 template:
