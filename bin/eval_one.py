@@ -10,6 +10,7 @@ This eliminates the global `process_models` join that previously OOM'd the
 predictions in memory; the reducer reads tiny JSONs.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -84,7 +85,7 @@ def _read_sources(path: str) -> tuple:
     each of their performance rows.
 
     Returns ``(exploded, totals)`` where `exploded` has columns
-    ``pair``/``source`` and `totals` maps source -> ground-truth counts in this
+    ``pair``/``source``/``interaction`` (the pair's label) and `totals` maps source -> ground-truth counts in this
     test split (i.e. the denominator the model's coverage is measured against).
 
     One row per canonical pair, and one (pair, source) row per distinct source.
@@ -98,6 +99,13 @@ def _read_sources(path: str) -> tuple:
     """
     df = pd.read_csv(path, dtype={"domain_1": str, "domain_2": str, "source": str})
     df["pair"] = _pair_keys(df["domain_1"], df["domain_2"])
+    # Checked before the narrowing cast: int8 would turn 257 into 1.
+    bad = ~df["interaction"].isin([0, 1])
+    if bad.any():
+        raise SystemExit(
+            f"[eval_one] {path}: {int(bad.sum())} row(s) have an `interaction` "
+            f"that is not 0/1 (e.g. {df.loc[bad, 'interaction'].head(EXAMPLES).tolist()})."
+        )
     df["interaction"] = df["interaction"].astype(np.int8)
     df["source"] = df["source"].fillna("")
 
@@ -117,15 +125,16 @@ def _read_sources(path: str) -> tuple:
             f"their sources. e.g. {_examples(df.loc[dup, 'pair'])}"
         )
         # A pair that is positive in one orientation and negative in the other
-        # is a domainsplit bug, not provenance. Positive wins: the DDI was
-        # observed by at least one source.
+        # is a domainsplit bug, not provenance, and there is no right answer to
+        # pick: fail (it used to resolve to positive, while the ML loader kept
+        # whichever row came first).
         labels = df.loc[dup].groupby("pair")["interaction"].nunique()
         conflicting = labels[labels > 1].index
         if len(conflicting):
-            print(
-                f"[eval_one][WARN] {path}: {len(conflicting)} of those pair(s) "
-                "disagree on `interaction` between orientations; counting them "
-                f"as positive. e.g. {_examples(conflicting)}"
+            raise SystemExit(
+                f"[eval_one] {path}: {len(conflicting)} domain pair(s) carry "
+                "`interaction` 0 in one orientation and 1 in the other. "
+                f"e.g. {_examples(conflicting)}"
             )
 
     exploded = (
@@ -138,7 +147,7 @@ def _read_sources(path: str) -> tuple:
     exploded = exploded[
         ~((exploded["source"] == UNKNOWN_SOURCE) & exploded["pair"].isin(named))
     ]
-    label = df.groupby("pair", sort=True)["interaction"].max()
+    label = df.groupby("pair", sort=True)["interaction"].first()
     exploded = exploded.assign(interaction=exploded["pair"].map(label).astype(np.int8))
     df = label.reset_index()
 
@@ -156,7 +165,7 @@ def _read_sources(path: str) -> tuple:
         "n_pos": n_pos_all,
         "n_neg": int(len(df) - n_pos_all),
     }
-    return exploded[["pair", "source"]], totals
+    return exploded[["pair", "source", "interaction"]], totals
 
 
 def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
@@ -225,6 +234,17 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
             "`domain.id` surrogate."
         )
 
+    # The join above is for provenance, but it is also the only place the
+    # prediction's truth meets the split's: a stale or mislabelled predictions
+    # file would otherwise be scored against its own labels.
+    wrong = merged.loc[merged["true_interaction"] != merged["interaction"], "pair"]
+    if len(wrong):
+        raise SystemExit(
+            f"[eval_one] {int(wrong.nunique())}/{int(preds['pair'].nunique())} "
+            f"scored domain pairs carry a true_interaction that differs from "
+            f"their label in {sources_path}. e.g. {_examples(wrong)}"
+        )
+
     per_source = {}
     for source, grp in merged.groupby("source", sort=True):
         n_scored = int(len(grp))
@@ -247,6 +267,10 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
         "n_pos": int(ground_all.get("n_pos", int((preds["true_interaction"] == 1).sum()))),
         "n_neg": int(ground_all.get("n_neg", 0)),
         "n_scored": n_all,
+        # Coverage by class: a model that abstains more on one class than the
+        # other is scored on a label-shifted subset.
+        "n_scored_pos": int((preds["true_interaction"] == 1).sum()),
+        "n_scored_neg": int((preds["true_interaction"] == 0).sum()),
         "correct": correct_all,
         "accuracy": float(correct_all) / n_all if n_all else float("nan"),
     }
@@ -260,47 +284,38 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
 
 
 def _drop_duplicate_pairs(df: pd.DataFrame, path: str) -> pd.DataFrame:
-    """One row per canonical (domain_a, domain_b), dropping the rest with a warning.
+    """One row per canonical (domain_a, domain_b).
 
     Every predictions file is supposed to be canonical already (CLAUDE.md, "The
     domain key"), so a duplicate is an upstream bug -- but one that used to be
     counted twice in every metric and in `n_scored`, silently.
 
-    The row kept is the one that sorts first on (true_interaction,
-    predicted_probability, predicted_interaction), so the choice is a function
-    of the rows' contents, not of the order the model happened to write them
-    in. Kept rows stay in file order, which leaves a clean file -- and its
-    bootstrap draws -- exactly as before.
+    Identical duplicates (same label, score and predicted label) are dropped
+    with a warning. Duplicates that differ are fatal: the rows are already
+    aggregated, so there is no correct one to keep and averaging them again
+    would invent a score no model produced. Kept rows stay in file order.
     """
     key = _pair_keys(df["domain_a"], df["domain_b"])
+    cols = ["true_interaction", "predicted_probability", "predicted_interaction"]
     is_extra = pd.Series(key).duplicated().to_numpy()
     if not is_extra.any():
         return df
-    order = np.lexsort((
-        df["predicted_interaction"].to_numpy(),
-        df["predicted_probability"].to_numpy(),
-        df["true_interaction"].to_numpy(),
-        key,
-    ))
-    first = ~pd.Series(key[order]).duplicated().to_numpy()
-    keep = np.sort(order[first])
-
-    in_dup = pd.Series(key).duplicated(keep=False).to_numpy()
-    dup_keys = key[in_dup]
-    n_disagree = int(
-        df.loc[in_dup, ["true_interaction", "predicted_probability", "predicted_interaction"]]
-        .assign(pair=dup_keys)
-        .drop_duplicates()
-        .groupby("pair").size().gt(1).sum()
-    )
+    records = df[cols].assign(pair=key)
+    distinct = records.drop_duplicates()
+    conflicting = distinct.loc[distinct["pair"].duplicated(keep=False), "pair"]
+    if len(conflicting):
+        raise SystemExit(
+            f"[eval_one] {path}: {int(conflicting.nunique())} domain pair(s) "
+            "appear more than once with a different label or score after "
+            f"canonicalising the orientation. e.g. {_examples(conflicting)}"
+        )
+    dup_keys = key[pd.Series(key).duplicated(keep=False).to_numpy()]
     print(
-        f"[eval_one][WARN] {path}: {int(is_extra.sum())} duplicate row(s) over "
-        f"{len(set(dup_keys))} domain pair(s) after canonicalising the "
-        f"orientation; dropped, keeping one row per pair "
-        f"({n_disagree} pair(s) disagree on label or score). "
-        f"e.g. {_examples(dup_keys)}"
+        f"[eval_one][WARN] {path}: {int(is_extra.sum())} identical duplicate "
+        f"row(s) over {len(set(dup_keys))} domain pair(s) after canonicalising "
+        f"the orientation; dropped. e.g. {_examples(dup_keys)}"
     )
-    return df.iloc[keep].reset_index(drop=True)
+    return df.loc[~is_extra].reset_index(drop=True)
 
 
 def _read_predictions(path: str, model_name: str) -> pd.DataFrame:
@@ -323,9 +338,16 @@ def _read_predictions(path: str, model_name: str) -> pd.DataFrame:
             f"{list(df.columns)}, {len(df)} rows). An empty frame here means the "
             "model scored no domain pairs at all -- check that upstream task's log."
         )
+    for col in ("true_interaction", "predicted_interaction"):
+        bad = ~df[col].isin([0, 1])
+        if bad.any():
+            raise SystemExit(
+                f"[eval_one] model {model_name}: {int(bad.sum())}/{len(df)} rows "
+                f"of {path} have a {col} that is not 0/1."
+            )
     df["true_interaction"] = df["true_interaction"].astype(np.int8)
     df["predicted_interaction"] = df["predicted_interaction"].astype(np.int8)
-    df["predicted_probability"] = df["predicted_probability"].astype(np.float32)
+    df["predicted_probability"] = df["predicted_probability"].astype(np.float64)
 
     # A non-finite score is fatal, not masked. It used to be dropped from the
     # ROC/AP/bootstrap inputs while the same row still counted in the confusion
@@ -339,7 +361,21 @@ def _read_predictions(path: str, model_name: str) -> pd.DataFrame:
             f"{path} have a non-finite predicted_probability. "
             f"e.g. {_examples(keys)}"
         )
-    return _drop_duplicate_pairs(df, path)
+    # Duplicates are compared at the file's own precision, before the float32
+    # cast, which could merge two scores that differ only below it.
+    df = _drop_duplicate_pairs(df, path)
+    df["predicted_probability"] = df["predicted_probability"].astype(np.float32)
+    # Rows in canonical key order: two models that scored the same pair set
+    # then get the same bootstrap index draws on aligned rows, which is what
+    # makes the pairwise test in eval_multiqc.py paired (`pair_set_sha1`).
+    order = np.argsort(_pair_keys(df["domain_a"], df["domain_b"]), kind="stable")
+    return df.iloc[order].reset_index(drop=True)
+
+
+def _pair_set_sha1(df: pd.DataFrame) -> str:
+    """Digest of the scored canonical pair set (rows are already key-sorted)."""
+    keys = _pair_keys(df["domain_a"], df["domain_b"])
+    return hashlib.sha1("\n".join(keys).encode()).hexdigest()
 
 
 def _summary(y_true, y_pred, model_name) -> dict:
@@ -372,6 +408,7 @@ def _summary(y_true, y_pred, model_name) -> dict:
     return {
         "Model": model_name,
         "Samples": total,
+        "Prevalence": _safe(pos, total),
         "TP": TP,
         "TN": TN,
         "FP": FP,
@@ -392,9 +429,13 @@ def _strata_metrics(df: pd.DataFrame, bootstrap_n: int, seed: int) -> tuple:
     A self-pair (domain_a == domain_b) is answerable without any feature: the
     model only has to notice that both halves of the input describe the same
     family. Where self-pairs are mostly positive that alone scores well, so
-    the pooled AUC mixes "is this a homodimer" with real DDI prediction. The
-    hetero stratum is the latter; `self_indicator_auc` is what predicting
+    the pooled AUC mixes "is this a same-family pair" with real DDI prediction.
+    The hetero stratum is the latter; `self_indicator_auc` is what predicting
     "positive iff self-pair" scores on this model's rows -- the free baseline.
+
+    With no self-pair at all the hetero stratum *is* the full set
+    (`hetero["same_as_full"]`) and the indicator is constant, so its AUC is
+    NaN rather than a meaningless 0.5.
     """
     y = df["true_interaction"].to_numpy()
     score = df["predicted_probability"].to_numpy()
@@ -427,10 +468,31 @@ def _strata_metrics(df: pd.DataFrame, bootstrap_n: int, seed: int) -> tuple:
             entry["pr_ap_ci"] = [lo, hi]
         strata[name] = entry
 
+    strata["hetero"]["same_as_full"] = not is_self.any()
     self_indicator_auc = (
-        float(roc_auc_score(y, is_self)) if len(np.unique(y)) == 2 else float("nan")
+        float(roc_auc_score(y, is_self))
+        if len(np.unique(y)) == 2 and is_self.any() and not is_self.all()
+        else float("nan")
     )
     return strata, self_indicator_auc
+
+
+def _ap_baseline(pr_ap: float, y_true) -> dict:
+    """AP next to its chance level: a no-skill ranker scores AP = prevalence.
+
+    Raw AP is not comparable across test sets of different prevalence (0.55 on
+    a 1:1 set is barely above chance, 0.30 on a 1:10 set is ~3x). NaN where
+    undefined: AP itself on a single-class split, lift at prevalence 0,
+    normalised AP at prevalence 1.
+    """
+    y_true = np.asarray(y_true)
+    pi = float(y_true.mean()) if len(y_true) else float("nan")
+    return {
+        "prevalence": pi,
+        "ap_no_skill": pi,
+        "ap_lift": pr_ap / pi if pi > 0 else float("nan"),
+        "ap_normalised": (pr_ap - pi) / (1.0 - pi) if pi < 1 else float("nan"),
+    }
 
 
 def _downsample_curve(xs, ys, max_points: int = 600):
@@ -524,6 +586,10 @@ def main():
         "pr_ap": pr_ap,
         "roc_auc_ci": [roc_lo, roc_hi],
         "pr_ap_ci": [pr_lo, pr_hi],
+        **_ap_baseline(pr_ap, y_true),
+        # Canonical pair set this model scored; eval_multiqc.py compares two
+        # models' bootstrap samples only when these match.
+        "pair_set_sha1": _pair_set_sha1(df),
         # A single-class resample is undefined and skipped, so the CI rests on
         # the valid ones only. On a heavily imbalanced split that can be far
         # fewer than bootstrap_n, which is worth seeing next to the interval.

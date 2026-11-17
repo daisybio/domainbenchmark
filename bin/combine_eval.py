@@ -13,7 +13,11 @@ from pathlib import Path
 import json
 
 from eval_multiqc_functions import (
+    AF3_CAVEAT,
+    NO_SKILL_NOTE,
     is_retired_block,
+    model_of_curve_label,
+    no_skill_series,
     order_dataset_keys,
     parse_dataset_order,
     resolve_dataset_order,
@@ -48,8 +52,29 @@ REPORT_NAME = "ddi_report"
 ID = "eval"
 DB_PREFIX = "db_"
 
-#: Reference row on the AUC heatmap -- not a model. See model_performance_heatmap.
-SELF_INDICATOR_ROW = "(self-pair indicator, no model)"
+#: Reference row of the AUC CI table -- not a model. See model_performance_heatmap.
+SELF_INDICATOR_ROW = (
+    "(same-family indicator, no model; on the largest-coverage predictor's rows)"
+)
+
+#: Suffix on heatmap rows of structure-assisted models.
+STRUCTURE_MARK = " [S]"
+
+#: AUC heatmaps: diverging, centred on chance (0.5 sits mid-scale on [0, 1]).
+_div = plt.get_cmap("RdYlGn")
+auc_colstops = [
+    [i / 8, "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in _div(i / 8)[:3]))]
+    for i in range(9)
+]
+
+AP_DESCRIPTION = (
+    "Raw AP depends on prevalence (a no-skill ranker scores AP = prevalence), "
+    "so a 1:1 and a 1:10 test set are not comparable on this colour scale. "
+    "The lift (AP / prevalence) in the CI table below is AP relative to that "
+    "population's no-skill baseline; it still moves with prevalence (the same "
+    "ranking gives a larger lift at lower prevalence), so compare models within "
+    "a dataset, and across datasets prefer ROC AUC."
+)
 
 
 def parse_arguments():
@@ -69,7 +94,9 @@ def parse_arguments():
         "--mqc_order",
         default=None,
         help="Comma-separated dataset (run label) order, e.g. "
-             "'random_balanced,minimal_leakage_hcni_realistic,external_test'. "
+             "'random_1_1,minimal_leakage_hcni_1_10,external_test' (a run "
+             "label is `<db>_<variant>` for each `test_<variant>` split, bare "
+             "`<db>` for a single `test`). "
              "Drives the section order of the per-dataset blocks, the tab order "
              "inside the combined ROC/PR and by-source plots, and the column "
              "order of the AUC/AP heatmaps. A name that does not exist in the "
@@ -128,8 +155,11 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
     roc_heatmap_ci = pick(r"model_performance_heatmap_roc_ci$")
     hetero_heatmap_block = pick(r"model_performance_heatmap_hetero_roc$")
     hetero_heatmap_ci = pick(r"model_performance_heatmap_hetero_roc_ci$")
+    hetero_pr_heatmap_block = pick(r"model_performance_heatmap_hetero_pr$")
+    hetero_pr_heatmap_ci = pick(r"model_performance_heatmap_hetero_pr_ci$")
     pr_heatmep_block = pick(r"model_performance_heatmap_pr$")
     pr_heatmap_ci = pick(r"model_performance_heatmap_pr_ci$")
+    coverage_blocks = pick(r"^combined_coverage_")
 
     source_block = pick(r"source_accuracy_by_ddi_source")
 
@@ -146,6 +176,7 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
         db_blocks = sort_by_dataset(db_blocks, dataset_order)
         metric_blocks = sort_by_dataset(metric_blocks, dataset_order)
         pairwise_blocks = sort_by_dataset(pairwise_blocks, dataset_order)
+        coverage_blocks = sort_by_dataset(coverage_blocks, dataset_order)
 
     # Threshold-free heatmaps first: they are the primary comparison. The
     # per-dataset metric tables depend on a threshold tuned at validation's
@@ -158,8 +189,11 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
         + hetero_heatmap_ci
         + pr_heatmep_block
         + pr_heatmap_ci
+        + hetero_pr_heatmap_block
+        + hetero_pr_heatmap_ci
         + db_blocks
         + metric_blocks
+        + coverage_blocks
         + pairwise_blocks
         + roc_curves_block
         + pr_curves_block
@@ -286,8 +320,8 @@ def get_db_name_from_dir(report_dir):
 def relabel_multiqc_block(block, db_name):
     # Append db_name to id, section_name, and pconfig fields for uniqueness.
     # eval_multiqc.py already labels its database-analysis blocks with the run
-    # name, so skip blocks that carry it to avoid "… (random_balanced)
-    # (random_balanced)".
+    # name, so skip blocks that carry it to avoid "… (random_1_1)
+    # (random_1_1)".
     suffix = f"_{db_name}"
     parenthesised = f"({db_name})"
 
@@ -317,18 +351,19 @@ SOURCE_ACCURACY_SIDECAR = "source_accuracy.json"
 #: Baseline row: the whole test set, i.e. what the ordinary overview tables show.
 ALL_SOURCES = "ALL"
 
-#: Extra bar per source group: unweighted mean over the models in that group.
-AVERAGE_CAT = "Average"
+#: Extra bar per source group: unweighted mean over the models shown in that
+#: group. Not an ensemble, and it moves when a model is added or removed.
+AVERAGE_CAT = "Mean over shown models"
 
-#: Extra tabs: datasets pooled per test variant. Exact, not an average of
-#: averages -- summed `correct` over summed `n_scored`.
+#: Extra tabs: datasets pooled per test variant, as an unweighted macro mean of
+#: per-dataset accuracy. Summing counts let the largest dataset dominate and
+#: counted overlapping datasets (e.g. `<db>` and `<db>_hcni`, same test pairs)
+#: twice.
 #:
-#: One pool per variant, never one over everything: the balanced and realistic
-#: test sets of a database are two views of the same DDIs, so pooling both
-#: counted every shared pair twice and mixed two class balances into one
-#: number. A database with a single test split (variant `test`, e.g.
-#: external_test) has no balanced/realistic distinction and joins both pools.
-POOLED_VARIANTS = ("realistic", "balanced")
+#: One pool per variant, never one over everything: the variants of a database
+#: are views of overlapping DDIs at different class balances. The variants are
+#: read from the data (every `test_<variant>` held by >= 2 datasets). A
+#: database with a single `test` split (e.g. external_test) joins no pool.
 SINGLE_SPLIT_VARIANT = "test"
 
 
@@ -369,9 +404,11 @@ def _variant(sidecar) -> str:
 def _combine_datasets(sidecars, label=None):
     """Pool `sidecars` into one synthetic sidecar named `label`.
 
-    Accuracy is recomputed from summed `correct` / `n_scored` rather than
-    averaged, so a dataset with ten times the DDIs of another carries ten times
-    the weight -- which is what pooling the test sets would have given.
+    Accuracy is the unweighted macro mean of the per-dataset accuracies (each
+    dataset in which the model scored the source counts once), so neither the
+    largest dataset nor a pair of overlapping twins dominates. `totals` and
+    `n_scored` are summed only to order the sources; they are not a pooled
+    test set.
     """
     totals = {}
     models = {}
@@ -383,43 +420,60 @@ def _combine_datasets(sidecars, label=None):
         for model, by_source in sidecar.get("models", {}).items():
             per_model = models.setdefault(model, {})
             for source, stats in by_source.items():
-                acc = per_model.setdefault(source, {"n_scored": 0, "correct": 0})
+                acc = per_model.setdefault(
+                    source, {"n_scored": 0, "correct": 0, "accuracies": []}
+                )
                 acc["n_scored"] += int(stats.get("n_scored", 0))
                 acc["correct"] += int(stats.get("correct", 0))
+                if stats.get("n_scored"):
+                    acc["accuracies"].append(stats["correct"] / stats["n_scored"])
     for by_source in models.values():
         for stats in by_source.values():
-            stats["accuracy"] = (
-                stats["correct"] / stats["n_scored"] if stats["n_scored"] else None
-            )
+            accs = stats.pop("accuracies")
+            stats["accuracy"] = sum(accs) / len(accs) if accs else None
     return {"db_name": label, "test_split": label, "pooled": True,
+            "members": sorted(sc.get("db_name", "") for sc in sidecars),
             "totals": totals, "models": models}
 
 
 def _pool_by_variant(sidecars):
-    """`Combined_realistic` / `Combined_balanced` over the real datasets.
+    """`Combined_<variant>` for every variant held by at least two datasets.
 
-    A pool is emitted only when it holds at least two datasets -- with one it
-    would repeat that dataset's tab under another name. A variant that is
-    neither pooled one nor `test` belongs to no pool and is reported once.
+    With one dataset a pool would repeat that dataset's tab under another
+    name. A single-`test` dataset (e.g. external_test) has no variant and
+    joins no pool, and neither does a variant only one dataset has.
     """
-    pools = []
-    for variant in POOLED_VARIANTS:
-        members = [
-            sc for sc in sidecars if _variant(sc) in (variant, SINGLE_SPLIT_VARIANT)
-        ]
-        if len(members) >= 2:
+    by_variant = {}
+    for sc in sidecars:
+        by_variant.setdefault(_variant(sc), []).append(sc)
+    pools, unpooled = [], []
+    for variant in sorted(by_variant):
+        members = by_variant[variant]
+        if variant != SINGLE_SPLIT_VARIANT and len(members) >= 2:
             pools.append(_combine_datasets(members, pooled_label(variant)))
-    unpooled = sorted(
-        sc.get("db_name", "") for sc in sidecars
-        if _variant(sc) not in POOLED_VARIANTS + (SINGLE_SPLIT_VARIANT,)
-    )
+        else:
+            unpooled += [sc.get("db_name", "") for sc in members]
     if unpooled:
         print(
-            f"[WARN] dataset(s) {', '.join(unpooled)} have a test variant other "
-            f"than {', '.join(POOLED_VARIANTS)} or '{SINGLE_SPLIT_VARIANT}'; "
-            "they are in no pooled tab."
+            f"[INFO] dataset(s) {', '.join(sorted(unpooled))} are in no pooled "
+            "tab (single `test` split, or a variant no other dataset has)."
         )
     return pools
+
+
+def _pool_description(pools):
+    """Which datasets each pooled tab averages, and how."""
+    if not pools:
+        return ""
+    items = "".join(
+        f"<li><b>{p['db_name']}</b>: {', '.join(p['members'])}</li>" for p in pools
+    )
+    return (
+        "<p><b>Pooled tabs</b> are the unweighted mean of each model's "
+        "per-dataset accuracy over these datasets (one per test variant held "
+        "by at least two datasets; single-<code>test</code> datasets join "
+        f"none):</p><ul>{items}</ul>"
+    )
 
 
 def _source_order(totals):
@@ -554,6 +608,7 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
     # would leave out a source only the other variant carries.
     source_order = _source_order(_combine_datasets(sidecars)["totals"])
     pools = _pool_by_variant(sidecars)
+    real_sidecars = sidecars
     sidecars = sidecars + pools
 
     palette = _model_palette(sorted({m for sc in sidecars for m in sc["models"]}))
@@ -572,7 +627,10 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
                 stats = sidecar["models"][model].get(source)
                 if not stats or not stats.get("n_scored"):
                     continue
-                accuracy = 100.0 * stats["correct"] / stats["n_scored"]
+                accuracy = 100.0 * (
+                    stats["accuracy"] if sidecar.get("pooled")
+                    else stats["correct"] / stats["n_scored"]
+                )
                 cell[model] = round(accuracy, 2)
                 accuracies.append(accuracy)
             if not accuracies:
@@ -597,7 +655,15 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
     block = {
         "id": "source_accuracy_by_ddi_source",
         "section_name": "Accuracy by DDI source",
-        "description": _counts_table_html(sidecars, source_order)
+        "description": (
+            "<p>On a positive-only source accuracy is recall; on a "
+            "negative-only source it is specificity. "
+            f"<b>{AVERAGE_CAT}</b> is the unweighted mean over the models shown "
+            "in that group, not an ensemble; it changes when a model is added "
+            "or removed.</p>"
+        )
+        + _counts_table_html(real_sidecars, source_order)
+        + _pool_description(pools)
         + _coverage_notes(sidecars),
         "plot_type": "bargraph",
         "categories": categories,
@@ -649,23 +715,33 @@ def cross_db_comparison(all_blocks, outdir, dataset_order=None):
     }
     # model_eval_data = {block["id"]: block for block in all_blocks if block["id"].startswith("model_eval_metrics_")}
 
+    # Prevalence of each (dataset, model)'s scored pairs, for the PR no-skill
+    # lines.
+    prevalence = {
+        (block_id.replace("combined_metrics_table_", ""), model): row.get("Prevalence")
+        for block_id, block in performance_data.items()
+        for model, row in block.get("data", {}).items()
+    }
+
     # combined_metrics_heatmap(model_eval_data, outdir)
     combined_roc_curves(roc_data, outdir, dataset_order)
-    combined_pr_curves(pr_data, outdir, dataset_order)
+    combined_pr_curves(pr_data, outdir, dataset_order, prevalence)
     model_performance_heatmap(performance_data, outdir, dataset_order)
     combine_curves_db_level(
         roc_data, outdir, "roc", "False Positive Rate", "True Positive Rate",
         dataset_order,
     )
     combine_curves_db_level(
-        pr_data, outdir, "pr", "Recall", "Precision", dataset_order
+        pr_data, outdir, "pr", "Recall", "Precision", dataset_order, prevalence
     )
 
 
 def combine_curves_db_level(
-    curve_data, outdir, curve_type, xlabel, ylabel, dataset_order=None
+    curve_data, outdir, curve_type, xlabel, ylabel, dataset_order=None,
+    prevalence=None,
 ):
-    # One tab per dataset, so `--mqc_order` is the tab order.
+    # One tab per dataset, so `--mqc_order` is the tab order. Series names
+    # are eval_multiqc.py's legend labels, which already carry each model's n.
     pairs = []
     for block_id, block in curve_data.items():
         db_name = block_id.replace(f"combined_{curve_type}_", "")
@@ -675,18 +751,25 @@ def combine_curves_db_level(
     data = [points for _, points in pairs]
     data_labels = [{"name": db, "title": db} for db, _ in pairs]
 
+    pconfig = {
+        "id": f"combined_{curve_type}_curves_db_level",
+        "title": f"{curve_type.upper()} Curves by Dataset",
+        "xlab": f"{xlabel}",
+        "ylab": f"{ylabel}",
+        "data_labels": data_labels,
+        "showlegend": True,
+    }
+    if prevalence is not None:
+        pconfig["extra_series"] = [
+            no_skill_series(prevalence.get((db, model_of_curve_label(s))) for s in points)
+            for db, points in pairs
+        ]
     combined_block = {
         "id": f"combined_{curve_type}_curves_db_level",
-        "section_name": f"{curve_type.upper()} Curves by Database",
+        "section_name": f"{curve_type.upper()} Curves by Dataset",
+        "description": NO_SKILL_NOTE if prevalence is not None else "",
         "plot_type": "linegraph",
-        "pconfig": {
-            "id": f"combined_{curve_type}_curves_db_level",
-            "title": f"{curve_type.upper()} Curves by Database",
-            "xlab": f"{xlabel}",
-            "ylab": f"{ylabel}",
-            "data_labels": data_labels,
-            "showlegend": True,
-        },
+        "pconfig": pconfig,
         "data": data,
     }
     with open(
@@ -702,21 +785,24 @@ def combined_roc_curves(roc_data, outdir, dataset_order=None):
     for block_id, block in roc_data.items():
         db_name = block_id.replace("combined_roc_", "")
         metrics = block.get("data", {})
-        for model in metrics.keys():
-            # Create a named list of dicts
+        for label in metrics.keys():
+            model = model_of_curve_label(label)
+            # Create a named list of dicts; the series is the dataset, and
+            # keeps the model's n there (`<db> (n=…)`).
             data_tmp.append(
-                {"name": model, "points": metrics[model], "model": model, "db": db_name}
+                {"name": model, "points": metrics[label], "model": model,
+                 "db": db_name, "series": db_name + label[len(model):]}
             )
 
     data = []
     for model in sorted({d["model"] for d in data_tmp}):
-        model_curves = [d for d in data_tmp if d["model"] == model]
-        tmp = {}
-        for curve in model_curves:
-            tmp[curve["db"]] = curve["points"]
         # One series per dataset inside each model's plot -- `--mqc_order` sets
-        # the series (and therefore legend) order.
-        data.append(order_dataset_keys(tmp, dataset_order))
+        # the series (and therefore legend) order, by dataset name.
+        model_curves = sort_by_dataset(
+            [d for d in data_tmp if d["model"] == model], dataset_order,
+            key=lambda c: c["db"],
+        )
+        data.append({c["series"]: c["points"] for c in model_curves})
         data_labels.append({"name": model, "title": model})
 
     # Order data by model_name
@@ -742,36 +828,41 @@ def combined_roc_curves(roc_data, outdir, dataset_order=None):
         json.dump(roc_block, f, indent=2)
 
 
-def combined_pr_curves(pr_data, outdir, dataset_order=None):
+def combined_pr_curves(pr_data, outdir, dataset_order=None, prevalence=None):
 
     data = []
     data_tmp = []
     data_labels = []
+    extra_series = []
+    prevalence = prevalence or {}
     for block_id, block in pr_data.items():
         db_name = block_id.replace("combined_pr_", "")
         metrics = block.get("data", {})
-        for model in metrics.keys():
+        for label in metrics.keys():
+            model = model_of_curve_label(label)
             data_tmp.append(
-                {"name": model, "points": metrics[model], "model": model, "db": db_name}
+                {"name": model, "points": metrics[label], "model": model,
+                 "db": db_name, "series": db_name + label[len(model):]}
             )
 
+    # Already in model-name order, which is the tab order below.
     for model in sorted({d["model"] for d in data_tmp}):
-        model_curves = [d for d in data_tmp if d["model"] == model]
-        tmp = {}
-        for curve in model_curves:
-            # x : y for each curve, where x is fpr and y is tpr, and the key is the database name
-            tmp[curve["db"]] = curve["points"]
         # Series order inside each model's plot; see combined_roc_curves.
-        data.append(order_dataset_keys(tmp, dataset_order))
+        model_curves = sort_by_dataset(
+            [d for d in data_tmp if d["model"] == model], dataset_order,
+            key=lambda c: c["db"],
+        )
+        # x : y for each curve, where x is recall and y is precision, and the key is the dataset
+        data.append({c["series"]: c["points"] for c in model_curves})
         data_labels.append({"name": model, "title": model})
-
-    # Order data by model_name
-    data = [d for _, d in sorted(zip(data_labels, data), key=lambda x: x[0]["name"])]
-    data_labels = sorted(data_labels, key=lambda x: x["name"])
+        extra_series.append(
+            no_skill_series(prevalence.get((c["db"], model)) for c in model_curves)
+        )
 
     pr_block = {
         "id": "combined_pr_curves",
         "section_name": "PR Curves",
+        "description": NO_SKILL_NOTE,
         "plot_type": "linegraph",
         "pconfig": {
             "id": "combined_pr_curves",
@@ -780,6 +871,7 @@ def combined_pr_curves(pr_data, outdir, dataset_order=None):
             "ylab": "Precision",
             "data_labels": data_labels,
             "showlegend": True,
+            "extra_series": extra_series,
         },
         "data": data,
     }
@@ -806,34 +898,57 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
                 return None
         return None
 
+    def _cell(value, ci, n=None, pi=None, extra=""):
+        """`0.734 [0.71, 0.75] · n=11,662 · π=0.091` (+ extra)."""
+        text = f"{value:.3f} {ci}".strip() if value is not None else (ci or "")
+        if n is not None:
+            text += f" · n={int(n):,}"
+        if pi is not None:
+            text += f" · π={pi:.3f}"
+        return text + extra
+
     roc_mean, roc_ci = {}, {}
     pr_mean, pr_ci = {}, {}
     het_mean, het_ci = {}, {}
+    het_pr_mean, het_pr_ci = {}, {}
+    structure = False
     for block_id, block in combined_metrics.items():
         db_name = block_id.replace("combined_metrics_table_", "")
         metrics = block.get("data", {})
         for model, row in metrics.items():
+            # Structure-assisted rows are marked, since their numbers rest on
+            # AF3 complexes and on the structure-covered subset only.
+            if row.get("Structure-assisted") == "yes":
+                structure = True
+                model = f"{model}{STRUCTURE_MARK}"
+            n, pi = row.get("Pairs"), _to_float(row.get("Prevalence"))
+            h_n, h_pos = row.get("Hetero pairs"), row.get("Hetero positives")
+            h_pi = h_pos / h_n if h_n and h_pos is not None else None
+            lift = _to_float(row.get("AP lift"))
             rv = _to_float(row.get("ROC AUC"))
             pv = _to_float(row.get("PR AP"))
             hv = _to_float(row.get("Hetero ROC AUC"))
+            hp = _to_float(row.get("Hetero PR AP"))
             if rv is not None:
                 roc_mean.setdefault(model, {})[db_name] = rv
             if pv is not None:
                 pr_mean.setdefault(model, {})[db_name] = pv
             if hv is not None:
                 het_mean.setdefault(model, {})[db_name] = hv
-            hc = row.get("Hetero ROC AUC CI") or ""
-            het_ci.setdefault(model, {})[db_name] = (
-                f"{hv:.3f} {hc}".strip() if hv is not None else hc
-            )
-            rc = row.get("ROC AUC CI") or ""
-            pc = row.get("PR AP CI") or ""
-            roc_ci.setdefault(model, {})[db_name] = (
-                f"{rv:.3f} {rc}".strip() if rv is not None else (rc or "")
-            )
-            pr_ci.setdefault(model, {})[db_name] = (
-                f"{pv:.3f} {pc}".strip() if pv is not None else (pc or "")
-            )
+            if hp is not None:
+                het_pr_mean.setdefault(model, {})[db_name] = hp
+            het_ci.setdefault(model, {})[db_name] = _cell(
+                hv, row.get("Hetero ROC AUC CI"), h_n, h_pi)
+            # Hetero lift against the hetero prevalence: the full-set lift
+            # does not carry over when the two prevalences differ.
+            het_pr_ci.setdefault(model, {})[db_name] = _cell(
+                hp, row.get("Hetero PR AP CI"), h_n, h_pi,
+                f" · lift={hp / h_pi:.2f}×" if hp is not None and h_pi else "")
+            roc_ci.setdefault(model, {})[db_name] = _cell(
+                rv, row.get("ROC AUC CI"), n, pi)
+            pr_ci.setdefault(model, {})[db_name] = _cell(
+                pv, row.get("PR AP CI"), n, pi,
+                f" · lift={lift:.2f}×" if lift is not None else "")
 
     # Sort rows (models) alphabetically, columns (datasets) by --mqc_order.
     # Every row carries every column (None where undefined or suppressed):
@@ -845,21 +960,25 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         )
         return {m: {db: table[m].get(db) for db in cols} for m in sorted(table)}
 
-    # The self-pair indicator as a reference row on the full-set AUC heatmap:
-    # what "positive iff domain_a == domain_b" scores, with no features. Taken
-    # from the model with the most scored pairs (the trained models share the
-    # full test set; graph models cover a subset).
+    # The self-pair indicator as a reference row of the AUC CI table (not of
+    # the heatmap: it is a baseline, not a model, and must not be coloured as
+    # one): what "positive iff domain_a == domain_b" scores, with no features.
+    # Taken from the predictor with the most scored pairs, on its rows -- not
+    # necessarily the full split.
     indicator = {}
     for block_id, block in combined_metrics.items():
         db_name = block_id.replace("combined_metrics_table_", "")
         rows = [r for r in block.get("data", {}).values()
-                if _to_float(r.get("Self-indicator AUC")) is not None]
+                if r.get("Self-indicator AUC") not in (None, "")]
         if rows:
             best = max(rows, key=lambda r: r.get("Pairs") or 0)
-            indicator[db_name] = _to_float(best["Self-indicator AUC"])
+            v = best["Self-indicator AUC"]
+            fv = _to_float(v)
+            indicator[db_name] = (
+                f"{fv:.3f} · n={int(best.get('Pairs') or 0):,}" if fv is not None else str(v)
+            )
     if indicator:
-        roc_mean[SELF_INDICATOR_ROW] = indicator
-        roc_ci[SELF_INDICATOR_ROW] = {db: f"{v:.3f}" for db, v in indicator.items()}
+        roc_ci[SELF_INDICATOR_ROW] = indicator
 
     roc_mean = _rows(roc_mean)
     pr_mean = _rows(pr_mean)
@@ -867,18 +986,22 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
     pr_ci = _rows(pr_ci)
     het_mean = _rows(het_mean)
     het_ci = _rows(het_ci)
+    het_pr_mean = _rows(het_pr_mean)
+    het_pr_ci = _rows(het_pr_ci)
+    caveat = f" {STRUCTURE_MARK.strip()} = structure-assisted. {AF3_CAVEAT}" if structure else ""
 
-    def _write_heatmap(block_id, title, data, fname):
+    def _write_heatmap(block_id, title, data, fname, stops=colstops, description=""):
         block = {
             "id": block_id,
             "section_name": title,
+            "description": (description + caveat).strip(),
             "plot_type": "heatmap",
             "pconfig": {
                 "id": block_id,
                 "title": title,
-                "xlab": "Database",
+                "xlab": "Dataset",
                 "ylab": "Model",
-                "colstops": colstops,
+                "colstops": stops,
                 "min": 0.0,
                 "max": 1.0,
                 "decimalPlaces": 3,
@@ -921,6 +1044,9 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         "AUC Heatmap",
         roc_mean,
         "model_performance_heatmap_roc_mqc.json",
+        stops=auc_colstops,
+        description="Colour diverges at 0.5 (chance). Each model is scored on "
+        "its own pairs; n and prevalence are in the CI table below.",
     )
     _write_ci_table(
         "model_performance_heatmap_roc_ci",
@@ -929,18 +1055,41 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         "model_performance_heatmap_roc_ci_mqc.json",
     )
 
+    def _has_text(table):
+        return any(v for row in table.values() for v in row.values())
+
+    # The CI tables are written whenever they hold text, heatmap or not: with
+    # no same-family pairs anywhere there is no hetero number to colour, but
+    # "= full (no same-family pairs)" still has to reach the combined report.
     if het_mean:
         _write_heatmap(
             "model_performance_heatmap_hetero_roc",
-            "Hetero-pair AUC Heatmap (self-pairs removed)",
+            "Hetero-pair AUC Heatmap (same-family pairs removed)",
             het_mean,
             "model_performance_heatmap_hetero_roc_mqc.json",
+            stops=auc_colstops,
         )
+    if _has_text(het_ci):
         _write_ci_table(
             "model_performance_heatmap_hetero_roc_ci",
             "Hetero-pair AUC Heatmap",
             het_ci,
             "model_performance_heatmap_hetero_roc_ci_mqc.json",
+        )
+    if het_pr_mean:
+        _write_heatmap(
+            "model_performance_heatmap_hetero_pr",
+            "Hetero-pair Average Precision Heatmap (same-family pairs removed)",
+            het_pr_mean,
+            "model_performance_heatmap_hetero_pr_mqc.json",
+            description=AP_DESCRIPTION,
+        )
+    if _has_text(het_pr_ci):
+        _write_ci_table(
+            "model_performance_heatmap_hetero_pr_ci",
+            "Hetero-pair Average Precision Heatmap",
+            het_pr_ci,
+            "model_performance_heatmap_hetero_pr_ci_mqc.json",
         )
 
     _write_heatmap(
@@ -948,6 +1097,7 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         "Average Precision Heatmap",
         pr_mean,
         "model_performance_heatmap_pr_mqc.json",
+        description=AP_DESCRIPTION,
     )
     _write_ci_table(
         "model_performance_heatmap_pr_ci",

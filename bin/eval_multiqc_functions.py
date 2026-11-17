@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -15,6 +16,52 @@ import networkx as nx
 import logging
 
 from load_data_gm import DEFAULT_PPI_SCORE_CUTOFF, load_ppi as gm_load_ppi
+
+
+### Report strings shared by eval_multiqc.py and combine_eval.py ###
+
+#: Structure features are computed on AF3 complexes; see CLAUDE.md, "Structure
+#: features".
+AF3_CAVEAT = (
+    "Structure-assisted models read AlphaFold3 complexes. Positives come from "
+    "PDB co-crystals that are in AF3's training data, so interface features "
+    "partly measure AF3's recall of known complexes rather than predict an "
+    "interaction; these models also score only DDIs with a structure."
+)
+
+#: D9: a dataset without same-family pairs has hetero = full.
+NO_SELF_PAIRS_FULL = "= full (no same-family pairs)"
+NO_SELF_PAIRS_NA = "n/a — no same-family pairs"
+
+_CURVE_LABEL = re.compile(r"^(?P<model>.*) \(n=[\d,]+\)$")
+
+
+def curve_label(model, n) -> str:
+    """Legend name of one model's curve: the model plus its scored n."""
+    return f"{model} (n={int(n or 0):,})"
+
+
+def model_of_curve_label(label) -> str:
+    """Inverse of `curve_label`; a bare model name passes through."""
+    m = _CURVE_LABEL.match(str(label))
+    return m.group("model") if m else str(label)
+
+
+NO_SKILL_NOTE = (
+    "Dashed grey line: a no-skill ranker, at precision = prevalence of the "
+    "scored pairs (one line per distinct prevalence among the curves shown)."
+)
+
+
+def no_skill_series(prevalences) -> list:
+    """MultiQC `extra_series`: a dashed PR line at each distinct prevalence."""
+    levels = sorted({round(float(p), 4) for p in prevalences
+                     if p is not None and p == p})
+    return [
+        {"name": f"no skill (prevalence {p:.3f})", "pairs": [[0.0, p], [1.0, p]],
+         "dash": "dash", "color": "#7f7f7f", "width": 1}
+        for p in levels
+    ]
 
 
 ### Bootstrap helpers ###
@@ -77,14 +124,15 @@ def count_valid(samples) -> int:
 
 
 def paired_bootstrap_diff(samples_a, samples_b) -> float:
-    """Two-sided p-value that metric_a differs from metric_b.
+    """Bootstrap metric-difference p-value: two-sided sign fraction x 2.
 
-    Operates on the per-resample arrays returned by `bootstrap_metric`. When the
-    arrays come from independent draws (the scatter-evaluation case here, where
-    each per-model JSON is built without cross-model index alignment), this is
-    an unpaired stochastic-dominance approximation rather than the textbook
-    paired-bootstrap test. It is still informative for ordering models; treat
-    p-values as indicative rather than calibrated.
+    Operates on the per-resample arrays returned by `bootstrap_metric`. It is a
+    paired test only when both arrays come from the same index draws on
+    aligned rows -- same pair set, same row order, same seed and resample
+    count. eval_one.py key-sorts every model's rows and records
+    `pair_set_sha1`; callers must compare only models whose digests match
+    (otherwise the draws are independent and the result is meaningless).
+    Even then its calibration is not established: read p-values as indicative.
 
     Resample i of `a` is compared with resample i of `b` and nothing else, so a
     resample that is NaN on *either* side drops from both. Filtering each side
@@ -105,6 +153,17 @@ def paired_bootstrap_diff(samples_a, samples_b) -> float:
     p_pos = float((diff <= 0).mean())
     p_neg = float((diff >= 0).mean())
     return float(min(1.0, 2.0 * min(p_pos, p_neg)))
+
+
+def holm(pvalues: dict) -> dict:
+    """Holm step-down adjusted p-values for `{key: p}` (NaN passes through)."""
+    finite = sorted((p, k) for k, p in pvalues.items() if p == p)
+    m = len(finite)
+    adjusted, running = {}, 0.0
+    for i, (p, k) in enumerate(finite):
+        running = max(running, min(1.0, (m - i) * p))
+        adjusted[k] = running
+    return {k: adjusted.get(k, float("nan")) for k in pvalues}
 
 
 ### Retired report blocks ###
@@ -129,8 +188,8 @@ def is_retired_block(name) -> bool:
 
 ### Dataset ordering (params.mqc_order) ###
 #
-# A "dataset" is one (database, test variant) run label -- `random_balanced`,
-# `minimal_leakage_hcni_realistic`, `external_test`. Several report sections
+# A "dataset" is one (database, test variant) run label -- `random_1_1`,
+# `minimal_leakage_hcni_1_10`, `external_test`. Several report sections
 # exist once per dataset (`db_database_analysis_<ds>`, `model_eval_metrics_<ds>`)
 # and several more carry every dataset inside one block (the tabs of the
 # combined ROC/PR line graphs and the by-source bar graph, the columns of the
@@ -141,7 +200,7 @@ def is_retired_block(name) -> bool:
 
 
 def variant_of_split(test_split) -> str:
-    """`test_balanced` -> `balanced`, `test` -> `test`.
+    """`test_<variant>` -> `<variant>` (`test_1_10` -> `1_10`), `test` -> `test`.
 
     The same rule as `discoverSplits()` in the utils subworkflow, which is where
     the pipeline's variant names come from. Only a fallback: EVALUATION passes
@@ -204,7 +263,7 @@ def dataset_of(name, order):
     """The dataset in `order` that `name` names, or None.
 
     Block ids are `<base>_<dataset>`, and one dataset name can be a suffix of
-    another (`random` vs `random_balanced`), so the longest match wins.
+    another (`random` vs `random_1_1`), so the longest match wins.
     """
     best = None
     for dataset in order:
@@ -379,7 +438,8 @@ def analyse_database(
     Analyse the train / validation / test splits of an input dir.
 
     test_split names which test set of the database to profile: a database with
-    an internal test set ships `test_balanced` and `test_realistic`, and each is
+    an internal test set ships one or more `test_<variant>` splits (currently
+    `test_1_1` and `test_1_10`), and each is
     reported as its own dataset, sharing the same train and validation splits.
 
     ppi_score_cutoff: PPIs below it are not counted -- the same
@@ -456,7 +516,8 @@ def aggregate_per_model_metrics(per_model_files):
                      pr:[[recall,precision]...], roc_auc, pr_ap,
                      roc_auc_ci, pr_ap_ci, roc_auc_samples, pr_ap_samples,
                      bootstrap_n, roc_auc_n_valid, pr_ap_n_valid, ranking_note,
-                     strata, self_indicator_auc}
+                     strata, self_indicator_auc, prevalence, ap_no_skill,
+                     ap_lift, ap_normalised, pair_set_sha1, per_source}
     """
     metrics_rows = []
     metrics_aucap = {}
@@ -489,9 +550,16 @@ def aggregate_per_model_metrics(per_model_files):
             ("ranking_note", "RANKING_NOTE"),
             ("strata", "STRATA"),
             ("self_indicator_auc", "SELF_INDICATOR_AUC"),
+            ("prevalence", "PREVALENCE"),
+            ("ap_lift", "AP_LIFT"),
+            ("ap_normalised", "AP_NORMALISED"),
+            ("pair_set_sha1", "PAIR_SET"),
         ):
             if obj.get(src) is not None:
                 entry[dst] = obj[src]
+        coverage = (obj.get("per_source") or {}).get("ALL")
+        if coverage:
+            entry["COVERAGE"] = coverage
         entry["SAMPLES"] = obj["metrics_summary"]["Samples"]
         metrics_aucap[name] = entry
         roc_pairs = obj["roc"]

@@ -16,9 +16,17 @@ from pathlib import Path
 import json
 import multiqc
 import shutil
+import numpy as np
 from eval_multiqc_functions import (
+    AF3_CAVEAT,
+    NO_SELF_PAIRS_FULL,
+    NO_SELF_PAIRS_NA,
+    NO_SKILL_NOTE,
     analyse_database,
     aggregate_per_model_metrics,
+    curve_label,
+    holm,
+    no_skill_series,
     paired_bootstrap_diff,
     variant_of_split,
 )
@@ -48,6 +56,24 @@ THRESHOLD_CAVEAT = (
     "ROC AUC / PR AP (threshold-free); read these columns as secondary."
 )
 
+PAIRS_NOTE = (
+    "Any model can abstain: an ML model drops pairs whose features do not "
+    "resolve, structure-feature combos (`_all` included) score only DDIs with "
+    "an AF3 complex, and graph models score only pairs their network reaches. "
+    "Models with different Pairs are not scored on the same DDIs."
+)
+
+DIFFERENT_SETS = "different scored sets"
+
+PAIRWISE_CAPTION = (
+    "Bootstrap AUC-difference, two-sided sign-fraction ×2, Holm-adjusted "
+    "within this dataset. Computed only for two models that scored the "
+    f"identical pair set (resamples paired on aligned rows); \"{DIFFERENT_SETS}\" "
+    "otherwise. `< x` means no resample crossed zero, x = 1/valid resamples. "
+    "The calibration of these p-values is not established: read them as "
+    "indicative."
+)
+
 
 def parse_arguments():
     p = argparse.ArgumentParser(
@@ -75,8 +101,10 @@ def parse_arguments():
     p.add_argument(
         "--test_split",
         default="test",
-        help="Test split of --database to profile (e.g. test_balanced). Each "
-             "test set of a database is reported as its own dataset.",
+        help="Test split of --database to profile: `test` or any "
+             "`test_<variant>` (currently test_1_1, in distribution, and "
+             "test_1_10, out of distribution). Each test set of a database is "
+             "reported as its own dataset.",
     )
     p.add_argument(
         "--db_id",
@@ -87,9 +115,19 @@ def parse_arguments():
     p.add_argument(
         "--variant",
         default=None,
-        help="Test variant of --db_id (`balanced`, `realistic`, or `test` for a "
-             "database with a single test split). Default: derived from "
-             "--test_split. Recorded in source_accuracy.json.",
+        help="Test variant of --db_id (`<variant>` of a `test_<variant>` split, "
+             "e.g. `1_1` / `1_10`, or `test` for a database with a single test "
+             "split). Default: derived from --test_split. Recorded in "
+             "source_accuracy.json.",
+    )
+    p.add_argument(
+        "--structure_features",
+        default=None,
+        help="Comma-separated structure features of this run "
+             "(params.machine_learning_features_structure minus --skip). Models "
+             "using one -- its singleton or `_all` -- are marked structure-"
+             "assisted and carry the AF3 training-data caveat. Omitted: no "
+             "model is marked.",
     )
     p.add_argument(
         "--ppi_score_cutoff",
@@ -202,6 +240,7 @@ def write_multiqc_json_metrics(
     metrics_df,
     outdir,
     prefix,
+    structure_features=(),
 ) -> None:
     # Write MultiQC JSON blocks for metrics, ROC and PR curves
     # @metrics_aucap: dict with AUC and AP metrics per model
@@ -236,14 +275,40 @@ def write_multiqc_json_metrics(
         return text
 
     def _hetero(entry):
-        """(AUC, CI text, AP) on hetero-pairs; NaN + the reason when suppressed."""
+        """Hetero-pair columns; NaN + the reason when suppressed or = full."""
         h = (entry.get("STRATA") or {}).get("hetero")
+        nan = float("nan")
         if not h:
-            return float("nan"), "", float("nan")
-        if h.get("note"):
-            return float("nan"), f"n/a ({h['note']})", float("nan")
-        lo, hi = h["roc_auc_ci"]
-        return float(h["roc_auc"]), f"[{lo:.3f}, {hi:.3f}]", float(h["pr_ap"])
+            return {"Hetero ROC AUC": nan, "Hetero ROC AUC CI": "",
+                    "Hetero PR AP": nan, "Hetero PR AP CI": ""}
+        cols = {"Hetero pairs": int(h.get("n", 0)),
+                "Hetero positives": int(h.get("n_pos", 0))}
+        # D9: without same-family pairs the stratum is the full set, and a
+        # second copy of the same numbers would read as a second result.
+        if h.get("same_as_full"):
+            text = NO_SELF_PAIRS_FULL
+        elif h.get("note"):
+            text = f"n/a ({h['note']})"
+        else:
+            (rlo, rhi), (plo, phi) = h["roc_auc_ci"], h["pr_ap_ci"]
+            return {**cols,
+                    "Hetero ROC AUC": float(h["roc_auc"]),
+                    "Hetero ROC AUC CI": f"[{rlo:.3f}, {rhi:.3f}]",
+                    "Hetero PR AP": float(h["pr_ap"]),
+                    "Hetero PR AP CI": f"[{plo:.3f}, {phi:.3f}]"}
+        return {**cols, "Hetero ROC AUC": nan, "Hetero ROC AUC CI": text,
+                "Hetero PR AP": nan, "Hetero PR AP CI": text}
+
+    def _self_indicator(entry):
+        v = float(entry.get("SELF_INDICATOR_AUC", float("nan")))
+        if v == v:
+            return f"{v:.3f}"
+        if ((entry.get("STRATA") or {}).get("hetero") or {}).get("same_as_full"):
+            return NO_SELF_PAIRS_NA
+        return "n/a"
+
+    structure_models = [m for m in metrics_aucap
+                        if is_structure_assisted(m, structure_features)]
 
     # --- Block 1: AUC/AP table -----------------------------------------------
     # Numeric mean kept as float (enables table colour-scale + downstream
@@ -251,23 +316,28 @@ def write_multiqc_json_metrics(
     table_id = f"{prefix}_metrics_table"
     table_data = {}
     for m in metrics_aucap:
-        h_auc, h_ci, h_ap = _hetero(metrics_aucap[m])
+        e = metrics_aucap[m]
         table_data[m] = {
-            "Pairs": int(metrics_aucap[m].get("SAMPLES", 0)),
-            "ROC AUC": float(metrics_aucap[m]["ROC_AUC"]),
-            "ROC AUC CI": _fmt_ci(metrics_aucap[m], "ROC_AUC"),
-            "PR AP": float(metrics_aucap[m]["PR_AP"]),
-            "PR AP CI": _fmt_ci(metrics_aucap[m], "PR_AP"),
-            "Hetero ROC AUC": h_auc,
-            "Hetero ROC AUC CI": h_ci,
-            "Hetero PR AP": h_ap,
-            "Self-indicator AUC": float(
-                metrics_aucap[m].get("SELF_INDICATOR_AUC", float("nan"))
-            ),
+            "Pairs": int(e.get("SAMPLES", 0)),
+            "Prevalence": float(e.get("PREVALENCE", float("nan"))),
+            "ROC AUC": float(e["ROC_AUC"]),
+            "ROC AUC CI": _fmt_ci(e, "ROC_AUC"),
+            "PR AP": float(e["PR_AP"]),
+            "PR AP CI": _fmt_ci(e, "PR_AP"),
+            "AP lift": float(e.get("AP_LIFT", float("nan"))),
+            **_hetero(e),
+            # A string, so the reason can stand where the number would be
+            # (and the column is a reference, so it stays uncoloured).
+            "Self-indicator AUC": _self_indicator(e),
+            "Structure-assisted": "yes" if m in structure_models else "no",
         }
+    description = PAIRS_NOTE
+    if structure_models:
+        description += " " + AF3_CAVEAT
     table_block = {
         "id": table_id,
         "section_name": "Model performance (AUC / AP)",
+        "description": description,
         "plot_type": "table",
         "pconfig": {
             "id": f"{prefix}_metrics_table",
@@ -277,10 +347,45 @@ def write_multiqc_json_metrics(
         "headers": {
             "Pairs": {
                 "title": "Pairs",
-                "description": "Test pairs this model scored (graph models "
-                "abstain on pairs without PPI evidence, so their rows differ).",
+                "description": "Test pairs this model scored. " + PAIRS_NOTE,
                 "scale": False,
                 "format": "{:,.0f}",
+            },
+            "Prevalence": {
+                "title": "Prevalence",
+                "description": "Fraction of positives among the pairs this "
+                "model scored -- the AP of a no-skill ranker.",
+                "scale": False,
+                "format": "{:,.3f}",
+            },
+            "AP lift": {
+                "title": "AP lift",
+                "description": "PR AP / prevalence: AP relative to this "
+                "population's no-skill baseline (1 = no skill). Still "
+                "prevalence-dependent, so not comparable across test sets.",
+                "scale": False,
+                "format": "{:,.2f}",
+            },
+            "Hetero pairs": {
+                "title": "Hetero pairs",
+                "description": "Scored pairs of two different domain families.",
+                "scale": False,
+                "format": "{:,.0f}",
+            },
+            "Hetero positives": {
+                "title": "Hetero positives",
+                "scale": False,
+                "format": "{:,.0f}",
+            },
+            "Hetero PR AP CI": {
+                "title": "Hetero PR AP 95% CI",
+                "scale": False,
+            },
+            "Structure-assisted": {
+                "title": "Structure-assisted",
+                "description": "Uses an AF3-complex structure feature. "
+                + AF3_CAVEAT,
+                "scale": False,
             },
             "ROC AUC": {
                 "title": "ROC AUC",
@@ -306,8 +411,8 @@ def write_multiqc_json_metrics(
             },
             "Hetero ROC AUC": {
                 "title": "Hetero ROC AUC",
-                "description": "ROC AUC on pairs of two different domains only "
-                "(self-pairs removed).",
+                "description": "ROC AUC on pairs of two different domain "
+                "families only (same-family pairs removed).",
                 "min": 0.0,
                 "max": 1.0,
                 "scale": "RdYlGn",
@@ -328,11 +433,8 @@ def write_multiqc_json_metrics(
                 "title": "Self-indicator AUC",
                 "description": "ROC AUC of predicting 'positive iff "
                 "domain_a == domain_b' on this model's pairs: the score "
-                "available with no features at all.",
-                "min": 0.0,
-                "max": 1.0,
-                "scale": "RdYlGn",
-                "format": "{:,.3f}",
+                "available with no features at all. A reference, not a model.",
+                "scale": False,
             },
         },
         "data": table_data,
@@ -345,8 +447,11 @@ def write_multiqc_json_metrics(
     # empty one, with `ranking_note` saying why); an empty series is left out
     # rather than drawn as nothing.
     roc_id = f"{prefix}_roc"
+    # Legend names carry each model's scored n: curves of models that scored
+    # different subsets are not over the same pairs.
     roc_data = {
-        m: to_pairs(*roc_curves[m]) for m in metrics_aucap if len(roc_curves[m][0])
+        curve_label(m, metrics_aucap[m].get("SAMPLES", 0)): to_pairs(*roc_curves[m])
+        for m in metrics_aucap if len(roc_curves[m][0])
     }
     roc_block = {
         "id": roc_id,
@@ -373,13 +478,19 @@ def write_multiqc_json_metrics(
     # --- Block 3: PR block ---
     pr_id = f"{prefix}_pr"
     pr_data = {
-        m: to_pairs(*pr_curves[m]) for m in metrics_aucap if len(pr_curves[m][0])
+        curve_label(m, metrics_aucap[m].get("SAMPLES", 0)): to_pairs(*pr_curves[m])
+        for m in metrics_aucap if len(pr_curves[m][0])
     }
     pr_block = {
         "id": pr_id,
         "section_name": "Precision Recall curves",
+        "description": NO_SKILL_NOTE,
         "plot_type": "linegraph",
         "pconfig": {
+            "extra_series": no_skill_series(
+                metrics_aucap[m].get("PREVALENCE")
+                for m in metrics_aucap if len(pr_curves[m][0])
+            ),
             "id": pr_id,
             "title": "Precision-Recall curves",
             "subtitle": f"{n_models} models",
@@ -399,7 +510,9 @@ def write_multiqc_json_metrics(
 
     # --- Block 4: Metrics overview block ---
     metrics_id = "model_eval_metrics"
-    metrics_data = metrics_df.set_index("Model").T.to_dict()
+    # Row-wise, so each column keeps its own dtype: the transposed frame
+    # turned the TP/TN/FP/FN counts into floats.
+    metrics_data = metrics_df.set_index("Model").to_dict(orient="index")
     metrics_block = {
         "id": metrics_id,
         "section_name": "Overview Model Evaluation Metrics",
@@ -408,7 +521,7 @@ def write_multiqc_json_metrics(
         "pconfig": {
             "id": metrics_id,
             "title": "Overview Model Evaluation Metrics",
-            "col1_header": "Metric",
+            "col1_header": "Model",
         },
         "data": metrics_data,
     }
@@ -416,33 +529,22 @@ def write_multiqc_json_metrics(
         json.dump(metrics_block, f, indent=2)
 
     # --- Block 5: Pairwise significance (Phase 4) ---
-    # Built only when every model carries bootstrap samples. Uses the unpaired
-    # stochastic-dominance approximation documented on paired_bootstrap_diff.
+    # Built only when at least two models carry bootstrap samples.
     sample_models = sorted(
         m for m in metrics_aucap if "ROC_AUC_SAMPLES" in metrics_aucap[m]
     )
     if len(sample_models) >= 2:
         pairwise_id = f"{prefix}_pairwise_significance"
-        pair_data = {}
-        for a in sample_models:
-            row = {}
-            for b in sample_models:
-                if a == b:
-                    row[b] = "—"
-                    continue
-                p = paired_bootstrap_diff(
-                    metrics_aucap[a]["ROC_AUC_SAMPLES"],
-                    metrics_aucap[b]["ROC_AUC_SAMPLES"],
-                )
-                row[b] = f"{p:.3f}"
-            pair_data[a] = row
+        pair_data = pairwise_table(metrics_aucap, sample_models)
         pairwise_block = {
             "id": pairwise_id,
-            "section_name": "Pairwise significance (ROC AUC)",
+            "section_name": "Bootstrap AUC difference (ROC AUC)",
+            "description": PAIRWISE_CAPTION,
             "plot_type": "table",
             "pconfig": {
                 "id": pairwise_id,
-                "title": "Pairwise significance — ROC AUC (two-sided p-value)",
+                "title": "Bootstrap AUC-difference, two-sided sign-fraction ×2 "
+                "(Holm-adjusted p)",
                 "col1_header": "Model",
             },
             "data": pair_data,
@@ -456,7 +558,136 @@ def write_multiqc_json_metrics(
             f"({len(sample_models)} models)"
         )
 
+    # --- Block 6: Coverage by class ---
+    coverage = coverage_table(metrics_aucap)
+    if coverage:
+        coverage_id = f"{prefix}_coverage"
+        coverage_block = {
+            "id": coverage_id,
+            "section_name": "Coverage by class",
+            "description": (
+                "Test DDIs each model scored, per class, against the split's "
+                "totals. A model whose positive and negative coverage differ "
+                f"by more than {COVERAGE_GAP_PP:g} percentage points is scored "
+                "on a label-shifted subset, which can move every metric "
+                "without any change in skill."
+            ),
+            "plot_type": "table",
+            "pconfig": {
+                "id": coverage_id,
+                "title": "Coverage by class",
+                "col1_header": "Model",
+            },
+            "headers": {
+                "Positives scored": {"title": "Positives scored", "scale": False},
+                "Negatives scored": {"title": "Negatives scored", "scale": False},
+                "Coverage gap (pp)": {
+                    "title": "Coverage gap (pp)",
+                    "description": "Positive minus negative coverage, in "
+                    "percentage points.",
+                    "scale": False,
+                    "format": "{:,.1f}",
+                },
+                "Flag": {"title": "Flag", "scale": False},
+            },
+            "data": coverage,
+        }
+        with open(os.path.join(outdir, f"{coverage_id}_mqc.json"), "w") as f:
+            json.dump(coverage_block, f, indent=2)
+
     logging.info("[OK] Wrote MultiQC JSON (ROC + PR)")
+
+
+def is_structure_assisted(model, structure_features) -> bool:
+    """`<ml_model>_<feature>` names a structure feature, or `_all` with any.
+
+    Model names are `<ml_model>_<combo>` (the prediction's parent directory),
+    where combo is one feature or `all`; graph models match nothing.
+    """
+    features = list(structure_features or [])
+    return bool(features) and any(
+        model.endswith(f"_{f}") for f in features + ["all"]
+    )
+
+
+def pairwise_table(metrics_aucap, models) -> dict:
+    """Holm-adjusted bootstrap AUC-difference p-values, `{a: {b: text}}`.
+
+    A cell is computed only when both models scored the identical canonical
+    pair set (`PAIR_SET`, written by eval_one.py, which also key-sorts the
+    rows): only then are the two bootstrap draws paired. Otherwise "—" +
+    footnote. Holm runs over the unordered pairs of this dataset (the matrix
+    is symmetric). A p of 0 prints as `< 1/n_valid`, the resolution the
+    resamples allow.
+    """
+    raw, n_valid = {}, {}
+    for i, a in enumerate(models):
+        for b in models[i + 1:]:
+            ea, eb = metrics_aucap[a], metrics_aucap[b]
+            if ea.get("PAIR_SET") is None or ea.get("PAIR_SET") != eb.get("PAIR_SET"):
+                continue
+            sa = np.asarray(ea["ROC_AUC_SAMPLES"], dtype=np.float64)
+            sb = np.asarray(eb["ROC_AUC_SAMPLES"], dtype=np.float64)
+            k = int((np.isfinite(sa) & np.isfinite(sb)).sum()) if sa.size == sb.size else 0
+            if k == 0:
+                continue
+            raw[(a, b)] = paired_bootstrap_diff(sa, sb)
+            n_valid[(a, b)] = k
+    adjusted = holm(raw)
+
+    def _cell(a, b):
+        key = (a, b) if (a, b) in adjusted else (b, a)
+        if key not in adjusted:
+            return f"— ({DIFFERENT_SETS})"
+        p = adjusted[key]
+        floor = 1.0 / n_valid[key]
+        return f"< {floor:.3g}" if p < floor else f"{p:.3f}"
+
+    def _row(a):
+        # Each model's scored population, so a "different scored sets" cell
+        # can be read against both sides' n and prevalence.
+        pi = metrics_aucap[a].get("PREVALENCE")
+        row = {
+            "Pairs": metrics_aucap[a].get("SAMPLES"),
+            "Prevalence": round(pi, 3) if pi is not None and np.isfinite(pi) else None,
+        }
+        row.update({b: ("—" if a == b else _cell(a, b)) for b in models})
+        return row
+
+    return {a: _row(a) for a in models}
+
+
+#: Coverage-by-class gap that is flagged.
+COVERAGE_GAP_PP = 5.0
+
+
+def coverage_table(metrics_aucap) -> dict:
+    """Scored / total by class per model, from eval_one.py's `per_source.ALL`."""
+    rows = {}
+    for m, e in metrics_aucap.items():
+        c = e.get("COVERAGE")
+        if not c or "n_scored_pos" not in c:
+            continue
+        rates = []
+        cells = {}
+        for label, scored, total in (
+            ("Positives scored", c["n_scored_pos"], c.get("n_pos", 0)),
+            ("Negatives scored", c["n_scored_neg"], c.get("n_neg", 0)),
+        ):
+            rate = 100.0 * scored / total if total else float("nan")
+            rates.append(rate)
+            cells[label] = f"{scored:,} / {total:,} ({rate:.1f}%)" if total else f"{scored:,} / 0"
+        gap = rates[0] - rates[1]
+        cells["Coverage gap (pp)"] = gap
+        cells["Flag"] = (
+            f"pos/neg coverage differ by > {COVERAGE_GAP_PP:g} pp"
+            if abs(gap) > COVERAGE_GAP_PP else ""
+        )
+        if cells["Flag"]:
+            print(f"[WARN] {m}: positive coverage {rates[0]:.1f}% vs negative "
+                  f"{rates[1]:.1f}%")
+        rows[m] = cells
+    return rows
 
 
 def write_multiqc_config(outdir, enrichment_ids=()) -> str:
@@ -496,6 +727,7 @@ def write_multiqc_config(outdir, enrichment_ids=()) -> str:
     pr_blocks = pick(r"_pr$")
     metric_blocks = pick(r"model_eval_metrics$")
     pairwise_blocks = pick(r"_pairwise_significance$")
+    coverage_blocks = pick(r"_coverage$")
 
     db_blocks = pick(r"database_analysis")
 
@@ -503,6 +735,7 @@ def write_multiqc_config(outdir, enrichment_ids=()) -> str:
         white_tbl
         + metric_blocks
         + auc_ap_tbl
+        + coverage_blocks
         + pairwise_blocks
         + roc_blocks
         + pr_blocks
@@ -726,6 +959,9 @@ def main():
         metrics_df,
         args.out_dir,
         PREFIX,
+        structure_features=[
+            f.strip() for f in (args.structure_features or "").split(",") if f.strip()
+        ],
     )
     print("[INFO] MultiQC JSON blocks written for model evaluation metrics and curves.")
 
