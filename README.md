@@ -367,8 +367,8 @@ What that takes, beyond passing `--seed` around:
   order, and `random_state` does not pin it. The CPU fallback used under
   `--allow_cpu_ml` takes `n_jobs=1` for the same reason -- sklearn accumulates
   per-tree probabilities under joblib, so `predict_proba` depends on thread
-  scheduling in its last bits. That is enough to move the MCC-tuned decision
-  threshold, and to perturb the scores the hyperparameter search ranks by.
+  scheduling in its last bits. That is enough to move the validation decision
+  thresholds, and to perturb the scores the hyperparameter search ranks by.
 - **Sorted channel groups.** `groupTuple()` and `collect()` emit in
   task-completion order, and that order became `eval_multiqc.py`'s argument
   order -- which MultiQC writes straight into its JSON. Grouped lists are

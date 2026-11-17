@@ -137,7 +137,7 @@ class RandomForestTrainer(DDIModelTrainer):
         # byte-identical across runs with n_jobs=-1. `predict_proba` is not:
         # sklearn accumulates per-tree probabilities under joblib, so the
         # summation order and the last bits of each probability depend on thread
-        # scheduling. That moved the MCC-tuned decision threshold between runs
+        # scheduling. That moved the tuned decision threshold between runs
         # (visibly, in model_parameters.json) without flipping any prediction,
         # and the same wobble reaches the validation AP the search ranks
         # candidates by -- where it *could* flip which model wins. The CPU path only runs under --allow_cpu (CI, laptops);
@@ -170,7 +170,7 @@ class RandomForestTrainer(DDIModelTrainer):
         # single chunk is 2.4 GB. Output dtype is the backend's (float64 from
         # scikit-learn, float32 from cuML); it makes no difference downstream,
         # because `_aggregate_to_ddi_level` casts every score to float32 before
-        # the DDI mean, the threshold tuning and the parquet see it.
+        # the DDI mean, the operating points and the parquet see it.
         check_positive_column(classifier)
         head = classifier.predict_proba(
             np.asarray(x[:self._PREDICT_CHUNK_ROWS], dtype=np.float32)

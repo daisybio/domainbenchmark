@@ -401,8 +401,10 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         # sides, so valid_loss measured memorisation, and EarlyStopping kept the
         # *last* epoch (load_best defaults to False), not the best one. The
         # validation split is DDI-disjoint from train by construction; it is
-        # the same block the search and the MCC threshold use. load_best=True
-        # restores the weights of the epoch with the lowest valid_loss.
+        # the same block the search and the operating points use. load_best=True
+        # restores the weights of the epoch with the lowest valid_loss. That
+        # loss is row-level (not DDI-level), weighted by train's pos_weight, on
+        # validation at its natural class balance.
         x_opt, y_opt, _ = load_opt()
         valid_ds = Dataset(
             np.asarray(x_opt, dtype=np.float32), np.asarray(y_opt, dtype=np.float32)

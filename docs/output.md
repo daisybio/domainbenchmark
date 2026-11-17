@@ -59,10 +59,21 @@ scored by the same trained model. A database with a single `test.sqlite3`
     and stages it as `features/<feature>.h5` without copying it into `results/`.
     One file serves `train`, `validation` and every `test*` split of the
     databases the same run produced.
-- `<db_name>/nn_output/neural_network_<combo>/` and
-  `<db_name>/rf_output/random_forest_<combo>/`
+- `<db_name>/nn_output/neural_network_<combo>/`,
+  `<db_name>/rf_output/random_forest_<combo>/` and
+  `<db_name>/svm_output/svm_<combo>/`
   - `model/`: the fitted model plus `model_parameters.json` (chosen
-    hyperparameters, balance method, tuned decision threshold).
+    hyperparameters, balance method, a `selection` block describing how they
+    were chosen, and a `thresholds` block with the two validation operating
+    points: `fpr0.01` — the smallest threshold with validation FPR ≤ 0.01, the
+    primary point — and `universe_prior` — the MCC optimum at the scenario
+    prevalence π = train positives / possible pairs of train domains, i.e.
+    catalogue density. Each carries `resolvable`, by a different rule:
+    `fpr0.01` is resolvable when validation has ≥ 100 negatives (so the budget
+    allows at least one false positive); `universe_prior` is resolvable only
+    when its optimum has ≥ 1 validation false positive — on any split size it is
+    not when the optimum sits at validation FPR 0, where the true FPR is only
+    bounded).
   - `predictions_<variant>.parquet`: one file per test split, scored by the one
     trained model. `<combo>` is a single feature name, `all` for the
     all-feature concatenation run (everything but `dummy`), or `all_seq` for the
@@ -70,7 +81,11 @@ scored by the same trained model. A database with a single `test.sqlite3`
     `--structure_informed_features`). One row per DDI, with `domain_a <= domain_b`:
     the loader instantiates each pair in both orientations (the feature vector is
     `concat(emb_a, emb_b)`, so the model needs both to stay symmetric) and the
-    two are averaged back into a single row here.
+    two are averaged back into a single row here. Columns: `domain_a`,
+    `domain_b`, `true_interaction`, `predicted_interaction` (at `fpr0.01`),
+    `predicted_interaction_prior` (at `universe_prior`; ML models only) and
+    `predicted_probability`. Both thresholds come from validation and are
+    applied unchanged to every test split.
 - `<db_name>/graph_models/<model>/`
   - `model/`: graph-topology exports and the run record.
   - `predictions_<variant>.parquet`: one file per test split, same

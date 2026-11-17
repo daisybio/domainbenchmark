@@ -45,15 +45,15 @@ REPORT_NAME = "ddi_report"
 ID = "eval"
 DB_PREFIX = "db_"
 
-#: Shown on every thresholded-metrics table. The trained models' threshold is
-#: the MCC argmax on the validation split, whose class balance is ~1:1; the
-#: MCC optimum moves with prevalence, so on 1:10 or 98%-positive test sets the
-#: confusion-based metrics reflect that mismatch as much as the model.
+#: Shown on every thresholded-metrics table. The ML models' label
+#: (`predicted_interaction`) is taken at the validation operating point
+#: FPR <= 0.01 (machine_learning.threshold_at_fpr); graph models emit their own.
+#: Interim wording; W-7 rewrites it.
 THRESHOLD_CAVEAT = (
-    "Accuracy, precision, recall, F1 and MCC depend on a decision threshold "
-    "tuned for MCC on the validation split at its ~1:1 class balance and "
-    "applied unchanged to test sets of other prevalence. Compare models by "
-    "ROC AUC / PR AP (threshold-free); read these columns as secondary."
+    "Accuracy, precision, recall, F1 and MCC: for NN, RF and SVM they are taken "
+    "at the threshold where validation FPR <= 0.01, applied unchanged to every "
+    "test set; graph models use the labels they emit themselves. Compare models "
+    "by ROC AUC / PR AP (threshold-free); read these columns as secondary."
 )
 
 PAIRS_NOTE = (

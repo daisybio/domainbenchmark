@@ -164,6 +164,9 @@ def test_loader_name_fallback_warns(tmp_path, capsys):
     assert "no 'layout' attribute" in capsys.readouterr().err
 
 
+THRESHOLDS = {"fpr0.01": {"threshold": .5}, "universe_prior": {"threshold": .5}}
+
+
 # S-5: CodexReview "predict-only feature-order corruption" repro.
 def _predict_only(p: Path, names, out_name):
     return subprocess.run([
@@ -200,7 +203,7 @@ def rf_artefact(tmp_path):
 def test_predict_only_feature_order(rf_artefact):
     p = rf_artefact
     (p / "model/model_parameters.json").write_text(json.dumps(
-        {"features": ["f", "g"], "seed": 42, "threshold": .5}))
+        {"features": ["f", "g"], "seed": 42, "thresholds": THRESHOLDS}))
     ok = _predict_only(p, ("f", "g"), "out_fg")
     assert ok.returncode == 0, ok.stderr
     assert pd.read_parquet(p / "out_fg/predictions_test.parquet")[
@@ -212,10 +215,24 @@ def test_predict_only_feature_order(rf_artefact):
 
 def test_predict_only_requires_saved_features(rf_artefact):
     p = rf_artefact
-    (p / "model/model_parameters.json").write_text(json.dumps({"threshold": .5}))
+    (p / "model/model_parameters.json").write_text(json.dumps({"thresholds": THRESHOLDS}))
     bad = _predict_only(p, ("f", "g"), "out")
     assert bad.returncode != 0
     assert "does not match the features" in bad.stderr
+
+
+# W-5: no legacy read path. A scalar `threshold` (or no block) fails clearly.
+@pytest.mark.parametrize("params", [
+    {"features": ["f", "g"], "threshold": .5},
+    {"features": ["f", "g"], "thresholds": {"fpr0.01": {"threshold": .5}}},
+])
+def test_predict_only_requires_thresholds_block(rf_artefact, params):
+    p = rf_artefact
+    (p / "model/model_parameters.json").write_text(json.dumps(params))
+    bad = _predict_only(p, ("f", "g"), "out")
+    assert bad.returncode != 0
+    assert "has no valid 'thresholds' block" in bad.stderr
+    assert not (p / "out/predictions_test.parquet").exists()
 
 
 def test_ddi_scorer_checks_classes():

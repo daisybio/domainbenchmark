@@ -117,7 +117,15 @@ def test_model_parameters(runs):
     assert params["optimizer"] is None
     assert params["balance_method"] in ("none", "downsample")
     assert "C" in params["model_parameters"] and "kernel" in params["model_parameters"]
-    assert 0.0 <= params["threshold"] <= 1.0
+    assert "threshold" not in params
+    assert params["primary"] == "fpr0.01"
+    assert params["selection"]["validation_balanced"] is False
+    assert params["selection"]["metric"] == "ddi_average_precision"
+    fpr = params["thresholds"]["fpr0.01"]
+    assert fpr["n_fp"] <= fpr["fp_budget"] and fpr["achieved_val_fpr"] <= 0.01
+    assert fpr["n_neg"] + fpr["n_pos"] == params["selection"]["n_neg"] + params["selection"]["n_pos"]
+    prior = params["thresholds"]["universe_prior"]
+    assert 0.0 < prior["pi"] < 1.0 and prior["universe_includes_self_pairs"] is False
     with (runs[0] / "model" / "SVM.pkl").open("rb") as f:
         model = pickle.load(f)
     assert type(model.steps[0][1]).__name__ == "StandardScaler"
@@ -138,3 +146,51 @@ def test_invariant_to_feature_shift_and_scale(runs):
         b = pd.read_parquet(runs[2] / "pred" / f"predictions_{variant}.parquet")
         assert (a[["domain_a", "domain_b"]].values == b[["domain_a", "domain_b"]].values).all()
         np.testing.assert_allclose(a["predicted_probability"], b["predicted_probability"], atol=1e-3)
+
+
+def test_predict_only_thresholds_fixed_on_test(runs, tmp_path):
+    """Perturbed test features move scores, never the validation thresholds."""
+    import shutil
+    data = Path(runs[0]).parent / "data"
+    shutil.copytree(data, tmp_path / "data")
+    with h5py.File(tmp_path / "data" / "features" / "feat__test_balanced.h5", "r+") as h5:
+        for group in h5.values():
+            for ds in group.values():
+                ds[...] = ds[...] * 1.5 + 0.3
+    params_path = runs[0] / "model" / "model_parameters.json"
+    before = params_path.read_bytes()
+    subprocess.run(
+        [sys.executable, str(BIN / "svm.py"), "--predict-only",
+         "--model_dir", str(runs[0] / "model"),
+         "--features", "feat", "--features_path", str(tmp_path / "data" / "features"),
+         "--ddi_path", str(tmp_path / "data" / "DDI"), "--config", str(runs[0] / "config.json"),
+         "--out_predictions_dir", str(tmp_path / "pred"),
+         "--test_splits", "test_balanced", "--seed", "7", "--allow_cpu"],
+        check=True, env={**os.environ, "PYTHONHASHSEED": "0"}, capture_output=True, text=True,
+    )
+    assert params_path.read_bytes() == before
+    thresholds = json.loads(before)["thresholds"]
+    df = pd.read_parquet(tmp_path / "pred" / "predictions_balanced.parquet")
+    orig = pd.read_parquet(runs[0] / "pred" / "predictions_balanced.parquet")
+    assert not np.array_equal(df["predicted_probability"], orig["predicted_probability"])
+    for column, point in (("predicted_interaction", "fpr0.01"),
+                          ("predicted_interaction_prior", "universe_prior")):
+        expected = (df["predicted_probability"] >= thresholds[point]["threshold"]).astype(np.int8)
+        assert (df[column] == expected).all()
+
+
+def test_retrain_with_other_test_features_keeps_thresholds(runs, tmp_path):
+    """Retraining with only test features changed reproduces both thresholds."""
+    import shutil
+    data = Path(runs[0]).parent / "data"
+    shutil.copytree(data, tmp_path / "data")
+    for split in ("test_balanced", "test_realistic"):
+        with h5py.File(tmp_path / "data" / "features" / f"feat__{split}.h5", "r+") as h5:
+            for group in h5.values():
+                for ds in group.values():
+                    ds[...] = ds[...] * 1.5 + 0.3
+    out = _run(tmp_path / "data", tmp_path / "run")
+    orig = json.loads((runs[0] / "model" / "model_parameters.json").read_text())
+    new = json.loads((out / "model" / "model_parameters.json").read_text())
+    assert new["thresholds"] == orig["thresholds"]
+    assert new["selection"] == orig["selection"]

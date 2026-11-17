@@ -9,7 +9,7 @@
         "models_to_evaluate": 100,
         "grid_search_epochs": 100,
         "retrain_epochs": 200,
-        "balance_positive_and_negative_interactions_opt_set": true
+        "balance_positive_and_negative_interactions_opt_set": false
     },
     "model_parameters": {
         "balance_method": ["downsample"],

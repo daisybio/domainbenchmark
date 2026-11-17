@@ -19,7 +19,7 @@ import pandas as pd
 from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from pathlib import Path
-from sklearn.metrics import average_precision_score, matthews_corrcoef
+from sklearn.metrics import average_precision_score
 from sklearn.model_selection import PredefinedSplit
 from typing import List
 
@@ -37,7 +37,7 @@ interaction_encodings = ["protdcal"]
 # replacement -- evicting only after the insert held the old and the new array
 # at once, e.g. two training blocks across consecutive balance methods. A hit
 # needs the SAME key twice in a row (the validation split reloaded for
-# threshold tuning right after the NN refit used it for early stopping).
+# the operating points right after the NN refit used it for early stopping).
 #
 # The cache holds a reference, so `del x` in a caller frees nothing while the
 # entry lives. A caller that wants the memory back must `clear_load_cache()`
@@ -292,35 +292,144 @@ def _aggregate_to_ddi_level(ddi_pairs, y_true, y_score):
     return agg.drop(columns="n_labels")
 
 
-def _tune_threshold_mcc(y_true, y_score, n_candidates: int = 200):
-    """Pick the decision threshold that maximises Matthews correlation.
+PRIMARY_POINT = "fpr0.01"
+PRIOR_POINT = "universe_prior"
 
-    MCC uses all four cells of the confusion matrix, so unlike F1 it does not
-    reward predicting everything positive (the F1-induced positive bias that
-    previously collapsed predictions to the majority class). It is *not*
-    prevalence-invariant: the threshold is tuned at the validation set's class
-    balance and may be off at a test prior that differs from it.
 
-    Returns (threshold, mcc_at_threshold).
+def _threshold_candidates(y_true, y_score):
+    """Sorted class scores and the candidate thresholds for an operating point.
+
+    Candidates are every distinct validation score (both classes, so a positive
+    sitting between two negatives is a candidate) plus one value just above the
+    maximum, where nothing is predicted positive. A label is `score >= threshold`,
+    so `#class >= c` counts every score tied at the boundary.
     """
-    y_true = np.asarray(y_true).astype(np.int8)
-    y_score = np.asarray(y_score).astype(np.float64)
-    # Candidate set: quantiles of the score distribution (handles flat scores
-    # and avoids evaluating degenerate thresholds outside [min, max]).
-    qs = np.linspace(0.0, 1.0, n_candidates + 2)[1:-1]
-    candidates = np.unique(np.quantile(y_score, qs))
-    if candidates.size == 0:
-        return 0.5, 0.0
-    best_thr = float(candidates[0])
-    best_mcc = -2.0
-    for thr in candidates:
-        pred = (y_score >= thr).astype(np.int8)
-        # matthews_corrcoef returns 0 when one class is empty in predictions.
-        mcc = matthews_corrcoef(y_true, pred)
-        if mcc > best_mcc:
-            best_mcc = mcc
-            best_thr = float(thr)
-    return best_thr, float(best_mcc)
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    pos = np.sort(y_score[y_true == 1])
+    neg = np.sort(y_score[y_true == 0])
+    if len(neg) == 0:
+        raise ValueError(
+            "Operating point: the validation split has no negative DDI, so no "
+            "false-positive rate exists."
+        )
+    uniq = np.unique(y_score)
+    candidates = np.append(uniq, np.nextafter(uniq[-1], np.inf))
+    n_tp = len(pos) - np.searchsorted(pos, candidates, side="left")
+    n_fp = len(neg) - np.searchsorted(neg, candidates, side="left")
+    return candidates, n_tp, n_fp, len(pos), len(neg)
+
+
+def threshold_at_fpr(y_true, y_score, max_fpr: float = 0.01) -> dict:
+    """Smallest threshold whose validation FPR is <= `max_fpr` (the primary point).
+
+    The false-positive budget is an integer, `floor(max_fpr * n_neg)`, and counts
+    are compared, never floats. Never `np.quantile`: with tied negatives at the
+    boundary it overshoots the budget (20 of 950 negatives at 1.0 gave FPR 0.021).
+    Under `ceil(1 / max_fpr)` negatives the budget is 0 and the point is only an
+    upper bound (`resolvable: false`).
+    """
+    candidates, n_tp, n_fp, n_pos, n_neg = _threshold_candidates(y_true, y_score)
+    budget = math.floor(max_fpr * n_neg + 1e-9)
+    # n_fp is non-increasing in the candidate and 0 at the last one.
+    i = int(np.argmax(n_fp <= budget))
+    return {
+        "threshold": float(candidates[i]),
+        "max_fpr": max_fpr,
+        "achieved_val_fpr": float(n_fp[i] / n_neg),
+        "achieved_val_tpr": float(n_tp[i] / n_pos) if n_pos else None,
+        "n_fp": int(n_fp[i]),
+        "n_tp": int(n_tp[i]),
+        "fp_budget": int(budget),
+        "n_neg": int(n_neg),
+        "n_pos": int(n_pos),
+        "n_distinct_scores": int(len(candidates) - 1),
+        "resolvable": bool(n_neg >= math.ceil(1 / max_fpr)),
+    }
+
+
+def universe_prior(ddi_path: Path, split: str = "train") -> dict:
+    """Catalogue density pi = positives / possible domain pairs among train domains.
+
+    Read from `<split>.csv`, not from loaded feature rows, so it is one value per
+    database whatever a combo resolves. Self-pairs count in the universe only if
+    the split holds any same-family DDI (either label), so the switch is the data.
+    """
+    csv = ddi_path / f"{split}.csv"
+    df = pd.read_csv(csv, dtype={"domain_1": str, "domain_2": str})
+    ddis = {canonical_ddi(a, b, int(i))
+            for a, b, i in zip(df["domain_1"], df["domain_2"], df["interaction"])}
+    domains = {d for a, b, _ in ddis for d in (a, b)}
+    n_domains = len(domains)
+    includes_self = any(a == b for a, b, _ in ddis)
+    universe = n_domains * (n_domains + 1) // 2 if includes_self else n_domains * (n_domains - 1) // 2
+    n_pos = sum(i == 1 for _, _, i in ddis)
+    if universe == 0 or n_pos == 0:
+        raise ValueError(
+            f"{csv}: cannot compute the universe prior "
+            f"({n_domains} domains, {n_pos} positive DDIs)."
+        )
+    return {
+        "pi": n_pos / universe,
+        "n_domains_train": n_domains,
+        "n_pos_train": n_pos,
+        "universe_size": universe,
+        "universe_includes_self_pairs": includes_self,
+    }
+
+
+def threshold_at_prior(y_true, y_score, pi: float) -> dict:
+    """Threshold maximising MCC at prevalence `pi`, from validation TPR and FPR.
+
+    MCC of the confusion matrix with cells pi*TPR, pi*(1-TPR), (1-pi)*FPR,
+    (1-pi)*(1-FPR); at pi = validation prevalence it is the count MCC. A scenario
+    (prevalence = catalogue density), not a measurement: the optimum usually sits
+    at validation FPR 0, where the true FPR is only bounded, so `resolvable`
+    requires at least one validation false positive. Ties take the highest
+    threshold.
+    """
+    candidates, n_tp, n_fp, n_pos, n_neg = _threshold_candidates(y_true, y_score)
+    if n_pos == 0:
+        raise ValueError(
+            "Operating point: the validation split has no positive DDI, so MCC "
+            "at the universe prior is undefined."
+        )
+    tpr = n_tp / n_pos
+    fpr = n_fp / n_neg
+    q = pi * tpr + (1 - pi) * fpr
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mcc = np.where((q > 0) & (q < 1),
+                       math.sqrt(pi * (1 - pi)) * (tpr - fpr) / np.sqrt(q * (1 - q)),
+                       0.0)
+    # Mathematically equal maxima can differ in the last bit; within rel 1e-12
+    # they are a tie, and a tie goes to the highest threshold.
+    best = mcc.max()
+    i = int(np.flatnonzero(np.abs(mcc - best) <= 1e-12 * np.abs(best))[-1])
+    denom = pi * tpr[i] + (1 - pi) * fpr[i]
+    return {
+        "threshold": float(candidates[i]),
+        "mcc_at_pi": float(mcc[i]),
+        "val_tpr": float(tpr[i]),
+        "val_fpr": float(fpr[i]),
+        "n_fp": int(n_fp[i]),
+        "precision_at_pi": float(pi * tpr[i] / denom) if denom > 0 else None,
+        "resolvable": bool(n_fp[i] >= 1),
+    }
+
+
+def read_thresholds(model_parameters: dict, source) -> dict:
+    """The two operating-point thresholds of a trained model, or a clear error."""
+    block = model_parameters.get("thresholds")
+    try:
+        return {point: float(block[point]["threshold"])
+                for point in (PRIMARY_POINT, PRIOR_POINT)}
+    except (TypeError, KeyError, ValueError):
+        raise ValueError(
+            f"{source} has no valid 'thresholds' block (needs "
+            f"{PRIMARY_POINT}.threshold and {PRIOR_POINT}.threshold). It was "
+            "written before the validation operating points existed; retrain "
+            "the model."
+        ) from None
 
 
 def load_instance_pairs(ddi_path: Path, dataset: str):
@@ -984,7 +1093,7 @@ class DDIModelTrainer(ABC):
         )
         argparser.add_argument(
             "--val_split", default="validation",
-            help="Split used for hyperparameter search and threshold tuning.",
+            help="Split used for hyperparameter search, early stopping and operating points.",
         )
         argparser.add_argument("--out_model_dir", type=Path, required=False)
         argparser.add_argument("--model_dir", type=Path, required=False)
@@ -1029,15 +1138,16 @@ class DDIModelTrainer(ABC):
                 f"({model_parameters.get('features')}, from {model_json_path}). "
                 "Pass exactly the saved list, in order."
             )
-        threshold = model_parameters.get("threshold", 0.5)
-        self.predict(args, classifier, threshold)
+        thresholds = read_thresholds(model_parameters, model_json_path)
+        self.predict(args, classifier, thresholds)
 
-    def predict(self, args, classifier, threshold=0.5):
+    def predict(self, args, classifier, thresholds):
         """Predict on every test split with the one trained model.
 
-        Datasets with an internal test set ship both `test_balanced` and
-        `test_realistic`; both are scored by the same model and threshold, so
-        training happens once and only the scoring loop fans out.
+        Every test split is scored by the same model and the same two
+        validation thresholds (`thresholds[PRIMARY_POINT]` -> `predicted_interaction`,
+        `thresholds[PRIOR_POINT]` -> `predicted_interaction_prior`); nothing is
+        re-picked on test. Training happens once and only the scoring loop fans out.
         """
         args.out_predictions_dir.mkdir(parents=True, exist_ok=True)
         # train() leaves the validation split cached; nothing below wants it,
@@ -1060,12 +1170,15 @@ class DDIModelTrainer(ABC):
             y_test_pred_proba = self._predict_proba(classifier, x_test)
 
             predictions_df = _aggregate_to_ddi_level(ddi_pairs, y_test, y_test_pred_proba)
+            proba = predictions_df["predicted_probability"].values
             predictions_df["predicted_interaction"] = (
-                predictions_df["predicted_probability"].values >= threshold
-            ).astype(np.int8)
+                proba >= thresholds[PRIMARY_POINT]).astype(np.int8)
+            predictions_df["predicted_interaction_prior"] = (
+                proba >= thresholds[PRIOR_POINT]).astype(np.int8)
             predictions_df["true_interaction"] = predictions_df["true_interaction"].astype(np.int8)
             predictions_df = predictions_df[
-                ["domain_a", "domain_b", "true_interaction", "predicted_interaction", "predicted_probability"]
+                ["domain_a", "domain_b", "true_interaction", "predicted_interaction",
+                 "predicted_interaction_prior", "predicted_probability"]
             ]
             out_path = args.out_predictions_dir / f"predictions_{variant}.parquet"
             predictions_df.to_parquet(out_path, index=False, compression="zstd")
@@ -1179,16 +1292,41 @@ class DDIModelTrainer(ABC):
         x_opt, y_opt, opt_ddi_pairs = load_opt()
         assert x_opt.shape == x_opt_shape, "Reloaded x_opt shape changed unexpectedly"
 
-        print("Tuning decision threshold on DDI-aggregated validation data via MCC...")
+        print("Deriving operating points on DDI-aggregated validation data...")
         y_opt_proba = self._predict_proba(classifier, x_opt)
         opt_agg = _aggregate_to_ddi_level(opt_ddi_pairs, y_opt, y_opt_proba)
-        best_thr, best_mcc = _tune_threshold_mcc(
-            opt_agg["true_interaction"].values,
-            opt_agg["predicted_probability"].values,
-        )
-        print(f"Tuned threshold: {best_thr:.3f} (MCC={best_mcc:.3f})")
+        # The exact float32 array predict() later compares against.
+        val_true = opt_agg["true_interaction"].values
+        val_score = opt_agg["predicted_probability"].values
+        prior = universe_prior(args.ddi_path)
+        thresholds = {
+            PRIMARY_POINT: threshold_at_fpr(val_true, val_score, max_fpr=0.01),
+            PRIOR_POINT: {
+                **threshold_at_prior(val_true, val_score, prior["pi"]), **prior,
+                "kind": "scenario: catalogue density",
+            },
+        }
+        for name, point in thresholds.items():
+            tpr = point.get("achieved_val_tpr", point.get("val_tpr"))
+            fpr = point.get("achieved_val_fpr", point.get("val_fpr"))
+            print(f"[{name}] threshold={point['threshold']:.6g} val FPR={fpr:.4f} "
+                  f"val TPR={tpr} n_fp={point['n_fp']}"
+                  f"{'/' + str(point['fp_budget']) if 'fp_budget' in point else ''} "
+                  f"resolvable={point['resolvable']}")
+        selection = {
+            "metric": "ddi_average_precision",
+            "split": args.val_split,
+            "validation_balanced": bool(balance_opt_set),
+            "aggregation": "mean over instance rows and both orientations",
+            "population": "every validation DDI this combo resolves; same- and different-family pooled",
+            "n_pos": int((val_true == 1).sum()),
+            "n_neg": int((val_true == 0).sum()),
+            "n_same_family": int((opt_agg["domain_a"] == opt_agg["domain_b"]).sum()),
+            "best_score": float(results[0][1]),
+            "score_by_balance_method": {bm: float(score) for _, score, bm in results},
+        }
 
-        y_pred = (opt_agg["predicted_probability"].values >= best_thr).astype(int)
+        y_pred = (val_score >= thresholds[PRIMARY_POINT]["threshold"]).astype(int)
         # Counted with bincount rather than `pd.crosstab`. Two reasons, and the
         # second one killed a 2 h cluster task:
         #
@@ -1217,7 +1355,7 @@ class DDIModelTrainer(ABC):
             index=pd.Index([0, 1, "All"], name="Actual"),
             columns=pd.Index([0, 1, "All"], name="Predicted"),
         )
-        print(f"\nConfusion Matrix (DDI-level):\n\n{confusion_matrix}\n")
+        print(f"\nConfusion Matrix (DDI-level, {PRIMARY_POINT}):\n\n{confusion_matrix}\n")
 
         print("Saving the model...")
         args.out_model_dir.mkdir(parents=True, exist_ok=True)
@@ -1228,12 +1366,14 @@ class DDIModelTrainer(ABC):
                 {
                     "model_parameters": best_params,
                     "balance_method": best_balance,
-                    "threshold": best_thr,
                     # In --features order, which is the column order of x: the
                     # only record of what an `all` combo concatenated.
                     "features": list(args.features),
                     "seed": args.seed,
                     "optimizer": self.OPTIMIZER and self.OPTIMIZER.__name__,
+                    "selection": selection,
+                    "primary": PRIMARY_POINT,
+                    "thresholds": thresholds,
                 },
                 f,
                 indent=4,

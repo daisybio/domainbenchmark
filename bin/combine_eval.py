@@ -179,8 +179,8 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
         coverage_blocks = sort_by_dataset(coverage_blocks, dataset_order)
 
     # Threshold-free heatmaps first: they are the primary comparison. The
-    # per-dataset metric tables depend on a threshold tuned at validation's
-    # ~1:1 balance (see THRESHOLD_CAVEAT in eval_multiqc.py) and come after.
+    # per-dataset metric tables depend on the validation FPR <= 0.01
+    # threshold (see THRESHOLD_CAVEAT in eval_multiqc.py) and come after.
     ordered = (
         white_tbl
         + roc_heatmap_block
