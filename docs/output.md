@@ -44,8 +44,10 @@ scored by the same trained model. A database with a single `test.sqlite3`
     `h5[pfam_id][instance_key]`. The flat name carries the layout; each ML
     task stages only its own combo's files into `features/` and resolves them
     by name, so adding a feature does not rerun models that do not use it.
-  - Structure features (`--machine_learning_features_structure`) are computed
-    on domainsplit's AlphaFold 3 complexes. Positives come from PDB co-crystals
+  - Structure features (`--machine_learning_features_structure`, off by default)
+    are computed on domainsplit's AlphaFold 3 complexes. They are off because
+    current domainsplit runs model complexes for most positives but almost no
+    negatives, so structure coverage itself predicts the label. Positives come from PDB co-crystals
     that are in AF3's training data, so interface features (buried surface,
     contacts, clashes, patches) partly measure AF3's recall of known complexes
     rather than predict an interaction. Read any structure-assisted model --

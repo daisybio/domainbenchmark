@@ -125,10 +125,10 @@
                 },
                 "machine_learning_features_structure": {
                     "type": "string",
-                    "default": "compactness,bsa_residue,sasa_structure,radius_of_gyration,polar_residue_fraction,k_closest_distance,depth_index,interface_arearatio,contact_map,aacomp_interface",
+                    "default": "",
                     "pattern": "^(|\\s*[\\w.]+\\s*(,\\s*[\\w.]+\\s*)*)$",
-                    "description": "Comma-separated structure features, computed on the AF3 complex of each instance pair. Pass 'none' to disable them.",
-                    "help_text": "Each name is an encoder in bin/features/ or a parameterised variant from assets/feature_variants.json. They join every feature combo, `_all` included; a combo containing one scores only DDIs with at least one structure-covered instance pair. Caveat: positives come from PDB co-crystals that are in AF3's training data, so interface features partly measure AF3 recall.",
+                    "description": "Comma-separated structure features, computed on the AF3 complex of each instance pair. Off by default; pass 'none' to disable them from the command line.",
+                    "help_text": "Each name is an encoder in bin/features/ or a parameterised variant from assets/feature_variants.json. They join every feature combo, `_all` included; a combo containing one scores only DDIs with at least one structure-covered instance pair. Caveat: positives come from PDB co-crystals that are in AF3's training data, so interface features partly measure AF3 recall. Off by default because current domainsplit runs model complexes for most positives but almost no negatives, so structure coverage itself predicts the label (check the per-class coverage that PREFLIGHT prints before enabling).",
                     "fa_icon": "fas fa-cubes"
                 },
                 "large_features": {
