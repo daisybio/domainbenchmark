@@ -360,11 +360,21 @@ AVERAGE_CAT = "Mean over shown models"
 #: counted overlapping datasets (e.g. `<db>` and `<db>_hrni`, same test pairs)
 #: twice.
 #:
-#: One pool per variant, never one over everything: the variants of a database
-#: are views of overlapping DDIs at different class balances. The variants are
-#: read from the data (every `test_<variant>` held by >= 2 datasets). A
+#: One pool per class ratio, never one over everything: the variants of a
+#: database are views of overlapping DDIs at different class balances. A
+#: variant's pool is its trailing `<pos>_<neg>` ratio, so `uniform_1_1` and
+#: `matched_1_1` (the same in-distribution role, different negative sampling)
+#: pool together as `Combined_1_1`; a variant without a ratio pools under its
+#: own name. Pools are read from the data (every key held by >= 2 datasets). A
 #: database with a single `test` split (e.g. external_test) joins no pool.
 SINGLE_SPLIT_VARIANT = "test"
+_RATIO = re.compile(r"(?:^|_)(\d+_\d+)$")
+
+
+def pool_key(variant) -> str:
+    """`matched_1_1` -> `1_1`; a variant with no trailing ratio is its own key."""
+    m = _RATIO.search(variant)
+    return m.group(1) if m else variant
 
 
 def pooled_label(variant) -> str:
@@ -437,7 +447,7 @@ def _combine_datasets(sidecars, label=None):
 
 
 def _pool_by_variant(sidecars):
-    """`Combined_<variant>` for every variant held by at least two datasets.
+    """`Combined_<ratio>` for every pool key (see `pool_key`) held by at least two datasets.
 
     With one dataset a pool would repeat that dataset's tab under another
     name. A single-`test` dataset (e.g. external_test) has no variant and
@@ -445,7 +455,9 @@ def _pool_by_variant(sidecars):
     """
     by_variant = {}
     for sc in sidecars:
-        by_variant.setdefault(_variant(sc), []).append(sc)
+        variant = _variant(sc)
+        key = variant if variant == SINGLE_SPLIT_VARIANT else pool_key(variant)
+        by_variant.setdefault(key, []).append(sc)
     pools, unpooled = [], []
     for variant in sorted(by_variant):
         members = by_variant[variant]

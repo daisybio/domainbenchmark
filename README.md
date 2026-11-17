@@ -91,8 +91,9 @@ nextflow run . \
     --outdir results
 ```
 
-No samplesheet ships with the pipeline; the directory form below is the usual
-entry. A samplesheet is a CSV with one row per database:
+The directory form below is the usual entry. A samplesheet is a CSV with one
+row per database; `assets/samplesheet_example.csv` is a working example on the
+in-repo fixture:
 
 ```csv
 id,db_path
@@ -120,7 +121,7 @@ nextflow run . \
 databases/
 ├── random/                    train, validation, test_uniform_1_1, test_uniform_1_10
 ├── random_ilp/                train, validation, test_matched_1_1, test_uniform_1_10
-├── random_hrni/               same positives, redrawn negatives
+├── random_hrni/               same positives, high-replication non-interactions
 ├── minimal_leakage/           train, validation, test_matched_1_1, test_uniform_1_10
 ├── minimal_leakage_hrni/
 ├── external_test/             train, validation, test
@@ -128,7 +129,7 @@ databases/
 ```
 
 A `<method>` / `<method>_hrni` pair is the same positive split with the
-negatives redrawn from a candidate network, so the two runs
+negatives redrawn as high-replication non-interactions (hrni), so the two runs
 differ in their input only in the negatives. They are not a fixed-model
 comparison: each database refits its models and retunes hyperparameters and
 thresholds on its own train/validation splits, so a difference between the two
@@ -311,8 +312,9 @@ That combined report also carries an **Accuracy by DDI source** section: one bar
 group per source (`3did`, `sampled_negative`, `single_domain_ppi`, `PPIDM*`,
 `negatome`, …), one bar per model plus a `Mean over shown models` bar (the mean
 of the bars beside it, not an ensemble), and a tab per (database, variant).
-Pooled `Combined_<variant>` tabs are derived from the data: one per
-`test_<variant>` variant present in at least two datasets (currently
+Pooled `Combined_<ratio>` tabs are derived from the data: one per class ratio
+(the trailing `<pos>_<neg>` of the variant, so `uniform_1_1` and `matched_1_1`
+pool together) present in at least two datasets (currently
 `Combined_1_1` and `Combined_1_10`), each the unweighted mean of the per-dataset
 accuracies, with the included datasets listed in its description. A database
 with a single `test` split (e.g. `external_test`) joins no pooled tab. A DDI whose

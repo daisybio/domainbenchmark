@@ -98,8 +98,9 @@ runs: it embeds a timestamp, absolute work-dir paths and the MultiQC version.
   - `ddi_report.html`: every (database, test variant) as its own dataset entry,
     with metrics, ROC/PR curves, per-source accuracy and pairwise significance
     across all models. The per-source accuracy section has one tab per dataset
-    plus pooled `Combined_<variant>` tabs, derived from the data: one per
-    `test_<variant>` variant present in at least two datasets, each the
+    plus pooled `Combined_<ratio>` tabs, derived from the data: one per class
+    ratio (the trailing `<pos>_<neg>` of the variant, so `uniform_1_1` and
+    `matched_1_1` pool together) present in at least two datasets, each the
     unweighted mean of the per-dataset accuracies. A single-`test` dataset such
     as `external_test` joins no pooled tab. The `Mean over shown models` bar is
     the mean of the bars beside it, not an ensemble.

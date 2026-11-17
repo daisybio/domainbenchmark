@@ -20,7 +20,7 @@ Every immediate subdirectory holding a `train.sqlite3` becomes a dataset named a
 
 ### Samplesheet
 
-A CSV with one row per database. No example ships with the pipeline. A samplesheet input cannot derive `--embeddings` or `--structures`, so pass both when the published or structure features are enabled (the defaults).
+A CSV with one row per database; `assets/samplesheet_example.csv` is a working example on the in-repo fixture. A samplesheet input cannot derive `--embeddings` or `--structures`, so pass both when the published or structure features are enabled (the defaults).
 
 ```csv title="samplesheet.csv"
 id,db_path

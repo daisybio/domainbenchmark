@@ -331,6 +331,20 @@ def test_pools_derived_from_variants_single_test_joins_none():
     assert all("external_test" not in p["members"] for p in pools)
 
 
+def test_pools_key_on_class_ratio_across_sampling_schemes():
+    # random has test_uniform_1_1, the others test_matched_1_1: one 1:1 pool.
+    sc = [_sidecar("random_uniform_1_1", "uniform_1_1", 1, 2),
+          _sidecar("ml_matched_1_1", "matched_1_1", 1, 2),
+          _sidecar("random_uniform_1_10", "uniform_1_10", 1, 2),
+          _sidecar("ml_uniform_1_10", "uniform_1_10", 1, 2),
+          _sidecar("external_test", "test", 1, 2)]
+    pools = combine_eval._pool_by_variant(sc)
+    assert [p["db_name"] for p in pools] == ["Combined_1_1", "Combined_1_10"]
+    assert pools[0]["members"] == ["ml_matched_1_1", "random_uniform_1_1"]
+    assert combine_eval.pool_key("uniform_1_10") == "1_10"
+    assert combine_eval.pool_key("odd") == "odd"
+
+
 def test_bargraph_average_relabelled(tmp_path):
     sc = [_sidecar("a_1_1", "1_1", 9, 10), _sidecar("b_1_1", "1_1", 5, 10)]
     combine_eval.source_accuracy_bargraph(sc, str(tmp_path))
