@@ -114,6 +114,7 @@ def test_model_parameters(runs):
     params = json.loads((runs[0] / "model" / "model_parameters.json").read_text())
     assert params["features"] == ["feat"]
     assert params["seed"] == 7
+    assert params["optimizer"] is None
     assert params["balance_method"] in ("none", "downsample")
     assert "C" in params["model_parameters"] and "kernel" in params["model_parameters"]
     assert 0.0 <= params["threshold"] <= 1.0

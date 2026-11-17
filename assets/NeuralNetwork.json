@@ -7,7 +7,7 @@
     "jobs": 5,
     "search_parameters": {
         "models_to_evaluate": 100,
-        "grid_search_epochs": 20,
+        "grid_search_epochs": 100,
         "retrain_epochs": 200,
         "balance_positive_and_negative_interactions_opt_set": true
     },
@@ -22,7 +22,7 @@
         ],
         "module__dropout_rate": [0.1, 0.2, 0.5],
         "optimizer__lr": [0.001, 0.01],
-        "optimizer__weight_decay": [0.0001, 0.001, 0.01, 0.1],
+        "optimizer__weight_decay": [0, 1e-05, 0.0001, 0.001],
         "batch_size": [32, 64, 128]
     }
 }

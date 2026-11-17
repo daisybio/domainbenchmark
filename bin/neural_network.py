@@ -57,15 +57,17 @@ def _warm_lazy_torch_imports():
     search. exit 1 is not in base.config's retry set, so it ends the run.
 
     Building a throwaway optimizer here walks that exact path (it is
-    `SGD.__init__` -> `add_param_group` -> `inner`) at import time, when the
-    sandbox is minutes old, and leaves the module cached for the refit. It
-    draws nothing from any RNG, so it cannot move a seeded result.
+    `Adam.__init__` -> `add_param_group` -> `inner`) at import time, when the
+    sandbox is minutes old, and leaves the module cached for the refit. Adam,
+    not SGD, because it is the optimizer the refit builds: the shared
+    `Optimizer.__init__` path is the same, but this also loads `torch.optim.adam`
+    up front. It draws nothing from any RNG, so it cannot move a seeded result.
 
     This is a guard, not the cure: the cure is squashfuse on the nodes (which
     also fixes the SIF-unpacking walltime blowups noted in conf/base.config) or
     an APPTAINER_TMPDIR no sweeper touches.
     """
-    torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.1)
+    torch.optim.Adam([torch.zeros(1, requires_grad=True)], lr=0.1)
 
 
 _warm_lazy_torch_imports()
@@ -240,9 +242,34 @@ class MLPModule(torch.nn.Module):
         return self.layers((x - self.input_mean) / self.input_std)
 
 
+class SharedValidSplit:
+    """skorch `train_split`: train on everything given, validate on `valid_ds`.
+
+    Same contract as `skorch.helper.predefined_split`, but sklearn's `clone`
+    (one per candidate in RandomizedSearchCV, up to 2 x jobs queued at once)
+    does not deep-copy the validation arrays: `predefined_split` hides them in
+    a `partial`, which clone deep-copies with every candidate. The dataset is
+    never mutated, so sharing one copy is safe.
+    """
+
+    def __init__(self, valid_ds):
+        self.valid_ds = valid_ds
+
+    def __call__(self, dataset, y=None, **fit_params):
+        return dataset, self.valid_ds
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 class NeuralNetworkTrainer(DDIModelTrainer):
     MODEL_NAME = "NeuralNetwork"
     MODEL_FILE = "NeuralNetwork.pkl"
+    # Every fit -- grid candidates and refit. skorch defaults to SGD, which is
+    # what ran before this was set. Adam's weight_decay is coupled L2 added to
+    # the gradient before the adaptive scaling, so the SGD-era grid's 0.01/0.1
+    # would swamp it; assets/NeuralNetwork.json searches 0..1e-3 instead.
+    OPTIMIZER = torch.optim.Adam
 
     def _get_balance_methods(self, hyperparameters):
         return hyperparameters.get("balance_method", ["downsample"])
@@ -307,15 +334,24 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         # rows in sorted pair order, so unshuffled batches are long runs of one
         # family pair (and, without balancing, mostly one class).
         #
-        # train_split=None: candidates train for a fixed grid_search_epochs on
-        # the whole train block. They used to carve out a stratified 20% row
-        # holdout that nothing monitored -- no EarlyStopping here -- so every
-        # candidate silently trained on 80% of train, and the holdout shared
-        # DDIs with the rest anyway. The candidate is judged on the validation
-        # fold by `scorer`.
+        # Candidates early-stop on the validation split, like the refit.
+        # RandomizedSearchCV hands each candidate only x[train_idx] (the
+        # PredefinedSplit's -1 rows), and SharedValidSplit makes skorch train on
+        # all of that and compute valid_loss on the validation rows given here
+        # -- so validation rows never enter a candidate's training data. They
+        # used to train a fixed 20 epochs with no monitor, under-training a
+        # small learning rate and over-training a large one.
+        # grid_search_epochs is therefore only a cap: set high enough (100) that
+        # EarlyStopping, not the cap, ends a fit.
+        (_, valid_idx), = cv_split.split()
+        valid_ds = Dataset(
+            np.asarray(x[valid_idx], dtype=np.float32),
+            np.asarray(y[valid_idx], dtype=np.float32),
+        )
         classifier = SeededNeuralNetBinaryClassifier(
             MLPModule,
             seed=self._seed,
+            optimizer=self.OPTIMIZER,
             max_epochs=config["search_parameters"]["grid_search_epochs"],
             device=device,
             verbose=0,
@@ -324,8 +360,11 @@ class NeuralNetworkTrainer(DDIModelTrainer):
             module__input_std=self._input_std,
             criterion__pos_weight=self._pos_weight,
             iterator_train__shuffle=True,
-            train_split=None,
-            callbacks=[SeedFit(self._seed)],
+            train_split=SharedValidSplit(valid_ds),
+            callbacks=[
+                SeedFit(self._seed),
+                EarlyStopping(patience=5, monitor="valid_loss", load_best=True),
+            ],
         )
         gs = RandomizedSearchCV(
             classifier, hyperparameters, n_iter=n_iter,
@@ -373,6 +412,7 @@ class NeuralNetworkTrainer(DDIModelTrainer):
         classifier = SeededNeuralNetBinaryClassifier(
             MLPModule,
             seed=self._seed,
+            optimizer=self.OPTIMIZER,
             max_epochs=config["search_parameters"]["retrain_epochs"],
             device=self._device(config),
             **best_params,

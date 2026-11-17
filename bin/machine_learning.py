@@ -852,6 +852,9 @@ class DDIModelTrainer(ABC):
 
     MODEL_NAME: str
     MODEL_FILE: str
+    # Gradient-trained models set their optimizer class; it is recorded by name
+    # in model_parameters.json (null for RF/SVM).
+    OPTIMIZER = None
 
     @abstractmethod
     def _get_balance_methods(self, hyperparameters: dict) -> list:
@@ -1230,6 +1233,7 @@ class DDIModelTrainer(ABC):
                     # only record of what an `all` combo concatenated.
                     "features": list(args.features),
                     "seed": args.seed,
+                    "optimizer": self.OPTIMIZER and self.OPTIMIZER.__name__,
                 },
                 f,
                 indent=4,
