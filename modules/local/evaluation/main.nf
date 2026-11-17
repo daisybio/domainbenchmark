@@ -19,10 +19,13 @@ process EVAL_ONE {
     script:
         // `<split>_sources.csv` carries each test DDI's comma-joined provenance
         // list, which is what turns the predictions into per-source accuracy.
-        // The block is dropped only when meta.split is null (no test split to
-        // name). Otherwise DDI_EXTRACTION wrote the file for that split, so
-        // eval_one.py treats a missing one as a staging error and fails.
-        def sources_arg = meta.split ? "--sources ${ddi_dir}/${meta.split}_sources.csv" : ''
+        // DDI_EXTRACTION wrote the file for that split, so eval_one.py treats a
+        // missing one as a staging error and fails. A null meta.split (variant
+        // not in meta.tests) used to drop the block silently; it is a wiring bug.
+        if (!meta.split) {
+            error("EVAL_ONE ${meta.id}: no test split for variant '${meta.variant}' of ${meta.db}; per-source metrics would be skipped.")
+        }
+        def sources_arg = "--sources ${ddi_dir}/${meta.split}_sources.csv"
         """
         mkdir -p per_model
 
@@ -86,6 +89,7 @@ process EVALUATION {
             --test_split ${test_split} \\
             --ppi_score_cutoff ${params.ppi_score_cutoff} \\
             ${enrichment_arg} \\
+            ${meta.structure_features ? "--structure_features ${meta.structure_features}" : ''} \\
             --out_dir evaluation/
         """
 

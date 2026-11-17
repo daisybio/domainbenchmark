@@ -16,7 +16,7 @@ process RANDOM_FOREST {
         def output_base        = "random_forest_${meta.combo_id}"
         def output_model_dir   = "${output_base}/model"
         // One trained model, scored against every test split of this database
-        // (test_balanced + test_realistic, or a single test).
+        // (every test_<variant>, e.g. test_1_1 + test_1_10, or a single test).
         def test_splits        = meta.tests.values().join(' ')
         // Without --allow_cpu the script exits 140 when its CUDA smoke test
         // fails, so Nextflow retries on a healthy GPU node.

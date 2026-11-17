@@ -58,6 +58,7 @@ workflow PIPELINE_INITIALISATION {
 
     command = "nextflow run ${workflow.manifest.name} -profile <docker/singularity/.../institute> --input samplesheet.csv --outdir <OUTDIR>"
 
+    checkListParamsNotBoolean()
     UTILS_NFSCHEMA_PLUGIN (
         workflow,
         validate_params,
@@ -192,13 +193,13 @@ workflow PIPELINE_COMPLETION {
 //
 // daisybio/domainsplit publishes `databases/<dataset>/<split>.sqlite3` with
 // `train`, `validation`, and one or more `test*` splits: `test` for a dataset
-// whose test set comes from BUILD_EXTERNAL_TEST, `test_balanced` +
-// `test_realistic` for one with an internal test set. Each test split is
+// whose test set comes from BUILD_EXTERNAL_TEST, `test_<variant>`
+// splits (currently `test_1_1` + `test_1_10`) for one with an internal test set. Each test split is
 // benchmarked separately against the same trained models.
 //
 // Returns [ splits, tests ]:
 //   splits — ordered split names, i.e. the sqlite stems
-//   tests  — variant -> split name (`test_balanced` -> `balanced`, `test` -> `test`)
+//   tests  — variant -> split name (`test_1_10` -> `1_10`, `test` -> `test`)
 //
 def discoverSplits(db_dir) {
     def names = db_dir.list().findAll { it.endsWith('.sqlite3') }.collect { it - '.sqlite3' }
@@ -232,16 +233,21 @@ def datasetTuple(id, db_dir) {
 //
 // Accept either a List or a comma-separated String. Filter out blanks and the
 // sentinel 'none' so callers can disable a list cleanly with
-// `--graph_models none` (or `--graph_models ''` once nf-schema allows it).
+// `--graph_models none`. `--graph_models ''` (or a bare `--graph_models`)
+// arrives as Boolean true, not as an empty string, and is rejected here;
+// validateModelParams() names the parameter first.
 //
 def csvToList(s) {
+    if (s instanceof Boolean) {
+        error("A list parameter arrived as Boolean ${s}: it was given without a value (or as ''). Disable a list with 'none'.")
+    }
     def items = s instanceof List ? s : (s ? s.tokenize(',') : [])
     items*.trim().findAll { it && it.toLowerCase() != 'none' }
 }
 
 //
-// A database with an internal test set produces two runs (`random_balanced`,
-// `random_realistic`); one with a single `test` keeps its bare name. The label
+// A database with an internal test set produces one run per test variant (`random_1_1`,
+// `random_1_10`); one with a single `test` keeps its bare name. The label
 // identifies the run everywhere downstream -- process tags, the evaluation
 // directory, and the entry in the combined cross-database report.
 //
@@ -254,8 +260,8 @@ def runLabel(db_id, variant) {
 //
 // Every one of these used to surface late or not at all: two samplesheet rows
 // with one id merged their `<feature>__<split>.h5` files under one key, two
-// datasets sharing a run label (`random` + `test_balanced` next to a database
-// named `random_balanced`) collided in COMBINE_EVAL's staging and one of them
+// datasets sharing a run label (`random` + `test_1_1` next to a database
+// named `random_1_1`) collided in COMBINE_EVAL's staging and one of them
 // vanished from the combined report, and an `--mqc_order` typo was only caught
 // by COMBINE_EVAL -- the last task of the run, after every model had trained.
 //
@@ -318,6 +324,20 @@ def validateDatasets(datasets) {
 //
 def featureVariants() {
     new groovy.json.JsonSlurper().parse(file("${workflow.projectDir}/assets/feature_variants.json").toFile()) as Map
+}
+
+// Runs before schema validation: nf-schema would otherwise reject the Boolean
+// against `"type": "string"` without saying that '' is the cause.
+def checkListParamsNotBoolean() {
+    def list_params = ['machine_learning_models', 'graph_models', 'machine_learning_features',
+                       'machine_learning_features_structure', 'published_features', 'large_features', 'skip']
+    def boolean_lists = list_params.findAll { params[it] instanceof Boolean }
+    if (boolean_lists) {
+        error(
+            "${boolean_lists.collect { '--' + it }.join(', ')} arrived as Boolean, i.e. without a value " +
+            "or as '' (Nextflow reads both as true). Disable a list with 'none', e.g. --${boolean_lists[0]} none."
+        )
+    }
 }
 
 def validateModelParams() {
@@ -385,6 +405,24 @@ def validateModelParams() {
     def both = structure.findAll { features.contains(it) }
     if (both) {
         error("Listed in both machine_learning_features and machine_learning_features_structure: ${both.join(', ')}.")
+    }
+    // A repeated token used to pass here and die late in NN/RF staging with
+    // `input file name collision`.
+    def repeated = (features + structure).countBy { it }.findAll { _f, n -> n > 1 }.keySet().sort()
+    if (repeated) {
+        error("Feature(s) listed more than once: ${repeated.join(', ')}.")
+    }
+    // A structure encoder needs --structures and the SASA cache, which only
+    // machine_learning_features_structure wires up.
+    def misplaced = features.findAll {
+        def py = file("${workflow.projectDir}/bin/features/${it}.py")
+        py.exists() && py.text.contains('make_extractor(')
+    }
+    if (misplaced) {
+        error(
+            "machine_learning_features lists structure encoder(s) ${misplaced.join(', ')}; " +
+            "move them to machine_learning_features_structure."
+        )
     }
 
     def skippable = features + structure + ml_models + graph_models

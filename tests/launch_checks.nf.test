@@ -1,0 +1,54 @@
+nextflow_pipeline {
+
+    // Launch-time validation (validateModelParams): each case must fail before
+    // any task runs, naming the problem. No snapshot -- nothing is produced.
+    name "Launch checks"
+    script "../main.nf"
+    tag "pipeline"
+    tag "launch"
+
+    test("duplicate feature token fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                machine_learning_features = 'aacomp,dummy,aacomp'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains('Feature(s) listed more than once: aacomp') }
+        }
+    }
+
+    test("structure encoder in machine_learning_features fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                machine_learning_features = 'aacomp,contact_map'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains('machine_learning_features lists structure encoder(s) contact_map') }
+        }
+    }
+
+    test("list param given as '' fails before schema validation") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                graph_models = true   // what `--graph_models ''` arrives as
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains("--graph_models arrived as Boolean") }
+        }
+    }
+}

@@ -10,6 +10,13 @@ fitting is shared across a database's test variants, so it sits directly under
 `<db_name>/`; only the evaluation fans out, into
 `<db_name>/evaluation/<variant>/`.
 
+A `<variant>` is the name of a test split without its `test_` prefix: a
+database may ship any number of `test_<variant>.sqlite3`, and each is reported
+as its own dataset `<db_name>_<variant>`. The current domainsplit layout has
+`test_1_1` (in distribution, 1:1) and `test_1_10` (out of distribution, 1:10),
+both scored by the same trained model. A database with a single `test.sqlite3`
+(e.g. `external_test`) has the variant `test` and reports under its bare name.
+
 ## Pipeline overview
 
 - [Per-database outputs](#per-database-outputs) — DDI tables, features, trained models, predictions, per-database report
@@ -33,8 +40,16 @@ fitting is shared across a database's test variants, so it sits directly under
     cross-product over every instance of each family.
 - `<db_name>/data/`
   - `<feature>__<split>.h5`: one feature encoding for one split, keyed
-    `h5[pfam_id][instance_key]`. The flat name carries the layout; the ML
-    modules stage the whole set into `features/` and resolve it by name.
+    `h5[pfam_id][instance_key]`. The flat name carries the layout; each ML
+    task stages only its own combo's files into `features/` and resolves them
+    by name, so adding a feature does not rerun models that do not use it.
+  - Structure features (`--machine_learning_features_structure`) are computed
+    on domainsplit's AlphaFold 3 complexes. Positives come from PDB co-crystals
+    that are in AF3's training data, so interface features (buried surface,
+    contacts, clashes, patches) partly measure AF3's recall of known complexes
+    rather than predict an interaction. Read any structure-assisted model --
+    a structure singleton or `all` -- with that caveat. Such a model also scores
+    only the DDIs with at least one structure-covered instance pair.
   - Features listed in `--published_features` produce nothing here. domainsplit
     already exported them, once per run, and `--embeddings` points at that
     directory; `VERIFY_EMBEDDINGS` checks each file against the split databases
@@ -61,12 +76,15 @@ fitting is shared across a database's test variants, so it sits directly under
 
 </details>
 
-Every one of these is reproducible: a run is seeded end to end from
-`--seed` (see `bin/determinism.py`), and `PYTHONHASHSEED` is fixed for every
-task in `nextflow.config`, so two runs of the same commit on the same data
-produce byte-identical models, predictions and metrics. The only exceptions are
-MultiQC's own report metadata, which embeds a timestamp, absolute work-dir paths
-and the MultiQC version.
+A run is seeded end to end from `--seed` (see `bin/determinism.py`), and
+`PYTHONHASHSEED` is fixed for every task in `nextflow.config`. On the tested
+setup -- the CPU backend with the pinned containers, as the nf-test suite runs
+it (`-profile test,docker --allow_cpu_ml true`) -- two runs of the same commit on
+the same data produce byte-identical models, predictions and metrics; the
+nf-test snapshot asserts it. The GPU backends (PyTorch CUDA, cuML) and other
+hardware or library versions are seeded the same way but not tested for
+bit-identity. In either case MultiQC's own report metadata differs between
+runs: it embeds a timestamp, absolute work-dir paths and the MultiQC version.
 
 ### Combined report
 
@@ -76,7 +94,12 @@ and the MultiQC version.
 - `evaluation/`
   - `ddi_report.html`: every (database, test variant) as its own dataset entry,
     with metrics, ROC/PR curves, per-source accuracy and pairwise significance
-    across all models.
+    across all models. The per-source accuracy section has one tab per dataset
+    plus pooled `Combined_<variant>` tabs, derived from the data: one per
+    `test_<variant>` variant present in at least two datasets, each the
+    unweighted mean of the per-dataset accuracies. A single-`test` dataset such
+    as `external_test` joins no pooled tab. The `Mean over shown models` bar is
+    the mean of the bars beside it, not an ensemble.
 
 </details>
 
@@ -96,8 +119,10 @@ and the MultiQC version.
 </details>
 
 The pipeline does not collect software versions. Provenance comes from the
-container digests (one image per environment, pinned in the module definitions)
-and the Nextflow execution trace.
+container tags (one image per environment, named in the module definitions,
+e.g. `domainbenchmark-general:1.0.2`) and the Nextflow execution trace. Tags are
+mutable: the image behind a tag is not pinned by digest, so record the digest
+your engine pulled (`docker image inspect` / the SIF file) when it matters.
 
 [Nextflow](https://www.nextflow.io/docs/latest/tracing.html) provides excellent
 functionality for generating various reports relevant to the running and

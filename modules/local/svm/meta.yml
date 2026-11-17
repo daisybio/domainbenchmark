@@ -30,7 +30,7 @@ input:
         type: map
         description: |
           Groovy Map with database and feature-combo information,
-          e.g. [ id:'random_denoise', combo_id:'aacomp', features:['aacomp'], tests:[balanced:'test_balanced'] ]
+          e.g. [ id:'random_denoise', combo_id:'aacomp', features:['aacomp'], tests:['1_1':'test_1_1'] ]
     - ddi_dir:
         type: directory
         description: DDI tables from `DDI_EXTRACTION`.

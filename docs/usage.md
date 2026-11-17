@@ -113,6 +113,18 @@ To further assist in reproducibility, you can use share and reuse [parameter fil
 > [!TIP]
 > If you wish to share such profile (such as upload as supplementary material for academic publications), make sure to NOT include cluster specific paths to files, nor institutional specific profiles.
 
+### Release gate: results-tree invariants
+
+CI runs the unit tests in `tests/python` (`.github/workflows/pytest.yml`), but the
+results-tree checks in `tests/python/test_invariants.py` skip there: they need a
+finished `--outdir`. Before a release, run them against the nf-test output (or
+any full run):
+
+```bash
+DOMAINBENCHMARK_RESULTS=<outdir> PYTHONDONTWRITEBYTECODE=1 \
+    python -m pytest -q -p no:cacheprovider tests/python/test_invariants.py
+```
+
 ## Core Nextflow arguments
 
 > [!NOTE]

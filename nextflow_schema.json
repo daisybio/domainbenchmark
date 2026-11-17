@@ -97,7 +97,7 @@
                     "type": "string",
                     "default": "",
                     "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
-                    "description": "Comma-separated list of graph-based DDI models to run. Pass 'none' (or an empty string) to disable.",
+                    "description": "Comma-separated list of graph-based DDI models to run. Pass 'none' to disable ('' arrives as Boolean true and fails).",
                     "fa_icon": "fas fa-project-diagram"
                 },
                 "ppi_score_cutoff": {
@@ -127,7 +127,7 @@
                     "type": "string",
                     "default": "compactness,bsa_residue,sasa_structure,radius_of_gyration,polar_residue_fraction,k_closest_distance,depth_index,interface_arearatio,contact_map,aacomp_interface",
                     "pattern": "^(|\\s*[\\w.]+\\s*(,\\s*[\\w.]+\\s*)*)$",
-                    "description": "Comma-separated structure features, computed on the AF3 complex of each instance pair. Empty disables them.",
+                    "description": "Comma-separated structure features, computed on the AF3 complex of each instance pair. Pass 'none' to disable them.",
                     "help_text": "Each name is an encoder in bin/features/ or a parameterised variant from assets/feature_variants.json. They join every feature combo, `_all` included; a combo containing one scores only DDIs with at least one structure-covered instance pair. Caveat: positives come from PDB co-crystals that are in AF3's training data, so interface features partly measure AF3 recall.",
                     "fa_icon": "fas fa-cubes"
                 },
@@ -156,7 +156,7 @@
                 },
                 "mqc_order": {
                     "type": "string",
-                    "description": "Comma-separated dataset (run label) order for the MultiQC reports, e.g. random_balanced,minimal_leakage_hcni_realistic,external_test.",
+                    "description": "Comma-separated dataset (run label) order for the MultiQC reports, e.g. random_1_1,minimal_leakage_hcni_1_10,external_test.",
                     "help_text": "A dataset is one (database, test variant) run label. Several report sections exist once per dataset and several more carry every dataset inside one block (the tabs of the combined ROC/PR and by-source plots, the columns of the AUC/AP heatmaps); left unset all of them come out alphabetically. A name that does not exist in the data is a hard failure. A dataset present in the data but missing from the list warns and is appended alphabetically after the ordered ones.",
                     "fa_icon": "fas fa-sort-amount-down"
                 },

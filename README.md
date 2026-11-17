@@ -25,12 +25,15 @@ publishes under `databases/`), the pipeline trains a panel of machine-learning
 and graph-based predictors, evaluates each one against every held-out test
 split, and produces a unified MultiQC report comparing them.
 
-A database with an internal test set ships **two** test splits,
-`test_balanced.sqlite3` and `test_realistic.sqlite3`. Both are benchmarked
-against the *same* trained models: DDI extraction, feature extraction and model
-fitting run once per database, and only scoring and evaluation fan out. Each
-test split is then reported as its own dataset — `random_balanced`,
-`random_realistic` — with its own curves, table rows and heatmap entries.
+A database may ship several test splits, each a `test_<variant>.sqlite3`; the
+variant name is free. The current domainsplit layout has two,
+`test_1_1.sqlite3` (in distribution, 1:1) and `test_1_10.sqlite3` (out of
+distribution, 1:10). All of them are benchmarked against the *same* trained
+models: DDI extraction, feature extraction and model fitting run once per
+database, and only scoring and evaluation fan out. Each test split is then
+reported as its own dataset — `random_1_1`, `random_1_10` — with its own
+curves, table rows and heatmap entries. A database with a single `test.sqlite3`
+(e.g. `external_test`) keeps its bare name.
 
 The pipeline runs the following stages:
 
@@ -111,18 +114,21 @@ nextflow run . \
 
 ```
 databases/
-├── random/                    train, validation, test_balanced, test_realistic
+├── random/                    train, validation, test_1_1, test_1_10
 ├── random_hcni/               same positives, high-confidence negatives
-├── minimal_leakage/           train, validation, test_balanced, test_realistic
+├── minimal_leakage/           train, validation, test_1_1, test_1_10
 ├── minimal_leakage_hcni/
 ├── external_test/             train, validation, test
 └── external_test_hcni/
 ```
 
 A `<method>` / `<method>_hcni` pair is the same positive split with the
-negatives redrawn from a high-confidence candidate network, so the two runs are
-a controlled comparison in which only the negatives differ. Each is reported as
-its own dataset.
+negatives redrawn from a high-confidence candidate network, so the two runs
+differ in their input only in the negatives. They are not a fixed-model
+comparison: each database refits its models and retunes hyperparameters and
+thresholds on its own train/validation splits, so a difference between the two
+mixes the negatives' effect on the test set with their effect on training. Each
+is reported as its own dataset.
 
 ### Embeddings
 
@@ -234,7 +240,7 @@ Used by CI and by `nf-test`.
 | `--seed` | `42` | Master RNG seed. Reaches every randomised step, including workers in a process pool -- see [Reproducibility](#reproducibility). |
 | `--allow_cpu_ml` | `false` | Let `RANDOM_FOREST` train with scikit-learn when no GPU is usable, instead of exiting 140 for a retry on another GPU node. For GPU-less machines (CI, laptops); the `test` profile sets it. |
 | `--ppi_score_cutoff` | `400` | Minimum STRING `combined_score` a PPI must reach to enter the interactome every graph model builds on. |
-| `--mqc_order` | `null` | Comma-separated dataset order for the MultiQC reports, e.g. `random_balanced,minimal_leakage_hcni_realistic,external_test`. Orders the per-dataset sections, the dataset tabs inside the combined plots, and the heatmap columns. A name that matches no dataset is a hard failure; a dataset missing from the list warns and is appended alphabetically. |
+| `--mqc_order` | `null` | Comma-separated dataset order for the MultiQC reports, e.g. `random_1_1,minimal_leakage_hcni_1_10,external_test` (a dataset is `<db>_<variant>` for a `test_<variant>` split, bare `<db>` for a single `test`). Orders the per-dataset sections, the dataset tabs inside the combined plots, and the heatmap columns. A name that matches no dataset is a hard failure; a dataset missing from the list warns and is appended alphabetically. |
 | `--publish_dir_mode` | `'copy'` | Nextflow `publishDir` mode. |
 
 Full schema with defaults, types, and descriptions: `nextflow_schema.json`.
@@ -295,8 +301,13 @@ and lists every (database, test variant) pair as a separate dataset.
 
 That combined report also carries an **Accuracy by DDI source** section: one bar
 group per source (`3did`, `sampled_negative`, `single_domain_ppi`, `PPIDM*`,
-`negatome`, …), one bar per model plus an `Average` bar, and a tab per
-(database, variant) with a final `Combined` tab pooling them all. A DDI whose
+`negatome`, …), one bar per model plus a `Mean over shown models` bar (the mean
+of the bars beside it, not an ensemble), and a tab per (database, variant).
+Pooled `Combined_<variant>` tabs are derived from the data: one per
+`test_<variant>` variant present in at least two datasets (currently
+`Combined_1_1` and `Combined_1_10`), each the unweighted mean of the per-dataset
+accuracies, with the included datasets listed in its description. A database
+with a single `test` split (e.g. `external_test`) joins no pooled tab. A DDI whose
 `source` lists several sources counts under each of them, so the groups overlap
 and do not sum to the `ALL` group. Sources are usually single-class -- `3did` is
 all positives, `sampled_negative` all negatives -- so accuracy is the only
@@ -307,9 +318,14 @@ A full description of each output is in [`docs/output.md`](docs/output.md).
 
 ## Reproducibility
 
-Two runs of the same commit, on the same input, with the same `--seed` produce
-byte-identical DDI tables, feature files, trained models, predictions and
-metrics. The only outputs that differ are MultiQC's own report metadata
+Two runs of the same commit, on the same input, with the same `--seed`, in the
+same software environment (container tag or conda solve) on the CPU backend
+the nf-test suite exercises (`-profile test,docker --allow_cpu_ml true`)
+produce byte-identical DDI tables, feature files, trained models, predictions
+and metrics. That is what the nf-test snapshot asserts. Bit-reproducibility on
+the GPU backends (PyTorch CUDA, cuML) and across hardware or library versions
+is aimed for (see below) but not tested. The only outputs that differ are
+MultiQC's own report metadata
 (`ddi_report.html` and parts of `ddi_report_data/`), which embed a run
 timestamp, absolute work-dir paths and the MultiQC version.
 

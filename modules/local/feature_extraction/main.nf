@@ -16,8 +16,8 @@
 // per-feature directory tree is no longer accepted.
 //
 // The split set comes from `meta.splits` — `train`, `validation`, and one or
-// more `test*` — so a database shipping both `test_balanced` and
-// `test_realistic` produces an h5 for each while training data is extracted
+// more `test*` — so a database shipping both `test_1_1` and
+// `test_1_10` produces an h5 for each while training data is extracted
 // once.
 //
 // Structure features (params.machine_learning_features_structure) read the

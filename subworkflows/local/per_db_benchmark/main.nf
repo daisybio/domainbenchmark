@@ -112,7 +112,7 @@ def structuresFile(features) {
     }
     def remedy =
         "Set --structures to domainsplit's results/structures/structures.h5, or " +
-        "drop the structure feature(s) with --machine_learning_features_structure '' " +
+        "drop the structure feature(s) with --machine_learning_features_structure none " +
         "or --skip ${features.join(',')}."
     def input_path = params.input ? file(params.input) : null
     if (!input_path || !input_path.isDirectory()) {
@@ -130,6 +130,18 @@ def structuresFile(features) {
     }
     log.info("[structures] --structures not set; using ${candidate} (sibling of --input)")
     return candidate
+}
+
+def comboFiles(files, combo, splits) {
+    // The feature files one model task stages: only those of its own combo.
+    // Staging the whole database's set put every feature into every model's
+    // task hash, so adding one feature re-ran every model on -resume.
+    // Names follow resolve_feature_file (bin/machine_learning.py):
+    // `<feature>__<split>.h5` (extracted, structure variants included) or
+    // `<feature>.h5` (published). Matched exactly, so `k_closest_distance`
+    // does not pick up `k_closest_distance_5k`.
+    def wanted = combo.collectMany { feat -> ["${feat}.h5".toString()] + splits.collect { "${feat}__${it}.h5".toString() } }
+    files.findAll { wanted.contains(it.name) }
 }
 
 workflow PER_DB_BENCHMARK {
@@ -266,7 +278,17 @@ workflow PER_DB_BENCHMARK {
               }
             : Channel.empty()
 
-        extracted_per_db = FEATURE_EXTRACTION.out.h5.groupTuple()
+        // Sized per database (one file per extracted feature x split, the same
+        // product FEATURE_EXTRACTION fans out over), so each database's models
+        // start when its own features are done rather than when the last
+        // feature task of any database is. `remainder: true` because the
+        // output is optional: a short group still emits when the channel closes.
+        extracted_per_db = FEATURE_EXTRACTION.out.h5
+            .combine(db_ch.map { meta, _db_path -> tuple(meta.id, (meta.splits ?: ['test']).size()) }, by: 0)
+            .map { db_id, h5, n_splits -> tuple(groupKey(db_id, n_splits * feature_specs.size()), h5) }
+            .groupTuple(remainder: true)
+            // GroupKey -> plain String again, or the joins below never match.
+            .map { key, files -> tuple(key.toString(), files) }
 
         // Group every h5 back to one entry per DB. The files are staged flat
         // into `features/` by NN/RF; their names carry the layout
@@ -318,7 +340,7 @@ workflow PER_DB_BENCHMARK {
                     combo_id: combo_id,
                     tests   : meta.tests
                 ]
-                tuple(m, ddi_dir, feature_files, cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo, meta.splits ?: ['test']), cfg)
             } : Channel.empty()
         NEURAL_NETWORK(nn_input_ch)
 
@@ -336,7 +358,7 @@ workflow PER_DB_BENCHMARK {
                     combo_id: combo_id,
                     tests   : meta.tests
                 ]
-                tuple(m, ddi_dir, feature_files, cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo, meta.splits ?: ['test']), cfg)
             } : Channel.empty()
         RANDOM_FOREST(rf_input_ch)
 
@@ -354,7 +376,7 @@ workflow PER_DB_BENCHMARK {
                     combo_id: combo_id,
                     tests   : meta.tests
                 ]
-                tuple(m, ddi_dir, feature_files, cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo, meta.splits ?: ['test']), cfg)
             } : Channel.empty()
         SVM(svm_input_ch)
 
@@ -399,8 +421,9 @@ workflow PER_DB_BENCHMARK {
                         id       : "${run_label}_${model_name}",
                         db       : meta.db,
                         variant  : variant,
-                        // Split name behind the variant (`balanced` ->
-                        // `test_balanced`), which is how EVAL_ONE finds the
+                        // Split name behind the variant (`<variant>` ->
+                        // `test_<variant>`, e.g. `1_10` -> `test_1_10`;
+                        // `test` -> `test`), which is how EVAL_ONE finds the
                         // right `<split>_sources.csv`.
                         split    : (meta.tests ? meta.tests[variant] : null),
                         run_label: run_label,
@@ -501,7 +524,11 @@ workflow PER_DB_BENCHMARK {
             }
             // Without --metadata there is no enrichment entry: stage nothing.
             .join(enrichment_ch, remainder: true)
-            .map { _key, meta, db_path, jsons, enrichment -> tuple(meta, db_path, jsons, enrichment ?: []) }
+            // structure_features: the report marks `<model>_<feature>` / `_all`
+            // models built on them as structure-assisted (AF3 caveat).
+            .map { _key, meta, db_path, jsons, enrichment ->
+                tuple(meta + [structure_features: structure_features.join(',')], db_path, jsons, enrichment ?: [])
+            }
         EVALUATION(evaluation_input_ch)
 
     emit:
