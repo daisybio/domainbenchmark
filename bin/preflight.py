@@ -12,8 +12,10 @@ itself calls, so the two cannot diverge:
              single-class test split only warns). Key presence only: finiteness
              and coverage fractions are VERIFY_EMBEDDINGS' job.
   structure  structure_utils.iter_structures over every split (coverage +
-             parse_complex on every complex), plus disulfide_bond_count.encode
-             when that encoder is enabled (every CYS has SG)
+             parse_complex on every complex), plus disulfide_bond_count /
+             salt_bridge_count .encode when enabled (every CYS has SG, every
+             LYS/ARG/ASP/GLU its charged atoms) and structure_utils.cb_coords
+             when a CB-based encoder is enabled (every non-GLY residue has CB)
   sequence   embeddings.clean_sequence over each enabled sequence encoder's own
              SEQUENCE_QUERY with its own MIN_SEQUENCE_LENGTH
   metadata   create_metadata.build_table + eval_enrichment.join_predictions over
@@ -42,6 +44,10 @@ TOOLCHAIN = [
     "eval_enrichment", "enrichment_plots", "create_metadata", "statsmodels",
 ]
 TRAINING_SPLITS = ("train", "validation")
+# Structure encoders whose `encode` raises on a missing atom without reading SASA.
+ATOM_ENCODERS = {"disulfide_bond_count", "salt_bridge_count"}
+# Structure encoders that place residues at CB (structure_utils.cb_coords).
+CB_ENCODERS = {"contact_map", "patch_max_size", "patch_mean_contacts"}
 
 
 def name_value(items):
@@ -106,14 +112,21 @@ class Usable:
         return self.lookup(*key) == "ok"
 
 
-def check_structures(db, structures, check_sg):
-    """Instance pairs (frozensets) with a parsed complex; raises like SASA/extraction would."""
-    disulfide = importlib.import_module("features.disulfide_bond_count") if check_sg else None
+def check_structures(db, structures, atom_encoders, check_cb):
+    """Instance pairs (frozensets) with a parsed complex; raises like SASA/extraction would.
+
+    atom_encoders: modules whose `encode` (no SASA needed) is run on every
+    complex to check its required atoms; check_cb: every non-GLY residue has CB.
+    """
+    encoders = [importlib.import_module(f"features.{m}") for m in atom_encoders]
     covered = set()
     with connect(db) as conn:
         for (_pa, _pb, inst_a, inst_b), cx in structure_utils.iter_structures(conn, structures):
-            if disulfide:
-                disulfide.encode(cx)
+            for module in encoders:
+                module.encode(cx)
+            if check_cb:
+                structure_utils.cb_coords(cx.first)
+                structure_utils.cb_coords(cx.second)
             covered.add(frozenset((inst_a, inst_b)))
     return covered
 
@@ -212,7 +225,8 @@ def main(argv=None):
     published = {f: Usable(p) for f, p in sorted(published_paths.items())}
     sequence_modules = sorted({m for m in extracted.values()
                                if hasattr(importlib.import_module(f"features.{m}"), "SEQUENCE_QUERY")})
-    check_sg = "disulfide_bond_count" in structure.values()
+    atom_encoders = sorted(ATOM_ENCODERS & set(structure.values()))
+    check_cb = bool(CB_ENCODERS & set(structure.values()))
     if structure and args.structures is None:
         failures.append("structure features enabled but no --structures given")
 
@@ -232,10 +246,12 @@ def main(argv=None):
 
         structure_pairs = None
         if structure and args.structures is not None:
-            structure_pairs = check(f"{split} structures", check_structures, db, args.structures, check_sg)
+            structure_pairs = check(f"{split} structures", check_structures, db, args.structures,
+                                    atom_encoders, check_cb)
             if structure_pairs is not None:
                 log(f"{split}: {len(structure_pairs)} complex(es) parsed"
-                    + (", every CYS has SG" if check_sg else ""))
+                    + "".join(f", {m} atoms present" for m in atom_encoders)
+                    + (", every non-GLY residue has CB" if check_cb else ""))
 
         labels = check(f"{split} labels", ddi_labels, db)
         if not combos and args.metadata is None:

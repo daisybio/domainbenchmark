@@ -20,7 +20,7 @@ import create_metadata  # noqa: E402
 import preflight  # noqa: E402
 import verify_embeddings  # noqa: E402
 from test_enrichment import _instances  # noqa: E402
-from test_structure_features import _drop_sg, _rewrite_structures  # noqa: E402
+from test_structure_features import _add_charged_atoms, _drop_sg, _rewrite_structures  # noqa: E402
 
 DATA = REPO / "tests" / "data"
 DB_DIR = DATA / "databases" / "random"
@@ -121,6 +121,36 @@ def test_cys_without_sg_only_matters_with_disulfide(tmp_path):
     assert run(tmp_path, structures=no_sg)[0] == 0
     rc, report = run(tmp_path, structures=no_sg, extra=("--structure", "disulfide_bond_count=disulfide_bond_count"))
     assert rc == 1 and "has no SG atom" in report
+
+
+def _charged_without_nz(group, dataset, lines):
+    group, dataset, lines = _add_charged_atoms(group, dataset, lines)
+    return group, dataset, [ln for ln in lines if not (ln.startswith("ATOM") and ln[12:16].strip() == "NZ")]
+
+
+def test_salt_bridge_needs_charged_atoms(tmp_path):
+    charged = tmp_path / "charged.h5"
+    _rewrite_structures(STRUCTURES, charged, _add_charged_atoms)
+    extra = ("--structure", "salt_bridge_count=salt_bridge_count")
+    rc, report = run(tmp_path, structures=charged, extra=extra)
+    assert rc == 0 and "salt_bridge_count atoms present" in report
+    no_nz = tmp_path / "no_nz.h5"
+    _rewrite_structures(STRUCTURES, no_nz, _charged_without_nz)
+    rc, report = run(tmp_path, structures=no_nz, extra=extra)
+    assert rc == 1 and "LYS" in report and "has no NZ atom" in report
+
+
+def _drop_non_gly_cb(group, dataset, lines):
+    first = next(ln for ln in lines if ln.startswith("ATOM") and ln[12:16].strip() == "CB" and ln[17:20] != "GLY")
+    return group, dataset, [ln for ln in lines if ln != first]
+
+
+def test_missing_cb_only_matters_with_cb_encoder(tmp_path):
+    no_cb = tmp_path / "structures.h5"
+    _rewrite_structures(STRUCTURES, no_cb, _drop_non_gly_cb)
+    assert run(tmp_path, structures=no_cb)[0] == 0
+    rc, report = run(tmp_path, structures=no_cb, extra=("--structure", "contact_map=contact_map"))
+    assert rc == 1 and "has no CB atom" in report
 
 
 def test_non_numeric_ppi_score(tmp_path):

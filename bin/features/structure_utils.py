@@ -145,6 +145,11 @@ def parse_complex(blob, label):
             missing = [name for name in BACKBONE if name not in res]
             if missing:
                 raise ValueError(f"{label}: chain {chain.id} residue {res.id} lacks backbone atom(s) {missing}")
+            # A NaN coordinate compares False against every cutoff, so it would
+            # read as "no contact" instead of failing.
+            bad = [a.get_id() for a in res if not np.isfinite(a.coord).all()]
+            if bad:
+                raise ValueError(f"{label}: chain {chain.id} residue {res.id} has non-finite coordinates for {bad}")
     return model["A"], model["B"]
 
 
@@ -305,6 +310,38 @@ def ca_coords(chain):
     return np.array([res["CA"].coord for res in chain], dtype=np.float64)
 
 
+def cb_coords(chain):
+    """CB per residue (CA for GLY), float64; a non-GLY residue without CB raises."""
+    out = []
+    for res in chain:
+        if res.get_resname() == "GLY":
+            out.append(res["CA"].coord)
+        elif "CB" in res:
+            out.append(res["CB"].coord)
+        else:
+            raise ValueError(f"{res.get_resname()} {res.get_full_id()} has no CB atom")
+    return np.array(out, dtype=np.float64)
+
+
+def residue_numbers(chain):
+    """Residue sequence numbers for sequence-separation bands. An insertion
+    code would give two residues one number (separation 0, in no band), so it
+    fails instead; AF3 output carries none."""
+    ins = [res.get_full_id() for res in chain if res.id[2] != " "]
+    if ins:
+        raise ValueError(f"insertion codes are not supported for sequence-separation bands: {ins[:3]}")
+    return np.array([res.id[1] for res in chain])
+
+
+MIN_INTERFACE_DECREASE = 1.0  # A^2
+
+
+def interface_residues(cx):
+    """(first, second) index arrays, PDB order: residues whose SASA drops by
+    more than MIN_INTERFACE_DECREASE A^2 from the chain alone to the complex."""
+    return tuple(np.flatnonzero(s["iso"] - s["cplx"] > MIN_INTERFACE_DECREASE) for s in cx.sasa())
+
+
 def resnames(chain):
     return [res.get_resname() for res in chain]
 
@@ -315,13 +352,7 @@ def rsa(chain, sasa):
 
 AVG_LEVELS = (2, 4)  # k=1 is M.mean(), derivable from the row-sum mean
 MAX_LEVELS = (2,)
-SEP_EDGES = (1, 3, 5, 9, 17, 33, 65)  # |i-j| bands [1,3) [3,5) ... [65,inf)
-
-
-def n_matrix_features(symmetric, banded=False):
-    core = 9 if symmetric else 14
-    grids = sum(k * (k + 1) // 2 if symmetric else k * k for k in AVG_LEVELS + MAX_LEVELS)
-    return core + grids + (len(SEP_EDGES) if banded else 0)
+SEP_EDGES = (1, 3, 5, 9, 17, 33, 65)  # |resseq_i - resseq_j| bands [1,3) [3,5) ... [65,inf)
 
 
 def _adaptive_pool(M, k, reduce, upper_only):
@@ -335,31 +366,36 @@ def _adaptive_pool(M, k, reduce, upper_only):
     return P[np.triu_indices(k)] if upper_only else P.ravel()
 
 
-def encode_matrix(M, symmetric, banded=False):
-    """Encode a variable-size 2-D matrix into n_matrix_features(symmetric, banded) floats.
+def encode_matrix(M, symmetric, positions=None):
+    """Encode a variable-size 2-D matrix into a fixed-width vector.
 
-    symmetric: square symmetric map (one row-sum profile, upper-triangle grids);
-    otherwise rectangular (row- and column-sum profiles). banded adds the mean
-    per |i-j| band, symmetric only; a band no residue pair reaches (chain
-    shorter than the band's lower edge) is 0 by construction of the encoding.
+    symmetric: square symmetric map, core [std, row-sum mean/std/min/max/median]
+    (6) + upper-triangle grids (16) = 22. Otherwise rectangular: core adds the
+    column-sum mean/std/min/max/median (11) + full grids (24) = 35, and
+    encode_matrix(M.T) is a permutation of encode_matrix(M). Grids: mean pool at
+    k=2,4, max pool at k=2. No size term, so the vector does not encode chain
+    length. positions (residue numbers, symmetric only) adds the mean per
+    |resseq_i - resseq_j| band in SEP_EDGES (+7 = 29); a band no residue pair
+    reaches is 0 by construction of the encoding.
     """
     M = np.asarray(M, dtype=np.float64)
     if M.ndim != 2 or M.size == 0 or (symmetric and M.shape[0] != M.shape[1]):
         raise ValueError(f"encode_matrix needs a non-empty {'square ' if symmetric else ''}2-D matrix, got {M.shape}")
-    r, c = M.shape
-    rs = M.sum(axis=1)
-    stats5 = [rs.mean(), rs.std(), rs.min(), rs.max(), np.median(rs)]
-    if symmetric:
-        core = [np.log1p(r), M.std(), M.max(), (M > 0).mean(), *stats5]
-    else:
-        cs = M.sum(axis=0)
-        core = [np.log1p(r), np.log1p(c), M.std(), M.max(), (M > 0).mean(), *stats5,
-                cs.std(), cs.min(), cs.max(), np.median(cs)]
+    r, _ = M.shape
+    if positions is not None and (not symmetric or len(positions) != r):
+        raise ValueError(f"positions need a square matrix and one entry per row, got {len(positions)} for {M.shape}")
+
+    def stats5(s):
+        return [s.mean(), s.std(), s.min(), s.max(), np.median(s)]
+
+    core = [M.std(), *stats5(M.sum(axis=1))]
+    if not symmetric:
+        core += stats5(M.sum(axis=0))
     parts = [np.array(core)]
     parts += [_adaptive_pool(M, k, np.mean, symmetric) for k in AVG_LEVELS]
     parts += [_adaptive_pool(M, k, np.max, symmetric) for k in MAX_LEVELS]
-    if banded:
-        idx = np.arange(r)
+    if positions is not None:
+        idx = np.asarray(positions)
         D = np.abs(idx[:, None] - idx[None, :])
         edges = list(SEP_EDGES) + [np.inf]
         band = np.zeros(len(SEP_EDGES))

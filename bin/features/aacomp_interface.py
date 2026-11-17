@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Interface amino-acid composition: share of the buried area per residue type.
 
-Residues losing more than 1 A^2 on complex formation, buried area summed per
-type over both chains and divided by the total buried area (2x interface area).
-Symmetric, 20 values.
+Interface residues (su.interface_residues: SASA drop > 1 A^2 on complex
+formation), buried area (A^2) summed per type over both chains and divided by
+the total buried area (2x interface area). Symmetric, 20 values.
 """
 import numpy as np
 
 from features import structure_utils as su
 
 AA3 = tuple(sorted(su.MAX_SASA))
-MIN_DECREASE = 1.0
 
 
 def encode(cx):
@@ -19,7 +18,9 @@ def encode(cx):
     names = np.array(su.resnames(cx.first) + su.resnames(cx.second))
     total_a, total_b, total_ab = cx.totals()
     buried = total_a + total_b - total_ab
-    keep = decrease > MIN_DECREASE
+    idx_first, idx_second = su.interface_residues(cx)
+    keep = np.zeros(len(names), dtype=bool)
+    keep[np.concatenate([idx_first, idx_second + len(cx.first)])] = True
     if not keep.any():
         # No interface (chains not in contact, common for AF3 negatives): genuinely
         # no buried area of any type, the same 0 that bsa_structure reports.

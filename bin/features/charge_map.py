@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Charge-complementarity map of each chain's surface shell.
+"""Charge-complementarity map across the interface.
 
-Shell = residues with RSA (chain alone) > 0.2. CCI_ij = 11 - |(pI_i-7)(pI_j-7) * 19/33.8|,
-encoded by su.encode_matrix per chain. Chain-ordered: [first (32), second (32)].
+Rows = first-chain interface residues, columns = second-chain interface
+residues (su.interface_residues: SASA drop > 1 A^2), PDB order.
+CCI_ij = 11 - |(pI_i-7)(pI_j-7) * 19/33.8|, dimensionless, in [0.94, 11].
+Encoded rectangular by su.encode_matrix: 35 values, chain-ordered (the
+swapped orientation is a permutation). No interface residue on either chain
+gives zeros(35), which no real map can produce (every CCI > 0).
 """
 import numpy as np
 
@@ -14,22 +18,21 @@ ISOELECTRIC_POINT = {
     "MET": 5.74, "PHE": 5.48, "PRO": 6.30, "SER": 5.68, "THR": 5.60, "TRP": 5.89,
     "TYR": 5.66, "VAL": 5.98,
 }
-RSA_SHELL = 0.2
+WIDTH = 35  # su.encode_matrix, rectangular
 
 
-def shell_values(cx, chain, sasa, table):
-    names = np.array(su.resnames(chain))[su.rsa(chain, sasa["iso"]) > RSA_SHELL]
-    if names.size == 0:
-        cx.fail(f"chain {chain.id} has no surface residue (RSA > {RSA_SHELL})")
-    return np.array([table[name] for name in names])
+def interface_values(cx, table):
+    """`table` values of the (first, second) interface residues."""
+    return tuple(np.array([table[name] for name in su.resnames(chain)], dtype=np.float64)[idx]
+                 for chain, idx in zip((cx.first, cx.second), su.interface_residues(cx)))
 
 
 def encode(cx):
-    out = []
-    for chain, sasa in zip((cx.first, cx.second), cx.sasa()):
-        d = shell_values(cx, chain, sasa, ISOELECTRIC_POINT) - 7.0
-        out.append(su.encode_matrix(11.0 - np.abs(d[:, None] * d[None, :] * 19.0 / 33.8), symmetric=True, banded=True))
-    return np.concatenate(out)
+    a, b = interface_values(cx, ISOELECTRIC_POINT)
+    if a.size == 0 or b.size == 0:
+        return np.zeros(WIDTH)
+    a, b = a - 7.0, b - 7.0
+    return su.encode_matrix(11.0 - np.abs(a[:, None] * b[None, :] * 19.0 / 33.8), symmetric=False)
 
 
 extract_features = su.make_extractor(encode)

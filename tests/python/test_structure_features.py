@@ -19,16 +19,23 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "bin"))
 
 from features import sasa_cache  # noqa: E402
+from test_structure_encoders_synthetic import _transpose_perm  # noqa: E402
+
+TRANSPOSE_PERM = _transpose_perm()
 
 DB = REPO / "tests/data/databases/random/test_balanced.sqlite3"
 DB_DIR = DB.parent
 STRUCTURES = REPO / "tests/data/structures/structures.h5"
 VARIANTS = json.loads((REPO / "assets/feature_variants.json").read_text())
 
-# feature -> (width, chain layout). "sym": vec_ba == vec_ab. A list of
-# (start, stop) halves: those blocks swap between orientations.
-H32 = [(0, 32), (32, 64)]
-H6 = [(0, 6), (6, 12)]
+# feature -> (width, chain layout). "sym": vec_ba == vec_ab. Otherwise
+# (halves, transpose): `halves` = [(start, stop), (start, stop)] blocks that
+# swap between orientations (or []), `transpose` = (start, stop) of a
+# rectangular su.encode_matrix block that permutes (M -> M.T), or None; every
+# other element is equal in both orientations.
+H6 = ([(0, 6), (6, 12)], None)
+MAP = ([], (0, 35))
+PATCH = ([(0, 1), (1, 2)], None)
 EXPECTED = {
     "aacomp_interface": (20, "sym"),
     "angles_phi": (12, "sym"),
@@ -36,20 +43,20 @@ EXPECTED = {
     "bsa_residue": (6, "sym"),
     "bsa_structure": (1, "sym"),
     "bsa_structure_norm": (1, "sym"),
-    "charge_map": (64, H32),
+    "charge_map": (35, MAP),
     "clash_backbone_atoms": (1, "sym"),
     "clash_heavy_atoms": (1, "sym"),
     "compactness": (1, "sym"),
-    "contact_map": (102, H32),
+    "contact_map": (93, ([(0, 29), (29, 58)], (58, 93))),
     "depth_index": (6, "sym"),
     "disulfide_bond_count": (1, "sym"),
-    "hydrophobic_map": (64, H32),
+    "hydrophobic_map": (35, MAP),
     "interface_arearatio": (1, "sym"),
     "k_closest_distance_5k": (1, "sym"),
     "k_closest_distance_10k": (1, "sym"),
-    "patch_max_size_5A": (1, "sym"),
-    "patch_max_size_7.5A": (1, "sym"),
-    "patch_max_size_10A": (1, "sym"),
+    "patch_max_size_5A": (3, PATCH),
+    "patch_max_size_7.5A": (3, PATCH),
+    "patch_max_size_10A": (3, PATCH),
     "patch_mean_contacts_5A": (1, "sym"),
     "patch_mean_contacts_7.5A": (1, "sym"),
     "patch_mean_contacts_10A": (1, "sym"),
@@ -67,6 +74,9 @@ EXPECTED = {
 # One reader per cached field (iso, cplx, depth); Shrake-Rupley on the fly
 # costs ~7 s per feature here, so not every SASA encoder is rerun.
 SASA_FEATURES = ["rasa_residue", "sasa_residue_complex", "depth_index"]
+# Encoders W-2 redefined; each must vary over the fixture.
+REWRITTEN = ["contact_map", "charge_map", "hydrophobic_map", "salt_bridge_count",
+             *(f"{f}_{t}" for f in ("patch_max_size", "patch_mean_contacts") for t in ("5A", "7.5A", "10A"))]
 
 
 def spec(feature):
@@ -130,9 +140,40 @@ def _rewrite_structures(src_path, dst_path, transform):
                 dst.require_group(g)[d] = np.frombuffer(blob, dtype=np.uint8)
 
 
+CHARGED_ATOMS = {"LYS": ("NZ",), "ARG": ("NE", "NH1", "NH2"), "ASP": ("OD1", "OD2"), "GLU": ("OE1", "OE2")}
+
+
+def _add_charged_atoms(group, dataset, lines):
+    """Give every LYS/ARG/ASP/GLU its charged atoms, 1.5 A from CB toward the partner chain.
+
+    The fixture has backbone + CB only, so without this every salt bridge is 0.
+    """
+    atoms = [ln for ln in lines if ln.startswith("ATOM")]
+    y = {c: np.mean([float(ln[38:46]) for ln in atoms if ln[21] == c and ln[12:16].strip() == "CA"]) for c in "AB"}
+    out = []
+    for ln in lines:
+        out.append(ln)
+        if ln.startswith("ATOM") and ln[12:16].strip() == "CB" and ln[17:20] in CHARGED_ATOMS:
+            toward = np.sign(y["B" if ln[21] == "A" else "A"] - y[ln[21]])
+            x0, y0, z0 = float(ln[30:38]), float(ln[38:46]), float(ln[46:54])
+            for k, name in enumerate(CHARGED_ATOMS[ln[17:20]]):
+                xyz = f"{x0 + 0.4 * k:8.3f}{y0 + 1.5 * toward:8.3f}{z0:8.3f}"
+                out.append(ln[:12] + f" {name:<3s}" + ln[16:30] + xyz + ln[54:76] + f"{name[0]:>2s}")
+    return group, dataset, out
+
+
 @pytest.fixture(scope="session")
-def outputs(cache):
-    return {feature: run(feature, cache=cache) for feature in EXPECTED}
+def charged_structures(tmp_path_factory):
+    path = tmp_path_factory.mktemp("charged") / "structures.h5"
+    _rewrite_structures(STRUCTURES, path, _add_charged_atoms)
+    return path
+
+
+@pytest.fixture(scope="session")
+def outputs(cache, charged_structures):
+    # salt_bridge_count reads no SASA, so the copy never touches the cache.
+    return {feature: run(feature, cache=cache) if feature != "salt_bridge_count"
+            else run(feature, structures=charged_structures) for feature in EXPECTED}
 
 
 def test_variants_file_covers_expected():
@@ -153,11 +194,34 @@ def test_encoder_layout(outputs, feature):
         assert np.isfinite(ab).all() and np.isfinite(ba).all()
         if layout == "sym":
             assert np.array_equal(ab, ba)
-        else:
-            (s1, e1), (s2, e2) = layout
+            continue
+        halves, transpose = layout
+        rest = np.ones(width, dtype=bool)
+        if halves:
+            (s1, e1), (s2, e2) = halves
             assert np.array_equal(ab[s1:e1], ba[s2:e2]) and np.array_equal(ab[s2:e2], ba[s1:e1])
-    if layout != "sym":  # the halves really differ somewhere, or the check proves nothing
+            rest[s1:e1] = rest[s2:e2] = False
+        if transpose:
+            s, e = transpose
+            # allclose: the transposed sums run in a different order
+            assert np.allclose(ab[s:e][TRANSPOSE_PERM], ba[s:e])
+            rest[s:e] = False
+        assert np.array_equal(ab[rest], ba[rest])
+    if layout == "sym":
+        return
+    # The blocks really differ somewhere, or the check proves nothing.
+    halves, transpose = layout
+    if halves:
+        (s1, e1), (s2, e2) = halves
         assert any(not np.array_equal(v[s1:e1], v[s2:e2]) for v in out.values())
+    if transpose:
+        s, e = transpose
+        assert any(not np.allclose(v[s:e][TRANSPOSE_PERM], v[s:e]) for v in out.values())
+
+
+@pytest.mark.parametrize("feature", REWRITTEN)
+def test_not_degenerate(outputs, feature):
+    assert len({v.tobytes() for v in outputs[feature].values()}) > 2
 
 
 def test_coverage_holes_and_homodimer(outputs):
