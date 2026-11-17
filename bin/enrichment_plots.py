@@ -24,7 +24,7 @@ GROUP_ORDER = ("af", "interpro", "biochem")
 ENRICHMENT_SIDECAR = "enrichment.json"
 PREFIX = "enrichment_"
 OBSERVED = "observed (model-independent)"
-TIDY_COLUMNS = ["dataset", "model", "target", "quantity", "feature", "value"]
+TIDY_COLUMNS = ["dataset", "model", "target", "quantity", "feature", "value", "n", "status", "reason"]
 TARGET_LABELS = {
     "observed": "Observed label (Logit)",
     "predicted": "Predicted label (Logit)",
@@ -87,30 +87,39 @@ def _feature_order(features, quantity):
 
 
 def tidy(datasets):
-    """Every reported number, one row each (TIDY_COLUMNS)."""
+    """Every reported number, one row each (TIDY_COLUMNS). Every target, skipped
+    ones included, also gets one `status` row, so "not fitted" is never confused
+    with "no effect"; every row carries its fit's n, status and reason."""
     ln2 = float(np.log(2.0))
-    rows = []
+    out = []
     for ds, d in datasets.items():
         for model, js in [(OBSERVED, d["observed"])] + sorted(d["models"].items()):
             for target, t in js["targets"].items():
-                if t["status"] != "ok":
-                    continue
-                rows.append((ds, model, target, "r2_adj", "", t["r2_adj"]))
-                for q in ("delta_r2", "group_delta_r2", "single_feature_r2"):
-                    rows += [(ds, model, target, q, f, v) for f, v in t[q].items()]
-                for eq, coefs in t["equations"].items():
-                    tk = _target_key(target, eq)
-                    for f, s in coefs.items():
-                        rows += [(ds, model, tk, k, f, s[k]) for k in ("coef", "se", "p", "q")]
-                        if t["model_kind"] != "ols" and s["coef"] is not None:
-                            rows.append((ds, model, tk, "log2_odds_ratio", f, s["coef"] / ln2))
-                for eq, vals in t["single_feature_log_odds"].items():
-                    rows += [
-                        (ds, model, _target_key(target, eq), "single_feature_log2_odds", f,
-                         None if v is None else v / ln2)
-                        for f, v in vals.items()
-                    ]
-    return pd.DataFrame(rows, columns=TIDY_COLUMNS).astype({"value": float})
+                rows = [(ds, model, target, "status", "", None)]
+                if t["status"] == "ok":
+                    rows.append((ds, model, target, "r2_adj", "", t["r2_adj"]))
+                    rows += _fit_rows(ds, model, target, t, ln2)
+                out += [(*r, t["n_rows"], t["status"], t.get("reason")) for r in rows]
+    return pd.DataFrame(out, columns=TIDY_COLUMNS).astype({"value": float})
+
+
+def _fit_rows(ds, model, target, t, ln2):
+    rows = []
+    for q in ("delta_r2", "group_delta_r2", "single_feature_r2"):
+        rows += [(ds, model, target, q, f, v) for f, v in t[q].items()]
+    for eq, coefs in t["equations"].items():
+        tk = _target_key(target, eq)
+        for f, s in coefs.items():
+            rows += [(ds, model, tk, k, f, s[k]) for k in ("coef", "se", "p", "q")]
+            if t["model_kind"] != "ols" and s["coef"] is not None:
+                rows.append((ds, model, tk, "log2_odds_ratio", f, s["coef"] / ln2))
+    for eq, vals in t["single_feature_log_odds"].items():
+        rows += [
+            (ds, model, _target_key(target, eq), "single_feature_log2_odds", f,
+             None if v is None else v / ln2)
+            for f, v in vals.items()
+        ]
+    return rows
 
 
 def _z(values):
@@ -172,6 +181,14 @@ def _html_block(outdir, block_id, section, description, axes, entries, height=52
     })
 
 
+def _balance(counts):
+    """"75/76 → 74/76": label counts of all rows vs the complete-case rows."""
+    if "label_counts_complete" not in counts:
+        return "-"
+    fmt = lambda d: f"{d.get('0', 0)}/{d.get('1', 0)}"  # noqa: E731
+    return f"{fmt(counts['label_counts_with_metadata'])} → {fmt(counts['label_counts_complete'])}"
+
+
 def status_block(datasets, outdir):
     """Row counts, dropped columns and fit status per (dataset, model): what
     the regressions rest on, including every target that was skipped and why."""
@@ -185,18 +202,24 @@ def status_block(datasets, outdir):
                 "all values present": c["n_complete"],
                 # Per (db, variant), so only the observed row carries it.
                 "DDI metadata from a subset of pairs": c.get("n_ddis_partial_pair_metadata", "-"),
+                "label 0/1 (with metadata → complete)": _balance(c),
                 "dropped columns": ", ".join(f"{k} ({v})" for k, v in js["dropped_columns"].items()) or "-",
             }
             for target, t in js["targets"].items():
+                fit_dropped = [k for k, v in t.get("dropped_columns", {}).items() if v != "constant"]
                 row[TARGET_LABELS[target]] = (
-                    f"ok (n={t['n_rows']})" if t["status"] == "ok" else f"skipped: {t['reason']}"
+                    f"ok (n={t['n_rows']}" + (f"; aliased: {', '.join(fit_dropped)}" if fit_dropped else "") + ")"
+                    if t["status"] == "ok" else f"skipped: {t['reason']}"
                 )
             data[model if len(datasets) == 1 else f"{ds} | {model}"] = row
     return _write(outdir, {
         "id": f"{PREFIX}status",
         "section_name": "Metadata enrichment — rows and fit status",
-        "description": "Rows with a missing metadata value are left out of every fit (counted here, "
-                       "never imputed). Features are standardised per fit; OLS uses HC3, Logit/MNLogit "
+        "description": "A metadata column with values in under half the rows is dropped (listed); otherwise "
+                       "rows with a missing value are left out of every fit (counted here, never imputed). "
+                       "Constant and aliased columns are dropped per fit. Logit/MNLogit need 10 events of "
+                       "the smallest class per parameter, OLS 10 rows. "
+                       "Features are standardised per fit; OLS uses HC3, Logit/MNLogit "
                        "HC0 robust standard errors; q-values are Benjamini-Hochberg per fit.",
         "plot_type": "table",
         "pconfig": {"id": f"{PREFIX}status_table", "title": "Enrichment: rows and fit status", "col1_header": "Model"},

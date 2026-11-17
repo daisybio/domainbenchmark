@@ -25,10 +25,11 @@ leave-group-out ΔR^2 (af_* / interpro_* / biochem), and single-feature
 R^2 and log-odds. Features are standardised per fit, so coefficients are per SD.
 
 A fit that cannot be estimated on this data (one class, a class under
-MIN_CLASS_SIZE rows, under MIN_ROWS_PER_PARAMETER rows per parameter,
-non-converged MLE -- what
+MIN_CLASS_SIZE rows, under MIN_ROWS_PER_PARAMETER rows (OLS) or
+smallest-class events (Logit/MNLogit) per parameter, non-converged MLE -- what
 (quasi-)separation looks like -- or a singular Hessian) is recorded with its
-reason. Anything else raises.
+reason. Anything else raises. Constant and aliased columns (condition number
+over MAX_CONDITION) are dropped per fit and recorded in its `dropped_columns`.
 """
 
 import argparse
@@ -59,8 +60,15 @@ GROUP_PREFIXES = (("af_", "af"), ("interpro_", "interpro"))
 DEFAULT_GROUP = GROUP_ORDER[-1]
 #: Smallest class a Logit/MNLogit target may have; below it the fit is skipped.
 MIN_CLASS_SIZE = 10
-#: Fewer rows per estimated parameter than this and the fit is skipped.
+#: Fewer rows (OLS) or smallest-class events (Logit/MNLogit) per estimated
+#: parameter than this and the fit is skipped.
 MIN_ROWS_PER_PARAMETER = 10
+#: A column with values in fewer than this share of rows is dropped rather
+#: than dropping its rows from every target.
+MIN_COLUMN_COVERAGE = 0.5
+#: Condition number of the standardised design (intercept + columns) above
+#: which a column is aliased and dropped -- Belsley's "serious" bound.
+MAX_CONDITION = 100
 
 
 class Degenerate(Exception):
@@ -84,23 +92,50 @@ def feature_columns(table):
 def complete_cases(df, features):
     """Rows with every usable feature present, plus what was dropped and why.
 
-    A column with no value at all in this split is dropped (it would otherwise
-    remove every row); any other missing value drops its row, and both are
-    counted, never imputed.
+    A column with values in under MIN_COLUMN_COVERAGE of the rows is dropped
+    (one sparse column, e.g. af_*, would otherwise restrict every target to
+    its covered rows); any other missing value drops its row, and both are
+    counted, never imputed. The label balance of the complete rows is reported
+    next to that of all rows, so a shift caused by the dropping is visible.
 
     No usable column, or no complete row, is not an error: it depends on which
     DDI subset a model scored (a structure combo scores only covered DDIs), so
     `analyse()` records every target as skipped instead.
     """
-    dropped = {c: "no values in this split" for c in features if df[c].isna().all()}
+    coverage = df[features].notna().mean()
+    dropped = {
+        c: f"{coverage[c]:.0%} of rows have a value (under {MIN_COLUMN_COVERAGE:.0%})"
+        for c in features if not coverage[c] >= MIN_COLUMN_COVERAGE  # NaN on an empty split
+    }
     used = [c for c in features if c not in dropped]
     complete = df.dropna(subset=used) if used else df.iloc[:0]
+    balance = lambda d: {str(k): int(v) for k, v in sorted(d["label"].astype(int).value_counts().items())}  # noqa: E731
     counts = {
         "n_with_metadata": int(len(df)),
         "n_complete": int(len(complete)),
         "n_missing_by_column": {c: int(df[c].isna().sum()) for c in used},
+        "label_counts_with_metadata": balance(df),
+        "label_counts_complete": balance(complete),
     }
     return complete, used, dropped, counts
+
+
+def aliased_columns(Z):
+    """{column: reason} for columns that make the standardised design (with an
+    intercept) ill-conditioned, taken greedily in column order: a column is kept
+    only while intercept + kept columns stay at or under MAX_CONDITION. A
+    rank-deficient design has an infinite / huge condition number, so this is
+    also the rank check -- OLS would otherwise fit it through a pseudo-inverse
+    and report confident p-values for both aliased columns."""
+    kept, dropped = [], {}
+    ones = np.ones((len(Z), 1))
+    for c in Z.columns:
+        cond = float(np.linalg.cond(np.hstack([ones, Z[kept + [c]].to_numpy(dtype=float)])))
+        if not cond <= MAX_CONDITION:
+            dropped[c] = f"aliased (condition number {cond:.3g} > {MAX_CONDITION} with {', '.join(kept)})"
+        else:
+            kept.append(c)
+    return dropped
 
 
 def _num(v):
@@ -191,14 +226,22 @@ def analyse(target, X, y, threads=1):
         sd = X.std(ddof=0)
         out["dropped_columns"] = {c: "constant" for c in X.columns if not sd[c] > 0}
         X = X.drop(columns=list(out["dropped_columns"]))
+        Z = (X - X.mean()) / sd[X.columns]
+        aliased = aliased_columns(Z)
+        out["dropped_columns"].update(aliased)
+        Z = Z.drop(columns=list(aliased))
+        if Z.shape[1] == 0:
+            raise Degenerate(f"every metadata column is constant or aliased in these rows {out['dropped_columns']}")
         n_eq = len(classes) - 1 if kind == "mnlogit" else 1
-        n_params = (X.shape[1] + 1) * n_eq
-        if X.shape[1] == 0 or len(y) < MIN_ROWS_PER_PARAMETER * n_params:
+        n_params = (Z.shape[1] + 1) * n_eq
+        # Logit/MNLogit: what limits the fit is the smallest class, not the rows.
+        n_events, unit = (len(y), "rows") if kind == "ols" else (int(counts.min()), "events in the smallest class")
+        if n_events < MIN_ROWS_PER_PARAMETER * n_params:
             raise Degenerate(
-                f"{len(y)} rows for {n_params} parameters (need {MIN_ROWS_PER_PARAMETER} per parameter)"
+                f"{n_events} {unit} for {n_params} parameters (need {MIN_ROWS_PER_PARAMETER} per parameter)"
             )
-        cols = list(X.columns)
-        Z = ((X - X.mean()) / sd[cols]).to_numpy(dtype=float)
+        cols = list(Z.columns)
+        Z = Z.to_numpy(dtype=float)
         res = _fit(kind, Z, y)
     except Degenerate as e:
         print(f"[enrichment] {target}: skipped -- {e}")

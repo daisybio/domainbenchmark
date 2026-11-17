@@ -61,12 +61,13 @@ def test_missing_values_are_counted_not_imputed():
     df = pd.DataFrame({"domain_a": list("abcd"), "domain_b": list("abcd"), "label": [0, 1, 0, 1],
                        "x": [1.0, np.nan, 3.0, 4.0], "y": [1.0, 2.0, 3.0, 5.0], "empty": [np.nan] * 4})
     complete, used, dropped, counts = ee.complete_cases(df, ee.feature_columns(df))
-    assert used == ["x", "y"] and dropped == {"empty": "no values in this split"}
-    assert counts == {"n_with_metadata": 4, "n_complete": 3, "n_missing_by_column": {"x": 1, "y": 0}}
+    assert used == ["x", "y"] and dropped == {"empty": "0% of rows have a value (under 50%)"}
+    assert counts == {"n_with_metadata": 4, "n_complete": 3, "n_missing_by_column": {"x": 1, "y": 0},
+                      "label_counts_with_metadata": {"0": 2, "1": 2}, "label_counts_complete": {"0": 2, "1": 1}}
     assert not complete[used].isna().any().any()
 
 
-@pytest.mark.parametrize("x, reason", [([np.nan] * 4, "no metadata column"), ([np.nan, 1.0, np.nan, np.nan], "no row")])
+@pytest.mark.parametrize("x, reason", [([np.nan] * 4, "no metadata column"), ([1.0, 2.0, np.nan, np.nan], "no row")])
 def test_no_complete_rows_is_a_recorded_skip(x, reason):
     """Depends on the DDI subset a model scored, so it must not fail the task."""
     df = pd.DataFrame({"domain_a": list("abcd"), "domain_b": list("abcd"), "label": [0, 1, 0, 1],
@@ -178,8 +179,9 @@ def test_smoke_fixture_end_to_end(tmp_path):
     result = json.loads(out.read_text())
     assert list(result["targets"]) == ["predicted", "combined", "error_positive", "error_negative"]
     assert result["counts"]["n_predictions"] == 151 and result["counts"]["n_complete"] == 150
-    # The test split is sized for 7 parameters x 10 rows per class; the 4-class
-    # MNLogit needs 21 x 10 and still skips with its reason.
+    # The test split is sized for 7 parameters x 10 events of the smallest class
+    # (observed 74, predicted 70 -- exactly at the gate); the 4-class MNLogit
+    # needs 21 x 10 and still skips with its reason.
     status = {name: t["status"] for name, t in result["targets"].items()}
     assert status == {"predicted": "ok", "combined": "skipped", "error_positive": "ok", "error_negative": "ok"}
     assert "per parameter" in result["targets"]["combined"]["reason"]
