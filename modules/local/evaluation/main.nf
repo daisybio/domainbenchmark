@@ -90,6 +90,7 @@ process EVALUATION {
             --ppi_score_cutoff ${params.ppi_score_cutoff} \\
             ${enrichment_arg} \\
             ${meta.structure_features ? "--structure_features ${meta.structure_features}" : ''} \\
+            ${meta.structure_informed ? "--structure_informed_features ${meta.structure_informed}" : ''} \\
             --out_dir evaluation/
         """
 

@@ -51,4 +51,19 @@ nextflow_pipeline {
             assert (workflow.stdout + workflow.stderr).any { it.contains("--graph_models arrived as Boolean") }
         }
     }
+
+    test("structure_informed_features outside published_features fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                structure_informed_features = 'aacomp'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains('structure_informed_features lists aacomp, which is not in published_features') }
+        }
+    }
 }

@@ -110,8 +110,14 @@ def test_model_artefact_matches_label_and_all_excludes_dummy():
         assert not (d / "model" / ("RandomForest.pkl" if nn else "NeuralNetwork.pkl")).exists(), d
         feats = json.loads((d / "model" / "model_parameters.json").read_text())["features"]
         combo = d.name.split("_", 2)[2]
-        if combo == "all":
+        if combo in ("all", "all_seq"):
             assert "dummy" not in feats and len(feats) >= 2, (d, feats)
+            if combo == "all_seq":
+                # A subset of the same model's `all` (which drops nothing it keeps).
+                all_dir = d.with_name(d.name[: -len("all_seq")] + "all")
+                if all_dir.exists():
+                    full = json.loads((all_dir / "model" / "model_parameters.json").read_text())["features"]
+                    assert set(feats) < set(full), (d, feats, full)
         else:
             assert feats == [combo], (d, feats)
 

@@ -171,6 +171,7 @@ workflow PER_DB_BENCHMARK {
         // Structure features read domainsplit's AF3 complexes. They take part
         // in every combo like any other feature, `_all` included -- so `_all`
         // scores only the DDIs with at least one structure-covered instance pair.
+        // `_all_seq` is the one combo without them.
         def all_structure        = any_ml ? csvToList(params.machine_learning_features_structure) : []
         def structure_features   = all_structure.findAll { !skip_features.contains(it) }
         def ml_features          = all_features.findAll { !skip_features.contains(it) } + structure_features
@@ -198,12 +199,26 @@ workflow PER_DB_BENCHMARK {
         def all_graph_models     = csvToList(params.graph_models)
         def graph_model_names    = all_graph_models.findAll { !skip_features.contains(it) }
 
-        // One run per feature (singleton) plus one all-feature concatenation
-        // run when more than one feature is available. `dummy` is a noise
-        // control, so it gets its singleton run but stays out of `all`.
-        def feature_combos = ml_features.collect { [it] }
+        // One run per feature (singleton) plus two concatenations, each built
+        // when it holds >= 2 features. `dummy` is a noise control, so it gets
+        // its singleton run but joins neither.
+        //   all     -- every other feature, structure ones included.
+        //   all_seq -- sequence features only: no structure feature and no
+        //              structure-informed embedding (params.structure_informed_features),
+        //              so it scores the full population. Skipped when it
+        //              would be the same set as `all`.
+        // Each combo is [id: ..., features: [...]]; the id names the output
+        // directory, task tag and report entry, so it must be unique.
+        def structure_informed = csvToList(params.structure_informed_features)
+        def feature_combos = ml_features.collect { [id: it, features: [it]] }
         def all_combo      = ml_features.findAll { it != 'dummy' }
-        if (all_combo.size() >= 2) feature_combos << all_combo
+        def all_seq_combo  = all_combo.findAll { !structure_features.contains(it) && !structure_informed.contains(it) }
+        if (all_combo.size() >= 2) feature_combos << [id: 'all', features: all_combo]
+        if (all_seq_combo.size() >= 2 && all_seq_combo != all_combo) feature_combos << [id: 'all_seq', features: all_seq_combo]
+        def dup_combo_ids = feature_combos*.id.countBy { it }.findAll { _id, n -> n > 1 }.keySet()
+        if (dup_combo_ids) {
+            error("Feature combo id(s) ${dup_combo_ids.join(', ')} used twice: a feature may not be called 'all' or 'all_seq'.")
+        }
 
         // Every model scores every test split, so each (db, variant) receives
         // exactly this many predictions. Known up front, which lets the
@@ -247,7 +262,7 @@ workflow PER_DB_BENCHMARK {
             structures_file ?: [],
             params.metadata ? file(params.metadata, checkIfExists: true) : [],
             [
-                combos   : feature_combos,
+                combos   : feature_combos*.features,
                 extracted: feature_specs.findAll { !it.structure }.collectEntries { [(it.name): it.module] },
                 structure: feature_specs.findAll { it.structure }.collectEntries { [(it.name): it.module] },
             ]
@@ -331,16 +346,16 @@ workflow PER_DB_BENCHMARK {
             .combine(Channel.fromList(feature_combos.collect { [it] }))
             .combine(Channel.value(ml_config))
             .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
-                def combo_id = combo.size() == 1 ? combo[0] : 'all'
+                def combo_id = combo.id
                 def m = [
                     id      : "${meta.id}_neural_network_${combo_id}",
                     db      : meta.db,
                     model   : 'neural_network',
-                    features: combo,
+                    features: combo.features,
                     combo_id: combo_id,
                     tests   : meta.tests
                 ]
-                tuple(m, ddi_dir, comboFiles(feature_files, combo, meta.splits ?: ['test']), cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test']), cfg)
             } : Channel.empty()
         NEURAL_NETWORK(nn_input_ch)
 
@@ -349,16 +364,16 @@ workflow PER_DB_BENCHMARK {
             .combine(Channel.fromList(feature_combos.collect { [it] }))
             .combine(Channel.value(rf_config))
             .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
-                def combo_id = combo.size() == 1 ? combo[0] : 'all'
+                def combo_id = combo.id
                 def m = [
                     id      : "${meta.id}_random_forest_${combo_id}",
                     db      : meta.db,
                     model   : 'random_forest',
-                    features: combo,
+                    features: combo.features,
                     combo_id: combo_id,
                     tests   : meta.tests
                 ]
-                tuple(m, ddi_dir, comboFiles(feature_files, combo, meta.splits ?: ['test']), cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test']), cfg)
             } : Channel.empty()
         RANDOM_FOREST(rf_input_ch)
 
@@ -367,16 +382,16 @@ workflow PER_DB_BENCHMARK {
             .combine(Channel.fromList(feature_combos.collect { [it] }))
             .combine(Channel.value(svm_config))
             .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
-                def combo_id = combo.size() == 1 ? combo[0] : 'all'
+                def combo_id = combo.id
                 def m = [
                     id      : "${meta.id}_svm_${combo_id}",
                     db      : meta.db,
                     model   : 'svm',
-                    features: combo,
+                    features: combo.features,
                     combo_id: combo_id,
                     tests   : meta.tests
                 ]
-                tuple(m, ddi_dir, comboFiles(feature_files, combo, meta.splits ?: ['test']), cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test']), cfg)
             } : Channel.empty()
         SVM(svm_input_ch)
 
@@ -524,10 +539,13 @@ workflow PER_DB_BENCHMARK {
             }
             // Without --metadata there is no enrichment entry: stage nothing.
             .join(enrichment_ch, remainder: true)
-            // structure_features: the report marks `<model>_<feature>` / `_all`
-            // models built on them as structure-assisted (AF3 caveat).
+            // structure_features / structure_informed: the report marks
+            // `<model>_<feature>` / `_all` models built on either as
+            // structure-assisted (the AF3 caveat applies to the former only).
             .map { _key, meta, db_path, jsons, enrichment ->
-                tuple(meta + [structure_features: structure_features.join(',')], db_path, jsons, enrichment ?: [])
+                tuple(meta + [structure_features: structure_features.join(','),
+                              structure_informed: ml_features.findAll { structure_informed.contains(it) }.join(',')],
+                      db_path, jsons, enrichment ?: [])
             }
         EVALUATION(evaluation_input_ch)
 

@@ -64,8 +64,10 @@ scored by the same trained model. A database with a single `test.sqlite3`
   - `model/`: the fitted model plus `model_parameters.json` (chosen
     hyperparameters, balance method, tuned decision threshold).
   - `predictions_<variant>.parquet`: one file per test split, scored by the one
-    trained model. `<combo>` is a single feature name, or `all` for the
-    all-feature concatenation run. One row per DDI, with `domain_a <= domain_b`:
+    trained model. `<combo>` is a single feature name, `all` for the
+    all-feature concatenation run (everything but `dummy`), or `all_seq` for the
+    sequence-only one (`all` minus structure features and
+    `--structure_informed_features`). One row per DDI, with `domain_a <= domain_b`:
     the loader instantiates each pair in both orientations (the feature vector is
     `concat(emb_a, emb_b)`, so the model needs both to stay symmetric) and the
     two are averaged back into a single row here.

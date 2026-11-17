@@ -122,6 +122,14 @@ def parse_arguments():
              "source_accuracy.json.",
     )
     p.add_argument(
+        "--structure_informed_features",
+        default=None,
+        help="Comma-separated structure-informed published embeddings of this "
+             "run (params.structure_informed_features that are enabled). Models "
+             "using one -- its singleton or `_all` -- are marked structure-"
+             "assisted too; the AF3-complex caveat does not apply to them.",
+    )
+    p.add_argument(
         "--structure_features",
         default=None,
         help="Comma-separated structure features of this run "
@@ -242,6 +250,7 @@ def write_multiqc_json_metrics(
     outdir,
     prefix,
     structure_features=(),
+    af3_features=(),
 ) -> None:
     # Write MultiQC JSON blocks for metrics, ROC and PR curves
     # @metrics_aucap: dict with AUC and AP metrics per model
@@ -308,8 +317,12 @@ def write_multiqc_json_metrics(
             return NO_SELF_PAIRS_NA
         return "n/a"
 
+    # structure_features: every feature that makes a model structure-assisted
+    # (AF3-complex features and structure-informed embeddings); af3_features:
+    # the AF3-complex ones, the only ones the AF3 caveat is about.
     structure_models = [m for m in metrics_aucap
                         if is_structure_assisted(m, structure_features)]
+    af3_models = [m for m in metrics_aucap if is_structure_assisted(m, af3_features)]
 
     # --- Block 1: AUC/AP table -----------------------------------------------
     # Numeric mean kept as float (enables table colour-scale + downstream
@@ -333,7 +346,7 @@ def write_multiqc_json_metrics(
             "Structure-assisted": "yes" if m in structure_models else "no",
         }
     description = PAIRS_NOTE
-    if structure_models:
+    if af3_models:
         description += " " + AF3_CAVEAT
     table_block = {
         "id": table_id,
@@ -384,8 +397,9 @@ def write_multiqc_json_metrics(
             },
             "Structure-assisted": {
                 "title": "Structure-assisted",
-                "description": "Uses an AF3-complex structure feature. "
-                + AF3_CAVEAT,
+                "description": "Uses an AF3-complex structure feature or a "
+                "structure-informed embedding (e.g. ESM3 with structure input). "
+                "For AF3-complex features: " + AF3_CAVEAT,
                 "scale": False,
             },
             "ROC AUC": {
@@ -603,7 +617,11 @@ def is_structure_assisted(model, structure_features) -> bool:
     """`<ml_model>_<feature>` names a structure feature, or `_all` with any.
 
     Model names are `<ml_model>_<combo>` (the prediction's parent directory),
-    where combo is one feature or `all`; graph models match nothing.
+    where combo is one feature, `all` or `all_seq` (never structure-assisted:
+    it excludes structure features and structure-informed embeddings, and does
+    not end in `_all`); graph models match nothing. `structure_features` here
+    holds both kinds (main() joins --structure_features and
+    --structure_informed_features).
     """
     features = list(structure_features or [])
     return bool(features) and any(
@@ -961,8 +979,11 @@ def main():
         args.out_dir,
         PREFIX,
         structure_features=[
-            f.strip() for f in (args.structure_features or "").split(",") if f.strip()
+            f.strip()
+            for f in f"{args.structure_features or ''},{args.structure_informed_features or ''}".split(",")
+            if f.strip()
         ],
+        af3_features=[f.strip() for f in (args.structure_features or "").split(",") if f.strip()],
     )
     print("[INFO] MultiQC JSON blocks written for model evaluation metrics and curves.")
 

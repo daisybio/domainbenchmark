@@ -118,9 +118,10 @@
                 },
                 "machine_learning_features": {
                     "type": "string",
-                    "default": "dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings",
+                    "default": "dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of feature encodings to compute and feed into the ML / RF classifiers.",
+                    "help_text": "Each feature runs as its own singleton model. Two concatenations are added when they hold at least two features: `all` (every feature except `dummy`, structure features included) and `all_seq` (the same minus every structure feature and every --structure_informed_features entry; built only when it differs from `all`).",
                     "fa_icon": "fas fa-vector-square"
                 },
                 "machine_learning_features_structure": {
@@ -133,18 +134,26 @@
                 },
                 "large_features": {
                     "type": "string",
-                    "default": "esm3_embeddings,esmc_embeddings,prott5_embeddings",
+                    "default": "esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings",
                     "pattern": "^(\\s*\\w+\\s*)(,\\s*\\w+\\s*)*$",
                     "description": "Comma-separated list of features whose embedding dim makes feature-extraction / NN / RF tasks need the heavy memory-time envelope (160 GB, 36 h) instead of the default one (40 GB, 12 h). Applied by the withName rules in conf/modules.config.",
                     "fa_icon": "fas fa-weight-hanging"
                 },
                 "published_features": {
                     "type": "string",
-                    "default": "esm3_embeddings,esmc_embeddings,prott5_embeddings",
+                    "default": "esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings",
                     "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
                     "description": "Comma-separated list of features read from --embeddings instead of being extracted from the split databases.",
                     "help_text": "domainsplit embeds the cut domain sequence once per run and publishes one mean-pooled vector per domain instance, so these features skip FEATURE_EXTRACTION entirely and one file serves every split of the run. Entries only take effect if they also appear in --machine_learning_features. Requires --embeddings.",
                     "fa_icon": "fas fa-file-import"
+                },
+                "structure_informed_features": {
+                    "type": "string",
+                    "default": "esm3_structure_embeddings",
+                    "pattern": "^(|none|\\s*\\w+\\s*(,\\s*\\w+\\s*)*)$",
+                    "description": "Comma-separated published features computed with structure input. Kept out of the sequence-only `all_seq` combo.",
+                    "help_text": "They still run as their own singleton and inside `all`. Every entry must be listed in --published_features (checked at launch). Pass 'none' to mark nothing.",
+                    "fa_icon": "fas fa-cube"
                 },
                 "modeljson": {
                     "type": "string",

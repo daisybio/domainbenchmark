@@ -330,7 +330,8 @@ def featureVariants() {
 // against `"type": "string"` without saying that '' is the cause.
 def checkListParamsNotBoolean() {
     def list_params = ['machine_learning_models', 'graph_models', 'machine_learning_features',
-                       'machine_learning_features_structure', 'published_features', 'large_features', 'skip']
+                       'machine_learning_features_structure', 'published_features', 'structure_informed_features',
+                       'large_features', 'skip']
     def boolean_lists = list_params.findAll { params[it] instanceof Boolean }
     if (boolean_lists) {
         error(
@@ -385,6 +386,17 @@ def validateModelParams() {
         error(
             "Unknown machine_learning_features: ${bad_feat.join(', ')}. An extracted feature " +
             "needs bin/features/<name>.py; a published one must be listed in published_features."
+        )
+    }
+
+    // Marks published embeddings that saw the structure (kept out of `_all_seq`);
+    // a name that is not published would silently mark nothing.
+    def bad_informed = csvToList(params.structure_informed_features).findAll { !published.contains(it) }
+    if (bad_informed) {
+        error(
+            "structure_informed_features lists ${bad_informed.join(', ')}, which is not in " +
+            "published_features (${published.join(', ') ?: 'empty'}). It may only mark published " +
+            "embeddings; drop the name, or pass --structure_informed_features none."
         )
     }
 

@@ -1000,7 +1000,8 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
     het_ci = _rows(het_ci)
     het_pr_mean = _rows(het_pr_mean)
     het_pr_ci = _rows(het_pr_ci)
-    caveat = f" {STRUCTURE_MARK.strip()} = structure-assisted. {AF3_CAVEAT}" if structure else ""
+    caveat = (f" {STRUCTURE_MARK.strip()} = structure-assisted (an AF3-complex feature or a "
+              f"structure-informed embedding). For AF3-complex features: {AF3_CAVEAT}") if structure else ""
 
     def _write_heatmap(block_id, title, data, fname, stops=colstops, description=""):
         block = {

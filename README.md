@@ -42,8 +42,11 @@ The pipeline runs the following stages:
 2. **Feature extraction** for every requested encoding computed here
    (`aacomp`, `aaencode`, `dummy`) —
    parallelized per `(feature × split)`.
-3. **ML classifiers** trained on each feature individually plus one
-   all-feature concatenation run (gated by `--machine_learning_models`):
+3. **ML classifiers** trained on each feature individually plus up to two
+   concatenation runs (gated by `--machine_learning_models`): `all` (every
+   feature except `dummy`) and `all_seq` (sequence features only: no structure
+   feature and no `--structure_informed_features` embedding; built only when it
+   differs from `all`):
    - `NEURAL_NETWORK` — neural network (PyTorch + skorch).
    - `RANDOM_FOREST` — RAPIDS cuML random forest on GPU.
 4. **Graph models** (`GRAPH_MODEL`): KGIDDI, DDI parsimony, KGIDDI-random.
@@ -145,10 +148,12 @@ mean-pooled vector per domain instance:
 embeddings/
 ├── esm3_domain_embeddings.h5
 ├── esmc_domain_embeddings.h5
-└── prott5_domain_embeddings.h5
+├── prott5_domain_embeddings.h5
+└── esm3_structure_domain_embeddings.h5
 ```
 
-The `esm3_embeddings`, `esmc_embeddings` and `prott5_embeddings` features read
+The `esm3_embeddings`, `esmc_embeddings`, `prott5_embeddings` and
+`esm3_structure_embeddings` (`esm3_structure_domain_embeddings.h5`) features read
 those files instead of extracting anything, so `--embeddings` is required
 whenever they are enabled:
 
@@ -217,7 +222,7 @@ nextflow run . \
     -c daisybio.config \
     -profile apptainer,gpu,keep_work \
     --input /path/to/domainsplit/results/databases \
-    --skip "kgiddi,ddiparsimony,esm3_embeddings,esmc_embeddings,prott5_embeddings"
+    --skip "kgiddi,ddiparsimony,esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings"
 ```
 
 ### Test profile (in-repo fixture)
@@ -241,10 +246,11 @@ Used by CI and by `nf-test`.
 | `--modeljson` | `${projectDir}/assets` | Directory of model hyperparameter JSONs. |
 | `--skip` | `''` | Comma-separated feature/model names to skip. |
 | `--graph_models` | `kgiddi,ddiparsimony,kgiddi_random` | Graph models to run. |
-| `--machine_learning_features` | `dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings` | Feature encodings fed to the classifiers. |
-| `--published_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings` | Of those, the ones read from `--embeddings` instead of extracted from the databases. |
+| `--machine_learning_features` | `dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings` | Feature encodings fed to the classifiers. |
+| `--published_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings` | Of those, the ones read from `--embeddings` instead of extracted from the databases. |
+| `--structure_informed_features` | `esm3_structure_embeddings` | Published features computed with structure input: kept out of the sequence-only `all_seq` combo. Must be a subset of `--published_features`; `none` marks nothing. |
 | `--embeddings` | `null` | domainsplit's `results/embeddings/` directory. Needed when `--published_features` is non-empty, but derived from `--input` when that is a directory (one level up, `embeddings/`). |
-| `--large_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings` | Features routed to the heavy memory-time envelope. |
+| `--large_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings` | Features routed to the heavy memory-time envelope. |
 | `--machine_learning_models` | `neural_network,random_forest` | ML models to run. |
 | `--seed` | `42` | Master RNG seed. Reaches every randomised step, including workers in a process pool -- see [Reproducibility](#reproducibility). |
 | `--allow_cpu_ml` | `false` | Let `RANDOM_FOREST` train with scikit-learn when no GPU is usable, instead of exiting 140 for a retry on another GPU node. For GPU-less machines (CI, laptops); the `test` profile sets it. |

@@ -226,12 +226,15 @@ def test_p_zero_prints_resolution_floor():
     assert table["a"]["b"] == f"< {1 / n:.3g}"
 
 
-def _per_dataset_report(tmp_path, ds, models, structure=()):
+def _per_dataset_report(tmp_path, ds, models, structure=(), informed=()):
+    # As main() calls it: structure_features = AF3 features + structure-informed
+    # embeddings, af3_features = the AF3 ones.
     out = tmp_path / ds / "evaluation"
     out.mkdir(parents=True)
     metrics, roc, pr, df, _ = aggregate_per_model_metrics(models)
     eval_multiqc.write_multiqc_json_metrics(
-        metrics, roc, pr, df, str(out), eval_multiqc.PREFIX, structure_features=structure,
+        metrics, roc, pr, df, str(out), eval_multiqc.PREFIX,
+        structure_features=list(structure) + list(informed), af3_features=structure,
     )
     eval_multiqc.write_source_accuracy_sidecar(models, str(out), ds, "test_1_1")
     return out
@@ -354,3 +357,30 @@ def test_bargraph_average_relabelled(tmp_path):
     assert "not an ensemble" in block["description"]
     pooled = block["data"][-1]["s"]["m"]
     assert pooled == pytest.approx(70.0)
+
+
+def test_all_seq_combo_is_not_structure_assisted():
+    # `all_seq` excludes structure features, so it scores the full population.
+    s = ["sasa_residue"]
+    assert eval_multiqc.is_structure_assisted("neural_network_all", s)
+    assert eval_multiqc.is_structure_assisted("svm_sasa_residue", s)
+    assert not eval_multiqc.is_structure_assisted("neural_network_all_seq", s)
+    assert not eval_multiqc.is_structure_assisted("neural_network_all", [])
+
+
+def test_structure_informed_embedding_is_structure_assisted():
+    # With structure features off (the default), a structure-informed embedding
+    # still marks its singleton and `_all`, never `all_seq`.
+    s = ["esm3_structure_embeddings"]
+    assert eval_multiqc.is_structure_assisted("random_forest_esm3_structure_embeddings", s)
+    assert eval_multiqc.is_structure_assisted("random_forest_all", s)
+    assert not eval_multiqc.is_structure_assisted("random_forest_all_seq", s)
+
+
+def test_af3_caveat_only_for_af3_features(tmp_path):
+    pairs, src, rows = _fixture(tmp_path)
+    e = _run_eval_one(tmp_path, "neural_network_esm3_structure_embeddings", rows(pairs, 0.6), src)
+    out = _per_dataset_report(tmp_path, "random_1_1", [e], informed=["esm3_structure_embeddings"])
+    table = json.loads((out / "combined_metrics_table_mqc.json").read_text())
+    assert table["data"]["neural_network_esm3_structure_embeddings"]["Structure-assisted"] == "yes"
+    assert "AlphaFold3" not in table["description"]
