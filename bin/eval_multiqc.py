@@ -22,6 +22,7 @@ from eval_multiqc_functions import (
     NO_SELF_PAIRS_FULL,
     NO_SELF_PAIRS_NA,
     NO_SKILL_NOTE,
+    SCORE_NOTE,
     analyse_database,
     aggregate_per_model_metrics,
     curve_label,
@@ -49,16 +50,81 @@ REPORT_NAME = "ddi_report"
 ID = "eval"
 DB_PREFIX = "db_"
 
-#: Shown on every thresholded-metrics table. The ML models' label
-#: (`predicted_interaction`) is taken at the validation operating point
-#: FPR <= 0.01 (machine_learning.threshold_at_fpr); graph models emit their own.
-#: Interim wording; W-7 rewrites it.
-THRESHOLD_CAVEAT = (
-    "Accuracy, precision, recall, F1 and MCC: for NN, RF and SVM they are taken "
-    "at the threshold where validation FPR <= 0.01, applied unchanged to every "
-    "test set; graph models use the labels they emit themselves. Compare models "
-    "by ROC AUC / PR AP (threshold-free); read these columns as secondary."
+#: The two operating-point tables (W-7): the primary point, validation FPR <=
+#: 0.01 (machine_learning.threshold_at_fpr), and the universe-prior scenario
+#: (threshold_at_prior). Columns are eval_one.py's metrics_summary keys.
+PRIMARY_CAVEAT = (
+    "NN, RF and SVM: thresholds are chosen once on validation and applied "
+    "unchanged to every test set. Test TPR is recall on the positives this "
+    "model scored, test FPR the share of its scored negatives at or above the "
+    "threshold. The 0.01 cap holds on validation; the realised test FPR can "
+    "differ and differs between models. 'Indicative' = fewer than 100 "
+    "validation negatives, so the FPR budget allows no false positive. Counts "
+    "depend on the scored population, which differs between models (Pairs)."
 )
+PRIOR_CAVEAT = (
+    "MCC-optimal threshold at π = positive train DDIs / possible train family "
+    "pairs. π is the density of the known catalogue, not the true rate of "
+    "interacting pairs, so this point and its π-precision are scenarios, not "
+    "measurements. 'Indicative' = no validation negative lies at or above the "
+    "threshold, so its FPR is only bounded. π-precision is the precision these "
+    "test rates would give at prevalence π; the note says why a cell is blank."
+)
+
+_P, _S = "val FPR≤0.01", "prior scenario"
+_RATE = {"scale": False, "format": "{:,.3f}"}
+_COUNT = {"scale": False, "format": "{:,.0f}"}
+_TEXT = {"scale": False}
+_LEAD = {
+    "Samples": ("Test pairs this model scored.", _COUNT),
+    "Prevalence": ("Fraction of positives among the scored test pairs.", _RATE),
+}
+#: Column -> (description, header config), in table order.
+PRIMARY_HEADERS = {**_LEAD, **{
+    f"Status ({_P})": ("'resolvable', or 'indicative: < 100 validation negatives'.", _TEXT),
+    "Val negatives": ("Validation negatives the threshold was chosen on.", _COUNT),
+    f"Val FPR ({_P})": ("Validation FPR at the chosen threshold (≤ 0.01).", _RATE),
+    f"Val TPR ({_P})": ("Validation TPR at the chosen threshold.", _RATE),
+    "Test positives": ("Positive test pairs this model scored.", _COUNT),
+    "Test negatives": ("Negative test pairs this model scored.", _COUNT),
+    f"Test FPR ({_P})": ("Share of the scored test negatives at or above the threshold.", _RATE),
+    f"Test TPR ({_P})": ("Recall on the scored test positives.", _RATE),
+    f"Test precision ({_P})": ("TP / (TP + FP) on the scored test pairs, at their own prevalence.", _RATE),
+    "TP": ("True positives on test.", _COUNT),
+    "FP": ("False positives on test.", _COUNT),
+    "TN": ("True negatives on test.", _COUNT),
+    "FN": ("False negatives on test.", _COUNT),
+    f"Accuracy ({_P})": ("(TP + TN) / scored test pairs.", _RATE),
+    f"Balanced Accuracy ({_P})": ("(TPR + TNR) / 2 on test.", _RATE),
+    f"F1 Score ({_P})": ("2·TP / (2·TP + FP + FN) on test.", _RATE),
+    f"MCC ({_P})": ("Matthews correlation coefficient on test.", _RATE),
+}}
+PRIOR_HEADERS = {**_LEAD, **{
+    f"Status ({_S})": ("'resolvable', or 'indicative: no validation false positive'.", _TEXT),
+    "π catalogue density": ("Positive train DDIs / possible train family pairs.", {"scale": False, "format": "{:,.2e}"}),
+    f"Val FPR ({_S})": ("Validation FPR at the scenario threshold.", _RATE),
+    f"Val TPR ({_S})": ("Validation TPR at the scenario threshold.", _RATE),
+    f"Test FPR ({_S})": ("Share of the scored test negatives at or above the threshold.", _RATE),
+    f"Test TPR ({_S})": ("Recall on the scored test positives.", _RATE),
+    f"Test precision ({_S})": ("TP / (TP + FP) on the scored test pairs, at their own prevalence.", _RATE),
+    "TP (prior)": ("True positives on test.", _COUNT),
+    "FP (prior)": ("False positives on test.", _COUNT),
+    "TN (prior)": ("True negatives on test.", _COUNT),
+    "FN (prior)": ("False negatives on test.", _COUNT),
+    f"π-precision ({_S})": ("TPR·π / (TPR·π + FPR·(1−π)) from the realised test rates: "
+                            "the precision at prevalence π. A scenario.", _RATE),
+    "π-precision note": ("Why the π-precision cell is blank.", _TEXT),
+}}
+PRIMARY_COLS = tuple(PRIMARY_HEADERS)
+PRIOR_COLS = tuple(PRIOR_HEADERS)
+
+
+def _headers(spec, seed_cols=()) -> dict:
+    out = {c: {"title": c, "description": d, **cfg} for c, (d, cfg) in spec.items()}
+    for c in seed_cols:
+        out[c] = {"title": c, "description": "Sample SD over seeds." if c.endswith(" SD")
+                  else "Seeds this model has / seeds requested.", "scale": False}
+    return out
 
 PAIRS_NOTE = (
     "Any model can abstain: an ML model drops pairs whose features do not "
@@ -392,7 +458,7 @@ def write_multiqc_json_metrics(
                          "scale": False, "format": "{:,.3f}"},
             "ROC AUC min–max": {"title": "ROC AUC min–max", "scale": False},
         }
-    description = PAIRS_NOTE + seeds_desc
+    description = PAIRS_NOTE + seeds_desc + " " + SCORE_NOTE
     if af3_models:
         description += " " + AF3_CAVEAT
     table_block = {
@@ -548,7 +614,7 @@ def write_multiqc_json_metrics(
     pr_block = {
         "id": pr_id,
         "section_name": "Precision Recall curves",
-        "description": NO_SKILL_NOTE + primary_note,
+        "description": NO_SKILL_NOTE + " " + SCORE_NOTE + primary_note,
         "plot_type": "linegraph",
         "pconfig": {
             "extra_series": no_skill_series(
@@ -572,8 +638,7 @@ def write_multiqc_json_metrics(
     with open(os.path.join(outdir, f"{prefix}_pr_mqc.json"), "w") as f:
         json.dump(pr_block, f, indent=2)
 
-    # --- Block 4: Metrics overview block ---
-    metrics_id = "model_eval_metrics"
+    # --- Block 4: the two operating-point tables ---
     # Row-wise, so each column keeps its own dtype: the transposed frame
     # turned the TP/TN/FP/FN counts into floats.
     metrics_data = metrics_df.set_index("Model").to_dict(orient="index")
@@ -584,22 +649,27 @@ def write_multiqc_json_metrics(
             len(seeds),
             # Each (model, seed) is thresholded at its own fitted operating point.
             spread=THRESHOLDED_COLS,
+            status_cols=(f"Status ({_P})", f"Status ({_S})"),
+            require_all={f"π-precision ({_S})": "π-precision note"},
         )
-    metrics_block = {
-        "id": metrics_id,
-        "section_name": "Overview Model Evaluation Metrics",
-        "description": THRESHOLD_CAVEAT + means_note
-        + (" `<metric> SD` is the sample SD over seeds." if seed_sets else ""),
-        "plot_type": "table",
-        "pconfig": {
-            "id": metrics_id,
-            "title": "Overview Model Evaluation Metrics",
-            "col1_header": "Model",
-        },
-        "data": metrics_data,
-    }
-    with open(os.path.join(outdir, "model_eval_metrics_mqc.json"), "w") as f:
-        json.dump(metrics_block, f, indent=2)
+    seed_note = (means_note + " Counts are per-seed means. `<metric> SD` is the "
+                 "sample SD over seeds." if seed_sets else "")
+    for block_id, section, caveat, spec in (
+        ("model_eval_metrics", "Operating point: validation FPR ≤ 0.01", PRIMARY_CAVEAT, PRIMARY_HEADERS),
+        ("model_eval_prior_metrics", "Scenario: universe-prior threshold", PRIOR_CAVEAT, PRIOR_HEADERS),
+    ):
+        seed_cols = ([f"{c} SD" for c in spec if c in THRESHOLDED_COLS] + ["Seeds"]) if seed_sets else []
+        cols = list(spec) + seed_cols
+        with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w") as f:
+            json.dump({
+                "id": block_id,
+                "section_name": section,
+                "description": caveat + seed_note,
+                "plot_type": "table",
+                "pconfig": {"id": block_id, "title": section, "col1_header": "Model"},
+                "headers": _headers(spec, seed_cols),
+                "data": {m: {c: row[c] for c in cols if c in row} for m, row in metrics_data.items()},
+            }, f, indent=2)
 
     # --- Block 5: Pairwise significance (Phase 4) ---
     # Built only when at least two models carry bootstrap samples.
@@ -674,11 +744,14 @@ def write_multiqc_json_metrics(
     logging.info("[OK] Wrote MultiQC JSON (ROC + PR)")
 
 
-#: Per-seed columns of the seed_variance block (eval_one.py metrics_summary,
-#: i.e. the validation FPR <= 0.01 operating point of W-5).
-THRESHOLDED_COLS = ("Accuracy", "Recall", "Specificity", "Precision",
-                    "Balanced Accuracy", "F1 Score", "MCC")
-SEED_SUMMARY_COLS = ("Samples",) + THRESHOLDED_COLS
+#: Rate/metric columns of both operating-point tables: each gets `<col> SD`
+#: over seeds. The per-seed detail carries both points' status, rates and counts.
+THRESHOLDED_COLS = tuple(
+    c for c in PRIMARY_COLS + PRIOR_COLS
+    if c.endswith((f"({_P})", f"({_S})")) and not c.startswith("Status")
+)
+SEED_SUMMARY_COLS = ("Samples",) + tuple(
+    c for c in PRIMARY_COLS + PRIOR_COLS if c not in ("Samples", "Prevalence"))
 
 
 def write_seed_blocks(seed_sets, seeds, outdir, prefix) -> None:
@@ -708,9 +781,9 @@ def write_seed_blocks(seed_sets, seeds, outdir, prefix) -> None:
             "section_name": "Per-seed results",
             "description": f"One row per (model, training seed) for seeds {seeds_txt}: "
                            "the raw values behind the means and SDs above. Thresholded "
-                           "columns: NN, RF and SVM rows are at that model's and seed's own "
-                           "validation FPR <= 0.01 threshold; graph models use the labels "
-                           "they emit themselves (primary seed only).",
+                           "columns are at that model's and seed's own two operating "
+                           "points: validation FPR ≤ 0.01 (val FPR≤0.01) and the "
+                           "universe-prior scenario threshold (prior).",
             "plot_type": "table",
             "pconfig": {"id": variance_id, "title": "Per-seed results", "col1_header": "Model · seed"},
             "data": {f"{r['Model']} · seed {r['Seed']}": {k: v for k, v in r.items() if k != "Model"}
@@ -867,7 +940,7 @@ def write_multiqc_config(outdir, enrichment_ids=()) -> str:
     auc_ap_tbl = pick(r"_metrics_table$")
     roc_blocks = pick(r"_roc$")
     pr_blocks = pick(r"_pr$")
-    metric_blocks = pick(r"model_eval_metrics$")
+    metric_blocks = pick(r"model_eval_metrics$") + pick(r"model_eval_prior_metrics$")
     pairwise_blocks = pick(r"_pairwise_significance$")
     seed_blocks = pick(r"_seed_variance$") + pick(r"_order_agreement$")
     coverage_blocks = pick(r"_coverage$")
@@ -876,8 +949,8 @@ def write_multiqc_config(outdir, enrichment_ids=()) -> str:
 
     ordered = (
         white_tbl
-        + metric_blocks
         + auc_ap_tbl
+        + metric_blocks
         + coverage_blocks
         + pairwise_blocks
         + seed_blocks

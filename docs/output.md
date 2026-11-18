@@ -14,7 +14,8 @@ A `<variant>` is the name of a test split without its `test_` prefix: a
 database may ship any number of `test_<variant>.sqlite3`, and each is reported
 as its own dataset `<db_name>_<variant>`. The current domainsplit layout has
 an in-distribution 1:1 set (`test_matched_1_1`, or `test_uniform_1_1` for
-`random`) and an out-of-distribution 1:10 set (`test_uniform_1_10`), both
+`random`) and a 1:10 set with the same positives and uniform negatives
+(`test_uniform_1_10`), both
 scored by the same trained model. A database with a single `test.sqlite3`
 (e.g. `external_test`) has the variant `test` and reports under its bare name.
 
@@ -48,7 +49,8 @@ scored by the same trained model. A database with a single `test.sqlite3`
     are computed on domainsplit's AlphaFold 3 complexes. They are off because
     current domainsplit runs model complexes for most positives but almost no
     negatives, so structure coverage itself predicts the label. Positives come from PDB co-crystals
-    that are in AF3's training data, so interface features (buried surface,
+    that may have been in AF3's training data (PDB cutoff 2021-09-30), i.e.
+    with AF3 that may have seen the positives, so interface features (buried surface,
     contacts, clashes, patches) partly measure AF3's recall of known complexes
     rather than predict an interaction. Read any structure-assisted model --
     a structure singleton or `all` -- with that caveat. Such a model also scores
@@ -95,12 +97,26 @@ scored by the same trained model. A database with a single `test.sqlite3`
 - `<db_name>/evaluation/<variant>/`
   - The per-(database, test variant) MultiQC report: `ddi_report.html`, its
     `ddi_report_data/`, and the JSON inputs under `multiqc_json/`.
+  - Report sections, in order: "Model performance (AUC / AP)", then the two
+    operating-point tables, "Operating point: validation FPR ≤ 0.01" (status,
+    validation negatives, validation FPR/TPR, scored test positives/negatives,
+    realised test FPR/TPR/precision, TP/FP/TN/FN, accuracy, balanced accuracy,
+    F1, MCC) and "Scenario: universe-prior threshold" (status, π catalogue
+    density, validation and test FPR/TPR, test precision, its own
+    TP/FP/TN/FN, and π-precision with a note saying why a cell is blank).
+    Every thresholded column names its point. 'Indicative' marks a point
+    resolved on too few validation negatives (`fpr0.01`) or without a
+    validation false positive (`universe_prior`). Each model's JSON under
+    `per_model/` carries the same numbers as an `operating_points` object.
   - With several `--seeds` only: `seed_metrics.json` (one row per (model,
-    seed): AUC, AP and the thresholded metrics) and two more report sections,
-    "Per-seed results" and "ROC AUC order agreement across seeds". The metric
-    tables then hold means over seeds plus `Seeds`, `ROC AUC SD`, `PR AP SD`
-    and `ROC AUC min–max`; curves, coverage, by-source accuracy, pairwise
-    tests and enrichment are the primary (first) seed's.
+    seed): AUC, AP and both points' status, rates and counts) and two more
+    report sections, "Per-seed results" and "ROC AUC order agreement across
+    seeds". The metric tables then hold means over seeds (counts too) plus
+    `Seeds`, `ROC AUC SD`, `PR AP SD`, `ROC AUC min–max` and `<rate> SD` for
+    every thresholded rate; a status reads "resolved in k/n seeds", and
+    π-precision is shown only if it is defined in every seed. Curves,
+    coverage, by-source rates, pairwise tests and enrichment are the primary
+    (first) seed's.
 
 </details>
 
@@ -121,12 +137,18 @@ runs: it embeds a timestamp, absolute work-dir paths and the MultiQC version.
 
 - `evaluation/`
   - `ddi_report.html`: every (database, test variant) as its own dataset entry,
-    with metrics, ROC/PR curves, per-source accuracy and pairwise significance
-    across all models. The per-source accuracy section has one tab per dataset
+    with metrics, ROC/PR curves, per-source rates and pairwise significance
+    across all models. After the AUC/AP heatmaps comes "Test TPR at validation
+    FPR ≤ 0.01" (model × dataset) with a details table per cell (realised test
+    FPR, validation FPR, scored positives/negatives, test prevalence,
+    'indicative'). The per-dataset operating-point tables follow, primary and
+    prior together. The per-source section ("Per-source rate at validation
+    FPR ≤ 0.01") names each bar group's rate: TPR on a positive-only source, TNR
+    on a negative-only one, accuracy on a mixed one. It has one tab per dataset
     plus pooled `Combined_<ratio>` tabs, derived from the data: one per class
     ratio (the trailing `<pos>_<neg>` of the variant, so `uniform_1_1` and
     `matched_1_1` pool together) present in at least two datasets, each the
-    unweighted mean of the per-dataset accuracies. A single-`test` dataset such
+    unweighted mean (macro-average) of the per-dataset rates. A single-`test` dataset such
     as `external_test` joins no pooled tab. The `Mean over shown models` bar is
     the mean of the bars beside it, not an ensemble.
 

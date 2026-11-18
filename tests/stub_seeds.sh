@@ -2,7 +2,7 @@
 # W-6 seeds: a stub run with --seeds 42, then the same resumed with --seeds 42,43.
 # Every seed-dependent task (NN/RF/SVM, EVAL_ONE, `dummy` extraction) must run
 # twice in total, every other task once, the outputs must move under seed<N>/,
-# and resuming must re-run no seed-42 model task. No containers needed.
+# and resuming must re-run no seed-42 model or EVAL_ONE task. No containers needed.
 # usage: tests/stub_seeds.sh [workdir]
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -33,10 +33,12 @@ fail = [f"{p}: no task in the --seeds 42 run" for p in sorted(DOUBLED) if not on
 fail += [f"{p}: {one[p]} -> {two[p]}" for p in sorted(set(one) | set(two))
          if two[p] != one[p] * (2 if p in DOUBLED else 1)]
 
-# Every seed-42 model task of run 1 must be reused, matched by hash: a cached
-# task keeps its run-1 name (no _seed42 tag), so a name match would miss a rerun.
+# Every seed-42 model and EVAL_ONE task of run 1 must be reused, matched by
+# hash: a cached task keeps its run-1 name (no _seed42 tag), so a name match
+# would miss a rerun. EVAL_ONE stages its model's model_parameters.json, which
+# must not change its hash while the model task stays cached.
 status = {r["hash"]: r["status"] for r in two_rows}
-reused = [r for r in one_rows if process(r) in MODELS]
+reused = [r for r in one_rows if process(r) in set(MODELS) | {"EVAL_ONE"}]
 fail += [f"not reused: {r['name']} {r['hash']} -> {status.get(r['hash'], 'absent')}"
          for r in reused if status.get(r["hash"]) != "CACHED"]
 
@@ -65,5 +67,5 @@ for db in dbs:
 if fail:
     sys.exit("FAIL:\n" + "\n".join(fail))
 print("OK:", ", ".join(f"{p} {one[p]}->{two[p]}" for p in sorted(one)),
-      f"| {len(reused)} seed-42 model tasks reused by hash | dbs: {', '.join(dbs)}")
+      f"| {len(reused)} seed-42 model/EVAL_ONE tasks reused by hash | dbs: {', '.join(dbs)}")
 EOF

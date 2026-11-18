@@ -28,8 +28,8 @@ split, and produces a unified MultiQC report comparing them.
 A database may ship several test splits, each a `test_<variant>.sqlite3`; the
 variant name is free. The current domainsplit layout has two per database:
 an in-distribution 1:1 set (`test_matched_1_1.sqlite3`, or
-`test_uniform_1_1.sqlite3` for `random`) and an out-of-distribution 1:10 set
-(`test_uniform_1_10.sqlite3`). All of them are benchmarked against the *same* trained
+`test_uniform_1_1.sqlite3` for `random`) and a 1:10 set with the same positives
+and uniform negatives (`test_uniform_1_10.sqlite3`). All of them are benchmarked against the *same* trained
 models: DDI extraction, feature extraction and model fitting run once per
 database, and only scoring and evaluation fan out. Each test split is then
 reported as its own dataset — `random_uniform_1_1`, `random_uniform_1_10` — with its own
@@ -306,7 +306,7 @@ For each database split processed, a subdirectory under `--outdir/<db_name>/`:
 └── evaluation/
     └── <variant>/                          # one report per test split
         ├── ddi_report.html
-        └── source_accuracy.json            # per-source accuracy, for COMBINE_EVAL
+        └── source_accuracy.json            # per-source rates, for COMBINE_EVAL
 ```
 
 Shared work (DDI CSVs, features, fitted models) sits directly under the
@@ -314,21 +314,33 @@ database directory; only `evaluation/` fans out per test variant. A top-level
 cross-database report is always written to `<outdir>/evaluation/ddi_report.html`
 and lists every (database, test variant) pair as a separate dataset.
 
-That combined report also carries an **Accuracy by DDI source** section: one bar
-group per source (`3did`, `sampled_negative`, `single_domain_ppi`, `PPIDM*`,
-`negatome`, …), one bar per model plus a `Mean over shown models` bar (the mean
-of the bars beside it, not an ensemble), and a tab per (database, variant).
+That combined report also carries a **Per-source rate at validation FPR ≤ 0.01**
+section: one bar group per source (`3did`, `sampled_negative`,
+`single_domain_ppi`, `PPIDM*`, `negatome`, …), one bar per model plus a
+`Mean over shown models` bar (the mean of the bars beside it, not an ensemble),
+and a tab per (database, variant). Each bar is the share of the source's scored
+pairs labelled correctly at the model's validation FPR ≤ 0.01 threshold, and
+the group name says what that is: `3did (TPR)` on a positive-only source,
+`sampled_negative (TNR)` on a negative-only one, `(accuracy)` on a mixed one.
+It moves with the threshold; a positive-only and a negative-only source are two
+sides of one trade-off.
 Pooled `Combined_<ratio>` tabs are derived from the data: one per class ratio
 (the trailing `<pos>_<neg>` of the variant, so `uniform_1_1` and `matched_1_1`
 pool together) present in at least two datasets (currently
-`Combined_1_1` and `Combined_1_10`), each the unweighted mean of the per-dataset
-accuracies, with the included datasets listed in its description. A database
+`Combined_1_1` and `Combined_1_10`), each the unweighted mean (macro-average) of
+the per-dataset rates, with the included datasets listed in its description. A database
 with a single `test` split (e.g. `external_test`) joins no pooled tab. A DDI whose
 `source` lists several sources counts under each of them, so the groups overlap
-and do not sum to the `ALL` group. Sources are usually single-class -- `3did` is
-all positives, `sampled_negative` all negatives -- so accuracy is the only
-metric reported; the DDI counts per source sit in the section description,
-together with a note for any model that scored less than the full source.
+and do not sum to the `ALL` group. The DDI counts per source sit in the section
+description, together with a note for any model that scored less than the full
+source.
+
+Each per-dataset report shows the two validation operating points of every
+NN/RF/SVM model side by side with the realised test numbers: "Operating point:
+validation FPR ≤ 0.01" and "Scenario: universe-prior threshold" (see
+[`docs/output.md`](docs/output.md)). The combined report adds a "Test TPR at
+validation FPR ≤ 0.01" heatmap with a details table. Scores are model-specific
+rankings, not probabilities; do not compare raw scores across models.
 
 A full description of each output is in [`docs/output.md`](docs/output.md).
 
@@ -339,7 +351,7 @@ how much of a difference between models is training noise. Seed-dependent
 tasks run once per seed (NN / RF / SVM, the `dummy` feature, per-model
 evaluation); everything else runs once. The first seed is the **primary
 seed**: graph models, metadata enrichment, the ROC/PR curves, the by-source
-accuracy and the pairwise bootstrap tests use it alone, and say so.
+rates and the pairwise bootstrap tests use it alone, and say so.
 
 With more than one seed:
 
@@ -349,9 +361,12 @@ With more than one seed:
   bootstrap CI (test-set sampling); the SD is training variance across seeds.
   The two are different sources of error and are not added. The combined
   heatmap CI cells read `0.734 [0.71, 0.75] · n=… · π=… ± 0.004 over 3 seeds`;
+- the two operating-point tables show means over seeds (counts too) with a
+  `<rate> SD` per thresholded rate; a point's status reads "resolved in k/n
+  seeds", and π-precision appears only if it is defined in every seed;
 - a **Per-seed results** table (also `seed_metrics.json`) lists every
-  (model, seed), including the thresholded metrics at each seed's own
-  validation FPR <= 0.01 threshold;
+  (model, seed), including both operating points' status, rates and counts at
+  that seed's own thresholds;
 - an **order agreement** table gives, for each model pair, in how many seeds
   one has the higher AUC. It is a count, not a test: call an order stable only
   when it holds in every seed.

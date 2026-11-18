@@ -18,6 +18,8 @@ import os
 import numpy as np
 import pandas as pd
 
+from eval_multiqc_functions import SCORE_NOTE
+
 # No statsmodels import here: EVALUATION / COMBINE_EVAL only render.
 GROUP_ORDER = ("af", "interpro", "biochem")
 #: Written by EVALUATION next to source_accuracy.json; read by combine_eval.py.
@@ -27,10 +29,10 @@ OBSERVED = "observed (model-independent)"
 TIDY_COLUMNS = ["dataset", "model", "target", "quantity", "feature", "value", "n", "status", "reason"]
 TARGET_LABELS = {
     "observed": "Observed label (Logit)",
-    "predicted": "Predicted label (Logit)",
-    "combined": "TN/FP/FN/TP (MNLogit)",
-    "error_positive": "|error|, positives (OLS)",
-    "error_negative": "|error|, negatives (OLS)",
+    "predicted": "Predicted label at the model's primary operating point (Logit)",
+    "combined": "TN/FP/FN/TP at the model's primary operating point (MNLogit)",
+    "error_positive": "|1 − score|, positives (OLS; score residual, threshold-free)",
+    "error_negative": "|score|, negatives (OLS; score residual, threshold-free)",
 }
 #: quantity -> (title, colour bar, diverging)
 HEATMAPS = {
@@ -228,7 +230,9 @@ def status_block(datasets, outdir):
                        "Constant and aliased columns are dropped per fit. Logit/MNLogit need 10 events of "
                        "the smallest class per parameter, OLS 10 rows. "
                        "Features are standardised per fit; OLS uses HC3, Logit/MNLogit "
-                       "HC0 robust standard errors; q-values are Benjamini-Hochberg per fit." + seed_note,
+                       "HC0 robust standard errors; q-values are Benjamini-Hochberg per fit." + seed_note
+                       + " Primary operating point — NN/RF/SVM: validation FPR ≤ 0.01 threshold. "
+                       + SCORE_NOTE,
         "plot_type": "table",
         "pconfig": {"id": f"{PREFIX}status_table", "title": "Enrichment: rows and fit status", "col1_header": "Model"},
         "data": data,

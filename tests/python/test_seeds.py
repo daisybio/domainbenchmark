@@ -8,7 +8,7 @@ import sys
 import numpy as np
 import pytest
 
-from test_eval_audit import _fixture, _run_eval_one, combine_eval, eval_multiqc  # noqa: F401
+from test_eval_audit import DISTINCT_POINTS, _fixture, _run_eval_one, combine_eval, eval_multiqc  # noqa: F401
 from eval_multiqc_functions import order_agreement, parse_seeds, seed_means
 
 
@@ -37,7 +37,8 @@ def _seeded_jsons(tmp_path, seeds=(42, 43), models=("neural_network_aacomp", "ra
             name = f"{m}.seed{seed}"
             # Distinct noise per (seed, model): different AUCs and different
             # thresholded labels (p > 0.5) for every seed.
-            path = _run_eval_one(tmp_path, name, rows(pairs, 0.5 + 0.6 * i + 0.3 * j), src)
+            path = _run_eval_one(tmp_path, name, rows(pairs, 0.5 + 0.6 * i + 0.3 * j), src,
+                                 val=DISTINCT_POINTS[i % 2])
             # _run_eval_one passes --seed 1 and names the model after the file.
             obj = json.loads(open(path).read())
             obj.update(seed=seed, model_name=m)
@@ -103,11 +104,14 @@ def test_two_seeds_mean_sd_and_primary_blocks(monkeypatch, tmp_path):
 
     # Operating-point metrics: mean and sample SD over each seed's own labels.
     overview = json.loads((out / "model_eval_metrics_mqc.json").read_text())["data"][m]
-    mcc = [obj(m, s)["metrics_summary"]["MCC"] for s in (42, 43)]
+    col = "MCC (val FPR≤0.01)"
+    mcc = [obj(m, s)["metrics_summary"][col] for s in (42, 43)]
     assert mcc[0] != mcc[1]
-    assert overview["MCC"] == pytest.approx(np.mean(mcc))
-    assert overview["MCC SD"] == pytest.approx(np.std(mcc, ddof=1))
+    assert overview[col] == pytest.approx(np.mean(mcc))
+    assert overview[f"{col} SD"] == pytest.approx(np.std(mcc, ddof=1))
     assert overview["Seeds"] == "2/2"
+    # The fixture's 20 validation negatives: indicative in both seeds.
+    assert overview["Status (val FPR≤0.01)"] == "resolved in 0/2 seeds"
 
     # Curves, pairwise and the by-source sidecar are the primary (43) seed's.
     for f in ("combined_roc_mqc.json", "combined_pr_mqc.json"):
@@ -123,7 +127,8 @@ def test_two_seeds_mean_sd_and_primary_blocks(monkeypatch, tmp_path):
     assert seed_rows["seeds"] == [43, 42] and len(seed_rows["rows"]) == 4
     variance = json.loads((out / "combined_seed_variance_mqc.json").read_text())
     assert variance["data"][f"{m} · seed 42"]["ROC AUC"] == pytest.approx(auc(m, 42))
-    assert "graph models use the labels they emit" in variance["description"]
+    assert "universe-prior scenario threshold" in variance["description"]
+    assert "Status (prior scenario)" in variance["data"][f"{m} · seed 42"]
 
     agree = json.loads((out / "combined_order_agreement_mqc.json").read_text())["data"]
     other = "random_forest_aacomp"

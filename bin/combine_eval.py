@@ -15,6 +15,7 @@ import json
 from eval_multiqc_functions import (
     AF3_CAVEAT,
     NO_SKILL_NOTE,
+    SCORE_NOTE,
     is_retired_block,
     model_of_curve_label,
     no_skill_series,
@@ -143,7 +144,10 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
 
     white_tbl = present(ID)
     # auc_ap_tbl = pick(r"_metrics_table")
-    metric_blocks = pick(r"model_eval_metrics")
+    # Within a dataset the primary table sorts before the prior one, so the
+    # two sit together once sorted by dataset below.
+    metric_blocks = sort_by_dataset(
+        pick(r"model_eval_metrics") + pick(r"model_eval_prior_metrics"), dataset_order)
     # Copied through per dataset like `model_eval_metrics`, but used to be
     # missing from this list, so MultiQC rendered them wherever it pleased.
     pairwise_blocks = pick(r"^combined_pairwise_significance_")
@@ -161,6 +165,8 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
     hetero_pr_heatmap_ci = pick(r"model_performance_heatmap_hetero_pr_ci$")
     pr_heatmep_block = pick(r"model_performance_heatmap_pr$")
     pr_heatmap_ci = pick(r"model_performance_heatmap_pr_ci$")
+    tpr_heatmap_blocks = (pick(r"model_performance_heatmap_tpr_fpr01$")
+                          + pick(r"model_performance_heatmap_tpr_fpr01_details$"))
     coverage_blocks = pick(r"^combined_coverage_")
 
     source_block = pick(r"source_accuracy_by_ddi_source")
@@ -176,14 +182,13 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
     # function of the file names, which is what keeps the report reproducible.
     if dataset_order:
         db_blocks = sort_by_dataset(db_blocks, dataset_order)
-        metric_blocks = sort_by_dataset(metric_blocks, dataset_order)
         pairwise_blocks = sort_by_dataset(pairwise_blocks, dataset_order)
         coverage_blocks = sort_by_dataset(coverage_blocks, dataset_order)
         seed_blocks = sort_by_dataset(seed_blocks, dataset_order)
 
     # Threshold-free heatmaps first: they are the primary comparison. The
-    # per-dataset metric tables depend on the validation FPR <= 0.01
-    # threshold (see THRESHOLD_CAVEAT in eval_multiqc.py) and come after.
+    # TPR heatmap and the per-dataset operating-point tables depend on the
+    # validation thresholds (see PRIMARY_CAVEAT in eval_multiqc.py) and come after.
     ordered = (
         white_tbl
         + roc_heatmap_block
@@ -194,6 +199,7 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
         + pr_heatmap_ci
         + hetero_pr_heatmap_block
         + hetero_pr_heatmap_ci
+        + tpr_heatmap_blocks
         + db_blocks
         + metric_blocks
         + coverage_blocks
@@ -485,8 +491,8 @@ def _pool_description(pools):
         f"<li><b>{p['db_name']}</b>: {', '.join(p['members'])}</li>" for p in pools
     )
     return (
-        "<p><b>Pooled tabs</b> are the unweighted mean of each model's "
-        "per-dataset accuracy over these datasets (one per test variant held "
+        "<p><b>Pooled tabs</b> are the unweighted mean (macro-average) of each "
+        "model's per-dataset rate over these datasets (one per test variant held "
         "by at least two datasets; single-<code>test</code> datasets join "
         f"none):</p><ul>{items}</ul>"
     )
@@ -585,7 +591,7 @@ def _coverage_notes(sidecars):
     if excess_notes:
         html += (
             "<p><b>Scored more DDIs than exist.</b> These cells count more scored "
-            "pairs than the source contains, so their accuracy is not over the "
+            "pairs than the source contains, so their rate is not over the "
             "test set and should not be read.<br><small>"
             + "<br>".join(excess_notes)
             + "</small></p>"
@@ -593,11 +599,22 @@ def _coverage_notes(sidecars):
     if partial_notes:
         html += (
             "<p><b>Partial coverage.</b> These models scored fewer DDIs than the source "
-            "contains; their accuracy is over the scored subset only.<br><small>"
+            "contains; their rate is over the scored subset only.<br><small>"
             + "<br>".join(partial_notes)
             + "</small></p>"
         )
     return html
+
+
+def rate_name(counts) -> str:
+    """What a source's share-correct is: TPR on a positive-only source, TNR on
+    a negative-only one, accuracy on a mixed one (D-8 item 2)."""
+    n_pos, n_neg = int(counts.get("n_pos", 0)), int(counts.get("n_neg", 0))
+    if n_pos and not n_neg:
+        return "TPR"
+    if n_neg and not n_pos:
+        return "TNR"
+    return "accuracy"
 
 
 def source_accuracy_bargraph(sidecars, outdir, dataset_order=None, seed_note=""):
@@ -652,7 +669,7 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None, seed_note="")
             if not accuracies:
                 continue
             cell[AVERAGE_CAT] = round(sum(accuracies) / len(accuracies), 2)
-            dataset[source] = cell
+            dataset[f"{source} ({rate_name(sidecar.get('totals', {}).get(source, {}))})"] = cell
         if not dataset:
             continue
 
@@ -670,10 +687,14 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None, seed_note="")
 
     block = {
         "id": "source_accuracy_by_ddi_source",
-        "section_name": "Accuracy by DDI source",
+        "section_name": "Per-source rate at validation FPR ≤ 0.01",
         "description": (
-            "<p>On a positive-only source accuracy is recall; on a "
-            "negative-only source it is specificity. "
+            "<p>Real tabs: the share of a source's scored pairs labelled "
+            "correctly at the validation FPR ≤ 0.01 threshold (TPR on a "
+            "positive-only source, TNR on a negative-only one, accuracy on a "
+            "mixed one). It moves with the threshold; a positive-only and a "
+            "negative-only source are two sides of one trade-off. Pooled tabs: "
+            "macro-average of per-dataset rates. "
             f"<b>{AVERAGE_CAT}</b> is the unweighted mean over the models shown "
             "in that group, not an ensemble; it changes when a model is added "
             "or removed.</p>"
@@ -686,11 +707,11 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None, seed_note="")
         "categories": categories,
         "pconfig": {
             "id": "source_accuracy_by_ddi_source",
-            "title": "Accuracy by DDI source",
-            "ylab": "Accuracy (%)",
+            "title": "Per-source rate at validation FPR ≤ 0.01",
+            "ylab": "Rate (%)",
             "ymin": 0,
             "ymax": 100,
-            # Grouped, not stacked: the bars are independent accuracies, and a
+            # Grouped, not stacked: the bars are independent rates, and a
             # stack of them would add up to a meaningless total.
             "stacking": "group",
             "cpswitch": False,
@@ -730,7 +751,9 @@ def cross_db_comparison(all_blocks, outdir, dataset_order=None, seed_note=""):
         for block in all_blocks
         if block["id"].startswith("combined_pr_")
     }
-    # model_eval_data = {block["id"]: block for block in all_blocks if block["id"].startswith("model_eval_metrics_")}
+    # Primary operating-point tables only; `model_eval_prior_metrics_*` does
+    # not match the prefix.
+    eval_data = {block["id"]: block for block in all_blocks if block["id"].startswith("model_eval_metrics_")}
 
     # Prevalence of each (dataset, model)'s scored pairs, for the PR no-skill
     # lines.
@@ -743,7 +766,7 @@ def cross_db_comparison(all_blocks, outdir, dataset_order=None, seed_note=""):
     # combined_metrics_heatmap(model_eval_data, outdir)
     combined_roc_curves(roc_data, outdir, dataset_order, seed_note)
     combined_pr_curves(pr_data, outdir, dataset_order, prevalence, seed_note)
-    model_performance_heatmap(performance_data, outdir, dataset_order)
+    model_performance_heatmap(performance_data, outdir, dataset_order, eval_data)
     combine_curves_db_level(
         roc_data, outdir, "roc", "False Positive Rate", "True Positive Rate",
         dataset_order,
@@ -897,7 +920,24 @@ def combined_pr_curves(pr_data, outdir, dataset_order=None, prevalence=None, see
         json.dump(pr_block, f, indent=2)
 
 
-def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
+#: Columns of eval_multiqc.py's primary operating-point table read by the TPR heatmap.
+_TPR, _P = "Test TPR (val FPR≤0.01)", "val FPR≤0.01"
+
+TPR_DESCRIPTION = (
+    "Recall on the positives each model scored, at a cutoff chosen on "
+    "validation. It does not depend on the scored prevalence, but it does "
+    "depend on which positives a model scored (coverage) and on how the test "
+    "set was sampled. Read it with the realised test FPR in the details table. "
+    "Both test variants of a database hold the same positives; only the "
+    "negatives differ (`random`: uniform at both ratios; ILP/HRNI methods: "
+    "bias-matched at 1:1, uniform at 1:10). TPR is therefore expected to be "
+    "equal across a database's two variants; FPR and ROC AUC carry the change "
+    "of negative sampler; prevalence alone changes neither (it moves precision "
+    "and AP)."
+)
+
+
+def model_performance_heatmap(combined_metrics, outdir, dataset_order=None, eval_data=None):
     # Heatmap colour + clustering use the numeric mean (float). The
     # bootstrap CI lives in a sibling "<...> CI" string column emitted by
     # eval_multiqc.py and is rendered as a companion label-table next to the
@@ -1023,11 +1063,14 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         "primary seed's bootstrap CI (test-set sampling only); ± SD is training variance "
         "across seeds. They are different sources of error and are not added."
     ) if seeded else ""
-    caveat = seed_desc + ((f" {STRUCTURE_MARK.strip()} = structure-assisted (an AF3-complex feature or a "
-                           f"structure-informed embedding). For AF3-complex features: {AF3_CAVEAT}")
-                          if structure else "")
+    struct_caveat = ((f" {STRUCTURE_MARK.strip()} = structure-assisted (an AF3-complex feature or a "
+                      f"structure-informed embedding). For AF3-complex features: {AF3_CAVEAT}")
+                     if structure else "")
 
-    def _write_heatmap(block_id, title, data, fname, stops=colstops, description=""):
+    def _write_heatmap(block_id, title, data, fname, stops=colstops, description="", caveat=None):
+        # caveat=None: the bootstrap/SD wording of the AUC/AP heatmaps.
+        if caveat is None:
+            caveat = seed_desc + struct_caveat
         block = {
             "id": block_id,
             "section_name": title,
@@ -1049,7 +1092,9 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         with open(os.path.join(outdir, fname), "w") as f:
             json.dump(block, f, indent=2)
 
-    def _write_ci_table(block_id, title, data, fname):
+    def _write_ci_table(block_id, title, data, fname, label="95% CI", description=None):
+        if description is None:
+            description = seed_desc
         # Table sharing the same model/db grid; cells = "mean [lo, hi]" strings.
         # Acts as the CI label panel rendered directly below the heatmap.
         db_cols = sort_by_dataset(
@@ -1061,12 +1106,12 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         }
         block = {
             "id": block_id,
-            "section_name": f"{title} — 95% CI labels",
-            **({"description": seed_desc.strip()} if seed_desc else {}),
+            "section_name": f"{title} — {label} labels",
+            **({"description": description.strip()} if description else {}),
             "plot_type": "table",
             "pconfig": {
                 "id": block_id,
-                "title": f"{title} (95% CI)",
+                "title": f"{title} ({label})",
                 "col1_header": "Model",
                 "no_violin": True,
                 "sortRows": False,
@@ -1084,7 +1129,7 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         "model_performance_heatmap_roc_mqc.json",
         stops=auc_colstops,
         description="Colour diverges at 0.5 (chance). Each model is scored on "
-        "its own pairs; n and prevalence are in the CI table below.",
+        "its own pairs; n and prevalence are in the CI table below. " + SCORE_NOTE,
     )
     _write_ci_table(
         "model_performance_heatmap_roc_ci",
@@ -1143,6 +1188,61 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         pr_ci,
         "model_performance_heatmap_pr_ci_mqc.json",
     )
+
+    # Test TPR at the primary operating point, from the per-dataset
+    # `model_eval_metrics` tables; the `[S]` mark from the same dataset's
+    # AUC table row.
+    def _tpr_details(v, row):
+        if v is None:
+            return "n/a (no scored positives)"
+        text = f"{v:.3f}"
+        for name, col in (("test FPR", f"Test FPR ({_P})"), ("val FPR", f"Val FPR ({_P})")):
+            x = _to_float(row.get(col))
+            text += f" · {name} {x:.3f}" if x is not None else f" · {name} n/a"
+        text += (f" · scored {_to_float(row.get('Test positives')) or 0:,.0f} pos / "
+                 f"{_to_float(row.get('Test negatives')) or 0:,.0f} neg")
+        prev = _to_float(row.get("Prevalence"))
+        if prev is not None:
+            text += f" · test prevalence {prev:.3f}"
+        status = str(row.get(f"Status ({_P})", ""))
+        if status.startswith("indicative"):
+            text += " · indicative"
+        elif status.startswith("resolved in"):
+            text += f" · {status}"
+        sd = _to_float(row.get(f"{_TPR} SD"))
+        if "Seeds" in row and sd is not None:
+            text += f" · SD {sd:.3f} over {str(row['Seeds']).split('/')[0]} seeds"
+        return text
+
+    tpr, tpr_details = {}, {}
+    for block_id, block in (eval_data or {}).items():
+        db_name = block_id.removeprefix("model_eval_metrics_")
+        perf = combined_metrics.get(f"combined_metrics_table_{db_name}", {}).get("data", {})
+        for model, row in block.get("data", {}).items():
+            name = model + (STRUCTURE_MARK if perf.get(model, {}).get("Structure-assisted") == "yes" else "")
+            v = _to_float(row.get(_TPR))
+            tpr.setdefault(name, {})[db_name] = v
+            tpr_details.setdefault(name, {})[db_name] = _tpr_details(v, row)
+    if tpr:
+        _write_heatmap(
+            "model_performance_heatmap_tpr_fpr01",
+            "Test TPR at validation FPR ≤ 0.01",
+            _rows(tpr),
+            "model_performance_heatmap_tpr_fpr01_mqc.json",
+            description=TPR_DESCRIPTION,
+            caveat=struct_caveat,
+        )
+        _write_ci_table(
+            "model_performance_heatmap_tpr_fpr01_details",
+            "Test TPR at validation FPR ≤ 0.01",
+            _rows(tpr_details),
+            "model_performance_heatmap_tpr_fpr01_details_mqc.json",
+            label="details",
+            description="Per cell: test TPR · realised test FPR · validation FPR · "
+            "scored test positives / negatives · test prevalence. 'indicative' = "
+            "fewer than 100 validation negatives. Multi-seed: means, with the "
+            "sample SD of the TPR over seeds.",
+        )
 
 
 # `combine_db_analysis()` lived here. It merged the per-dataset degree,

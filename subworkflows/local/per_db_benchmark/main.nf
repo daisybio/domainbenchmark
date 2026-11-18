@@ -449,11 +449,22 @@ workflow PER_DB_BENCHMARK {
         // under the run label `<db>_<variant>` (bare `<db>` when the database
         // ships a single `test`).
         // ---------------------------------------------------------------
-        all_predictions_ch = NEURAL_NETWORK.out.predictions
-            .mix(RANDOM_FOREST.out.predictions)
-            .mix(SVM.out.predictions)
+        // Each prediction carries its model's model_parameters.json: the
+        // validation operating points EVAL_ONE reports exist only there. Both
+        // emits come from one task with one meta, so the join is exact;
+        // failOnMismatch makes a dropped prediction an error rather than a
+        // short EVALUATION group. Graph models write no such file and are not
+        // supported from W-7 on (they are being removed): their 2-element
+        // tuples fail in the flatMap below.
+        def params_file = { m, dir -> tuple(m, dir / 'model_parameters.json') }
+        scored_ch = NEURAL_NETWORK.out.predictions
+            .join(NEURAL_NETWORK.out.model.map(params_file), failOnMismatch: true, failOnDuplicate: true)
+            .mix(RANDOM_FOREST.out.predictions
+                .join(RANDOM_FOREST.out.model.map(params_file), failOnMismatch: true, failOnDuplicate: true))
+            .mix(SVM.out.predictions
+                .join(SVM.out.model.map(params_file), failOnMismatch: true, failOnDuplicate: true))
             .mix(GRAPH_MODEL.out.predictions)
-            .flatMap { meta, pred ->
+            .flatMap { meta, pred, model_params ->
                 def files = pred instanceof java.util.List ? pred : [pred]
                 files.collect { f ->
                     def pf         = file(f)
@@ -474,18 +485,19 @@ workflow PER_DB_BENCHMARK {
                         // The model's seed: EVAL_ONE bootstraps with it.
                         seed     : meta.seed
                     ]
-                    tuple(m_eval, pf)
+                    tuple(m_eval, pf, model_params)
                 }
             }
+        all_predictions_ch = scored_ch.map { m, pf, _p -> tuple(m, pf) }
 
         // Per-source accuracy needs each test DDI's provenance list, so the
         // scatter task gets its database's DDI directory alongside the
         // predictions. `combine(by: 0)` rather than `join`: one DDI dir fans out
         // to every (model x variant) prediction of that database.
-        eval_one_input_ch = all_predictions_ch
-            .map { m, pf -> tuple(m.db, m, pf) }
+        eval_one_input_ch = scored_ch
+            .map { m, pf, mp -> tuple(m.db, m, pf, mp) }
             .combine(ddi_keyed.map { id, _meta, ddi_dir -> tuple(id, ddi_dir) }, by: 0)
-            .map { _db_id, m, pf, ddi_dir -> tuple(m, pf, ddi_dir) }
+            .map { _db_id, m, pf, mp, ddi_dir -> tuple(m, pf, ddi_dir, mp) }
         EVAL_ONE(eval_one_input_ch)
 
         // ---------------------------------------------------------------

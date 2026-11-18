@@ -11,7 +11,9 @@ process EVAL_ONE {
     container "docker.io/konstantinpelz/domainbenchmark-general:1.0.2"
 
     input:
-        tuple val(meta), path(predictions), path(ddi_dir)
+        // model_params: the model's model_parameters.json (validation
+        // operating points), reported beside the realised test rates.
+        tuple val(meta), path(predictions), path(ddi_dir), path(model_params, stageAs: 'model_parameters.json')
 
     output:
         // One per (model, seed): EVALUATION stages every seed's JSON side by side.
@@ -34,6 +36,7 @@ process EVAL_ONE {
             --predictions ${predictions} \\
             --model_name ${meta.model} \\
             ${sources_arg} \\
+            --model_parameters model_parameters.json \\
             --seed ${meta.seed} \\
             --out per_model/${meta.model}.seed${meta.seed}.json
         """

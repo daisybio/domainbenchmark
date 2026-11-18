@@ -23,10 +23,23 @@ from load_data_gm import DEFAULT_PPI_SCORE_CUTOFF, load_ppi as gm_load_ppi
 #: Structure features are computed on AF3 complexes; see CLAUDE.md, "Structure
 #: features".
 AF3_CAVEAT = (
-    "Structure-assisted models read AlphaFold3 complexes. Positives come from "
-    "PDB co-crystals that are in AF3's training data, so interface features "
-    "partly measure AF3's recall of known complexes rather than predict an "
-    "interaction; these models also score only DDIs with a structure."
+    "Structure-assisted models read AlphaFold3 complexes, with AF3 that may "
+    "have seen the positives (PDB training cutoff 2021-09-30). Positives come "
+    "from PDB co-crystals, so interface features partly measure AF3's recall "
+    "of known complexes rather than predict an interaction; these models also "
+    "score only DDIs with a structure."
+)
+
+#: The two validation operating points of an NN/RF/SVM model (W-5), named the
+#: way every thresholded number in the reports names its point (W-7, D-1).
+POINT_LABEL = {
+    "fpr0.01": "at validation FPR ≤ 0.01",
+    "universe_prior": "at universe-prior scenario threshold",
+}
+
+SCORE_NOTE = (
+    "Scores are model-specific rankings, not probabilities; do not compare raw "
+    "scores across models."
 )
 
 #: D9: a dataset without same-family pairs has hetero = full.
@@ -602,7 +615,8 @@ def split_by_seed(per_model_files, seeds) -> dict:
     return by_seed
 
 
-def seed_means(primary_rows, per_seed_rows, n_seeds, spread=(), minmax=None) -> dict:
+def seed_means(primary_rows, per_seed_rows, n_seeds, spread=(), minmax=None,
+               status_cols=(), require_all=None) -> dict:
     """Replace every numeric cell of `primary_rows` by its mean over seeds.
 
     @primary_rows:  {model: row} built from the primary seed (decides the
@@ -610,6 +624,11 @@ def seed_means(primary_rows, per_seed_rows, n_seeds, spread=(), minmax=None) -> 
     @per_seed_rows: {seed: {model: row}}, the same row builder per seed
     @spread:        columns that also get `<col> SD` (sample SD, ddof=1)
     @minmax:        a column that also gets `<col> min–max`
+    @status_cols:   operating-point status columns; the cell becomes
+                    "resolved in k/n seeds" (k = seeds whose status is
+                    `resolvable`)
+    @require_all:   {col: note_col}: `col` stays blank unless finite in all n
+                    seeds, and `note_col` then reads "defined in k/n seeds"
     Adds `Seeds` = "k/n". k < n would mean a failed-and-ignored task; no
     process carries error_ignore, so every seed of every model succeeded
     by the time EVALUATION runs and k = n in practice. NaN cells (an undefined metric) are left out
@@ -630,9 +649,21 @@ def seed_means(primary_rows, per_seed_rows, n_seeds, spread=(), minmax=None) -> 
             else:
                 new[col] = v
         new["Seeds"] = f"{len(rows)}/{n_seeds}"
+        for col in status_cols:
+            if col in new:
+                k = sum(1 for r in rows if r.get(col) == "resolvable")
+                new[col] = f"resolved in {k}/{n_seeds} seeds"
+        for col, note in (require_all or {}).items():
+            k = int(finite(rows, col).size)
+            if col in new and k < n_seeds:
+                new[col] = float("nan")
+                new[note] = f"defined in {k}/{n_seeds} seeds"
         for col in spread:
             vals = finite(rows, col)
-            new[f"{col} SD"] = float(np.std(vals, ddof=1)) if vals.size >= 2 else float("nan")
+            # A require_all column blank by rule keeps a blank SD too.
+            partial = col in (require_all or {}) and vals.size < n_seeds
+            new[f"{col} SD"] = (float(np.std(vals, ddof=1))
+                                if vals.size >= 2 and not partial else float("nan"))
         if minmax:
             vals = finite(rows, minmax)
             new[f"{minmax} min–max"] = f"[{vals.min():.3f}, {vals.max():.3f}]" if vals.size else "n/a"

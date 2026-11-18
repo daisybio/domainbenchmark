@@ -26,7 +26,18 @@ from sklearn.metrics import (
     roc_curve,
 )
 
-from eval_multiqc_functions import bootstrap_metric, count_valid
+from eval_multiqc_functions import POINT_LABEL, bootstrap_metric, count_valid
+
+#: The two validation operating points (machine_learning.PRIMARY_POINT /
+#: PRIOR_POINT) and the parquet column each one labels.
+PRIMARY, PRIOR = "fpr0.01", "universe_prior"
+LABEL_COL = {PRIMARY: "predicted_interaction", PRIOR: "predicted_interaction_prior"}
+UNRESOLVED = {
+    PRIMARY: "indicative: < 100 validation negatives",
+    PRIOR: "indicative: no validation false positive",
+}
+#: Column-name suffix of each point in `metrics_summary`.
+COL_TAG = {PRIMARY: "val FPR≤0.01", PRIOR: "prior scenario"}
 
 
 #: Row label for the whole test set, used as the per-source table's baseline.
@@ -297,6 +308,7 @@ def _drop_duplicate_pairs(df: pd.DataFrame, path: str) -> pd.DataFrame:
     """
     key = _pair_keys(df["domain_a"], df["domain_b"])
     cols = ["true_interaction", "predicted_probability", "predicted_interaction"]
+    cols += [LABEL_COL[PRIOR]] if LABEL_COL[PRIOR] in df.columns else []
     is_extra = pd.Series(key).duplicated().to_numpy()
     if not is_extra.any():
         return df
@@ -318,7 +330,9 @@ def _drop_duplicate_pairs(df: pd.DataFrame, path: str) -> pd.DataFrame:
     return df.loc[~is_extra].reset_index(drop=True)
 
 
-def _read_predictions(path: str, model_name: str) -> pd.DataFrame:
+def _read_predictions(path: str, model_name: str, points: dict = None) -> pd.DataFrame:
+    """`points` (from `_read_points`) adds the prior label column to the
+    required ones and checks both labels against their thresholds."""
     if path.endswith(".parquet") or path.endswith(".pq"):
         df = pd.read_parquet(path)
     else:
@@ -330,7 +344,7 @@ def _read_predictions(path: str, model_name: str) -> pd.DataFrame:
     required = (
         "domain_a", "domain_b",
         "true_interaction", "predicted_interaction", "predicted_probability",
-    )
+    ) + ((LABEL_COL[PRIOR],) if points else ())
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
@@ -338,15 +352,15 @@ def _read_predictions(path: str, model_name: str) -> pd.DataFrame:
             f"{list(df.columns)}, {len(df)} rows). An empty frame here means the "
             "model scored no domain pairs at all -- check that upstream task's log."
         )
-    for col in ("true_interaction", "predicted_interaction"):
+    label_cols = [c for c in required if c.startswith(("true_", "predicted_interaction"))]
+    for col in label_cols:
         bad = ~df[col].isin([0, 1])
         if bad.any():
             raise SystemExit(
                 f"[eval_one] model {model_name}: {int(bad.sum())}/{len(df)} rows "
                 f"of {path} have a {col} that is not 0/1."
             )
-    df["true_interaction"] = df["true_interaction"].astype(np.int8)
-    df["predicted_interaction"] = df["predicted_interaction"].astype(np.int8)
+        df[col] = df[col].astype(np.int8)
     df["predicted_probability"] = df["predicted_probability"].astype(np.float64)
 
     # A non-finite score is fatal, not masked. It used to be dropped from the
@@ -361,6 +375,21 @@ def _read_predictions(path: str, model_name: str) -> pd.DataFrame:
             f"{path} have a non-finite predicted_probability. "
             f"e.g. {_examples(keys)}"
         )
+    # Both labels must be `score >= threshold`. The producer compares float32
+    # scores with float32-derived thresholds, and the float64 cast above is
+    # exact, so this holds bit for bit -- and proves the staged
+    # model_parameters.json belongs to this parquet (wrong seed or model fails).
+    for point, p in (points or {}).items():
+        expected = df["predicted_probability"].to_numpy() >= p["threshold"]
+        wrong = expected != df[LABEL_COL[point]].to_numpy().astype(bool)
+        if wrong.any():
+            keys = _pair_keys(df.loc[wrong, "domain_a"], df.loc[wrong, "domain_b"])
+            raise SystemExit(
+                f"[eval_one] model {model_name}: {int(wrong.sum())}/{len(df)} rows "
+                f"of {path} have a {LABEL_COL[point]} that is not score >= "
+                f"{point} threshold {p['threshold']!r}; the model_parameters.json "
+                f"does not belong to these predictions. e.g. {_examples(keys)}"
+            )
     # Duplicates are compared at the file's own precision, before the float32
     # cast, which could merge two scores that differ only below it.
     df = _drop_duplicate_pairs(df, path)
@@ -421,6 +450,165 @@ def _summary(y_true, y_pred, model_name) -> dict:
         "F1 Score": F1,
         "MCC": MCC,
     }
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v)
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+#: Required fields of each point in `thresholds`: (field, check, description).
+_POINT_FIELDS = {
+    PRIMARY: (
+        ("threshold", _is_num, "a finite number"),
+        ("achieved_val_fpr", _is_num, "a finite number"),
+        ("achieved_val_tpr", lambda v: v is None or _is_num(v), "a finite number or null"),
+        ("n_neg", lambda v: _is_int(v) and v > 0, "an integer > 0"),
+        ("resolvable", lambda v: isinstance(v, bool), "a boolean"),
+    ),
+    PRIOR: (
+        ("threshold", _is_num, "a finite number"),
+        ("val_fpr", _is_num, "a finite number"),
+        ("val_tpr", _is_num, "a finite number"),
+        ("pi", lambda v: _is_num(v) and 0 <= v <= 1, "a number in [0, 1]"),
+        ("n_fp", _is_int, "an integer"),
+        ("resolvable", lambda v: isinstance(v, bool), "a boolean"),
+    ),
+}
+
+
+def _read_points(path: str, seed: int = None) -> dict:
+    """The two validation operating points of `model_parameters.json`.
+
+    Fails naming the file and field on anything malformed, and when the file's
+    `seed` is not `seed` (another seed's thresholds). The prior point's
+    validation negatives are `fpr0.01.n_neg`: both are derived from the same
+    validation DDIs, and the producer records the count only there.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            params = json.load(fh)
+        block = params.get("thresholds")
+    except (OSError, ValueError, AttributeError) as e:
+        raise SystemExit(f"[eval_one] {path}: not a readable model_parameters.json ({e}).")
+    if seed is not None and params.get("seed") != seed:
+        raise SystemExit(
+            f"[eval_one] {path}: seed {params.get('seed')!r} is not --seed {seed}; "
+            "the model_parameters.json belongs to another seed."
+        )
+    points = {}
+    for point, fields in _POINT_FIELDS.items():
+        entry = block.get(point) if isinstance(block, dict) else None
+        if not isinstance(entry, dict):
+            raise SystemExit(f"[eval_one] {path}: thresholds.{point} is missing.")
+        for field, ok, what in fields:
+            if field not in entry or not ok(entry[field]):
+                raise SystemExit(
+                    f"[eval_one] {path}: thresholds.{point}.{field} = "
+                    f"{entry.get(field, '<missing>')!r} is not {what}."
+                )
+        points[point] = entry
+    p, q = points[PRIMARY], points[PRIOR]
+    return {
+        PRIMARY: {"threshold": p["threshold"], "resolvable": p["resolvable"],
+                  "val_fpr": p["achieved_val_fpr"], "val_tpr": p["achieved_val_tpr"],
+                  "val_n_neg": p["n_neg"]},
+        PRIOR: {"threshold": q["threshold"], "resolvable": q["resolvable"],
+                "val_fpr": q["val_fpr"], "val_tpr": q["val_tpr"],
+                "val_n_neg": p["n_neg"], "kind": q.get("kind"), "pi": q["pi"]},
+    }
+
+
+def _rates(s: dict) -> dict:
+    """Test counts and rates from `_summary`'s counts; each rate is None where
+    its own denominator is 0 (an all-positive split keeps TPR, an all-negative
+    one keeps FPR, no predicted positive leaves precision undefined)."""
+    tp, fp, tn, fn = s["TP"], s["FP"], s["TN"], s["FN"]
+
+    def rate(num, den):
+        return num / den if den else None
+
+    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "n_pos": tp + fn, "n_neg": tn + fp,
+            "tpr": rate(tp, tp + fn), "fpr": rate(fp, tn + fp), "precision": rate(tp, tp + fp)}
+
+
+def _pi_precision(test: dict, pi: float) -> tuple:
+    """Precision the realised test rates would give at prevalence `pi`, at the
+    frozen prior threshold (no test cutoff search). (value, note): the value is
+    None with a note saying why."""
+    if not test["n_pos"]:
+        return None, "undefined: no test positives"
+    if not test["n_neg"]:
+        return None, "undefined: no test negatives"
+    if not test["tp"] + test["fp"]:
+        return None, "undefined: no predicted positives"
+    if not test["fp"]:
+        # The formula would read 1.0 off a FPR that is only bounded.
+        return None, f"no test false positive: 0/{test['n_neg']}"
+    num = test["tpr"] * pi
+    den = num + test["fpr"] * (1 - pi)
+    if not den:
+        return None, f"undefined: π = {pi:g}"
+    return num / den, None
+
+
+def _operating_points(df: pd.DataFrame, points: dict, model_name: str) -> tuple:
+    """(`operating_points` payload, `metrics_summary` row) for both points."""
+    y_true = df["true_interaction"].to_numpy()
+    ops = {}
+    row = None
+    for point, p in points.items():
+        s = _summary(y_true, df[LABEL_COL[point]].to_numpy(), model_name)
+        test = _rates(s)
+        op = {"label": POINT_LABEL[point], "threshold": p["threshold"],
+              "resolvable": p["resolvable"],
+              "status": "resolvable" if p["resolvable"] else UNRESOLVED[point],
+              "val_fpr": p["val_fpr"], "val_tpr": p["val_tpr"],
+              "val_n_neg": p["val_n_neg"], "test": test}
+        if point == PRIOR:
+            value, note = _pi_precision(test, p["pi"])
+            op.update(kind=p["kind"], pi=p["pi"], pi_precision=value, pi_precision_note=note)
+        ops[point] = op
+        if row is None:
+            row = {"Model": s["Model"], "Samples": s["Samples"], "Prevalence": s["Prevalence"]}
+        nan = float("nan")
+        num = (lambda v: nan if v is None else float(v))
+        tag = COL_TAG[point]
+        if point == PRIMARY:
+            row.update({
+                f"Status ({tag})": op["status"],
+                "Val negatives": p["val_n_neg"],
+                f"Val FPR ({tag})": num(p["val_fpr"]),
+                f"Val TPR ({tag})": num(p["val_tpr"]),
+                "Test positives": test["n_pos"],
+                "Test negatives": test["n_neg"],
+                f"Test FPR ({tag})": num(test["fpr"]),
+                f"Test TPR ({tag})": num(test["tpr"]),
+                f"Test precision ({tag})": num(test["precision"]),
+                "TP": s["TP"], "FP": s["FP"], "TN": s["TN"], "FN": s["FN"],
+                f"Accuracy ({tag})": s["Accuracy"],
+                f"Balanced Accuracy ({tag})": s["Balanced Accuracy"],
+                f"F1 Score ({tag})": s["F1 Score"],
+                f"MCC ({tag})": s["MCC"],
+            })
+        else:
+            row.update({
+                f"Status ({tag})": op["status"],
+                "π catalogue density": p["pi"],
+                f"Val FPR ({tag})": num(p["val_fpr"]),
+                f"Val TPR ({tag})": num(p["val_tpr"]),
+                f"Test FPR ({tag})": num(test["fpr"]),
+                f"Test TPR ({tag})": num(test["tpr"]),
+                f"Test precision ({tag})": num(test["precision"]),
+                "TP (prior)": s["TP"], "FP (prior)": s["FP"],
+                "TN (prior)": s["TN"], "FN (prior)": s["FN"],
+                f"π-precision ({tag})": num(op["pi_precision"]),
+                "π-precision note": op["pi_precision_note"] or "",
+            })
+    return ops, row
 
 
 def _strata_metrics(df: pd.DataFrame, bootstrap_n: int, seed: int) -> tuple:
@@ -515,6 +703,12 @@ def main():
              "provenance list). Enables the per-source accuracy block; skipped when "
              "not given, fatal when given but missing.",
     )
+    p.add_argument(
+        "--model_parameters", required=True,
+        help="The model's model_parameters.json: its two validation operating "
+             "points, reported beside the realised test rates. Fatal when "
+             "malformed or when a parquet label is not score >= its threshold.",
+    )
     p.add_argument("--max_curve_points", type=int, default=600)
     p.add_argument("--bootstrap_n", type=int, default=1000,
                    help="Bootstrap resamples for ROC_AUC / PR_AP confidence intervals.")
@@ -532,9 +726,10 @@ def main():
     if args.run_id:
         print(f"[eval_one] run_id={args.run_id}")
 
-    df = _read_predictions(args.predictions, args.model_name)
+    points = _read_points(args.model_parameters, args.seed)
+    df = _read_predictions(args.predictions, args.model_name, points)
+    operating_points, metrics_summary = _operating_points(df, points, args.model_name)
     y_true = df["true_interaction"].to_numpy()
-    y_pred = df["predicted_interaction"].to_numpy()
     y_score = df["predicted_probability"].to_numpy()
 
     # Both ranking metrics are undefined on a single-class split. Say so in the
@@ -584,7 +779,12 @@ def main():
         # The training seed of the model behind these predictions (it also
         # seeds the bootstrap); eval_multiqc.py groups seeds by it.
         "seed": int(args.seed),
-        "metrics_summary": _summary(y_true, y_pred, args.model_name),
+        # One flat row holding both points (eval_multiqc.py PRIMARY_COLS /
+        # PRIOR_COLS pick from it).
+        "metrics_summary": metrics_summary,
+        # The contract W-10 reads: per point label, threshold, status,
+        # validation rates and realised test counts/rates.
+        "operating_points": operating_points,
         "roc": [[float(x), float(y)] for x, y in zip(fp_d, tp_d)],
         "pr": [[float(x), float(y)] for x, y in zip(rec_d, prec_d)],
         "roc_auc": roc_auc,
