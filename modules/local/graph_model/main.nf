@@ -29,7 +29,7 @@ process GRAPH_MODEL {
             --test_splits ${test_splits} \\
             --threads ${task.cpus} \\
             --ppi_score_cutoff ${params.ppi_score_cutoff} \\
-            --seed ${params.seed}
+            --seed ${meta.seed}
         """
 
     stub:

@@ -75,7 +75,7 @@ def main():
                     help="how many grid candidates to time; the real search runs 67 per "
                          "balance method")
     ap.add_argument("--seed", type=int, default=42,
-                    help="same as params.seed, so the estimator is configured as in production")
+                    help="one of params.seeds, so the estimator is configured as in production")
     ap.add_argument("--grid", type=Path,
                     default=Path(__file__).resolve().parent.parent / "assets" / "RandomForest.json",
                     help="the real hyperparameter grid")

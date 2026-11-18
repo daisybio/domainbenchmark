@@ -212,6 +212,14 @@ def status_block(datasets, outdir):
                     if t["status"] == "ok" else f"skipped: {t['reason']}"
                 )
             data[model if len(datasets) == 1 else f"{ds} | {model}"] = row
+    # eval_multiqc.py records `seeds` only for a multi-seed run: ENRICHMENT is
+    # fitted on the primary (first) seed's predictions alone.
+    seed_lists = sorted({tuple(d["seeds"]) for d in datasets.values() if d.get("seeds")})
+    seed_note = "".join(
+        f" Fitted on the primary seed's predictions only (seed {s[0]} of {', '.join(map(str, s))}); "
+        "the other training seeds are not covered."
+        for s in seed_lists
+    )
     return _write(outdir, {
         "id": f"{PREFIX}status",
         "section_name": "Metadata enrichment — rows and fit status",
@@ -220,7 +228,7 @@ def status_block(datasets, outdir):
                        "Constant and aliased columns are dropped per fit. Logit/MNLogit need 10 events of "
                        "the smallest class per parameter, OLS 10 rows. "
                        "Features are standardised per fit; OLS uses HC3, Logit/MNLogit "
-                       "HC0 robust standard errors; q-values are Benjamini-Hochberg per fit.",
+                       "HC0 robust standard errors; q-values are Benjamini-Hochberg per fit." + seed_note,
         "plot_type": "table",
         "pconfig": {"id": f"{PREFIX}status_table", "title": "Enrichment: rows and fit status", "col1_header": "Model"},
         "data": data,

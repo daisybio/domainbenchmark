@@ -169,10 +169,11 @@
                     "help_text": "A dataset is one (database, test variant) run label. Several report sections exist once per dataset and several more carry every dataset inside one block (the tabs of the combined ROC/PR and by-source plots, the columns of the AUC/AP heatmaps); left unset all of them come out alphabetically. A name that does not exist in the data is a hard failure. A dataset present in the data but missing from the list warns and is appended alphabetically after the ordered ones.",
                     "fa_icon": "fas fa-sort-amount-down"
                 },
-                "seed": {
-                    "type": "integer",
-                    "default": 42,
-                    "description": "Global RNG seed (numpy / torch / cuML).",
+                "seeds": {
+                    "type": ["string", "integer"],
+                    "default": "42",
+                    "description": "Training seeds, comma-separated (e.g. 42,43,44). The first one is the primary seed.",
+                    "help_text": "Every seed-dependent task (NN / RF / SVM training, the `dummy` feature, per-model evaluation) runs once per seed; seed-free tasks run once. The first seed listed is the primary seed: graph models, enrichment, ROC/PR curves, by-source accuracy and the pairwise bootstrap tests use it. With more than one seed the metric tables show the mean over seeds plus SD, min-max and a per-seed table, and outputs of seed-dependent tasks are published under `seed<N>/`. Use a fresh --outdir when changing the number of seeds. Quote it in a params file (`seeds: '42,43'`).",
                     "fa_icon": "fas fa-dice"
                 },
                 "allow_cpu_ml": {

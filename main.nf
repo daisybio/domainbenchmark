@@ -21,7 +21,7 @@
     source of truth for them.
 
     Nextflow's v2 (strict) parser, the default since 26.x, stopped inferring types
-    for command-line parameters: `--seed 7` arrives as the String "7", and
+    for command-line parameters: `--ppi_score_cutoff 900` arrives as the String "900", and
     nf-schema then rejects it against the schema's `"type": "integer"` with
     "Value is [string] but should be [integer]". Declaring the type here makes
     Nextflow coerce the CLI value before validation runs, which is the v2-native
@@ -41,11 +41,12 @@
     The nf-core boolean flags are declared too. They are usually passed bare,
     but `--validate_params false` arrived as the String "false" -- truthy in
     Groovy -- so it left validation *on*. `help` stays undeclared: it is a
-    string-or-boolean union a type here would break.
+    string-or-boolean union a type here would break. Nor is `seeds`: a comma
+    list arrives as a String anyway, `seeds: 42` in a -params-file is an
+    Integer, and parseSeeds() takes both.
 ----------------------------------------------------------------------------------------
 */
 params {
-    seed: Integer
     ppi_score_cutoff: Integer
     min_embedding_coverage: Float
     sasa_cache_shards: Integer

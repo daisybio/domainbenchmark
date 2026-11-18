@@ -147,6 +147,8 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
     # Copied through per dataset like `model_eval_metrics`, but used to be
     # missing from this list, so MultiQC rendered them wherever it pleased.
     pairwise_blocks = pick(r"^combined_pairwise_significance_")
+    # Multi-seed runs only (eval_multiqc.write_seed_blocks), per dataset.
+    seed_blocks = pick(r"^combined_seed_variance_") + pick(r"^combined_order_agreement_")
 
     # metrics_heatmap_block = pick(r"combined_metrics_heatmap")
     roc_curves_block = pick(r"combined_roc_curves")
@@ -177,6 +179,7 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
         metric_blocks = sort_by_dataset(metric_blocks, dataset_order)
         pairwise_blocks = sort_by_dataset(pairwise_blocks, dataset_order)
         coverage_blocks = sort_by_dataset(coverage_blocks, dataset_order)
+        seed_blocks = sort_by_dataset(seed_blocks, dataset_order)
 
     # Threshold-free heatmaps first: they are the primary comparison. The
     # per-dataset metric tables depend on the validation FPR <= 0.01
@@ -195,6 +198,7 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
         + metric_blocks
         + coverage_blocks
         + pairwise_blocks
+        + seed_blocks
         + roc_curves_block
         + pr_curves_block
         + list(enrichment_ids)
@@ -596,7 +600,7 @@ def _coverage_notes(sidecars):
     return html
 
 
-def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
+def source_accuracy_bargraph(sidecars, outdir, dataset_order=None, seed_note=""):
     """One tabbed bar graph: bars = models, groups = sources, tabs = datasets.
 
     A table would have been the natural shape here, but MultiQC 1.32 renders only
@@ -676,7 +680,8 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
         )
         + _counts_table_html(real_sidecars, source_order)
         + _pool_description(pools)
-        + _coverage_notes(sidecars),
+        + _coverage_notes(sidecars)
+        + (f"<p>{seed_note.strip()}</p>" if seed_note else ""),
         "plot_type": "bargraph",
         "categories": categories,
         "pconfig": {
@@ -708,7 +713,7 @@ def source_accuracy_bargraph(sidecars, outdir, dataset_order=None):
     )
 
 
-def cross_db_comparison(all_blocks, outdir, dataset_order=None):
+def cross_db_comparison(all_blocks, outdir, dataset_order=None, seed_note=""):
 
     performance_data = {
         block["id"]: block
@@ -736,8 +741,8 @@ def cross_db_comparison(all_blocks, outdir, dataset_order=None):
     }
 
     # combined_metrics_heatmap(model_eval_data, outdir)
-    combined_roc_curves(roc_data, outdir, dataset_order)
-    combined_pr_curves(pr_data, outdir, dataset_order, prevalence)
+    combined_roc_curves(roc_data, outdir, dataset_order, seed_note)
+    combined_pr_curves(pr_data, outdir, dataset_order, prevalence, seed_note)
     model_performance_heatmap(performance_data, outdir, dataset_order)
     combine_curves_db_level(
         roc_data, outdir, "roc", "False Positive Rate", "True Positive Rate",
@@ -790,7 +795,7 @@ def combine_curves_db_level(
         json.dump(combined_block, f, indent=2)
 
 
-def combined_roc_curves(roc_data, outdir, dataset_order=None):
+def combined_roc_curves(roc_data, outdir, dataset_order=None, seed_note=""):
 
     data_tmp = []
     data_labels = []
@@ -824,6 +829,7 @@ def combined_roc_curves(roc_data, outdir, dataset_order=None):
     roc_block = {
         "id": "combined_roc_curves",
         "section_name": "ROC Curves",
+        **({"description": seed_note.strip()} if seed_note else {}),
         "plot_type": "linegraph",
         "pconfig": {
             "id": "combined_roc_curves",
@@ -840,7 +846,7 @@ def combined_roc_curves(roc_data, outdir, dataset_order=None):
         json.dump(roc_block, f, indent=2)
 
 
-def combined_pr_curves(pr_data, outdir, dataset_order=None, prevalence=None):
+def combined_pr_curves(pr_data, outdir, dataset_order=None, prevalence=None, seed_note=""):
 
     data = []
     data_tmp = []
@@ -874,7 +880,7 @@ def combined_pr_curves(pr_data, outdir, dataset_order=None, prevalence=None):
     pr_block = {
         "id": "combined_pr_curves",
         "section_name": "PR Curves",
-        "description": NO_SKILL_NOTE,
+        "description": NO_SKILL_NOTE + seed_note,
         "plot_type": "linegraph",
         "pconfig": {
             "id": "combined_pr_curves",
@@ -919,8 +925,18 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
             text += f" · π={pi:.3f}"
         return text + extra
 
+    def _seed_extra(row, sd_col):
+        """` ± 0.004 over 2 seeds` for a multi-seed row (eval_multiqc.py adds
+        `Seeds` = "k/n" and `<metric> SD` only then); "" otherwise."""
+        if "Seeds" not in row:
+            return ""
+        k = int(str(row["Seeds"]).split("/")[0])
+        sd = _to_float(row.get(sd_col))
+        return f" ± {sd:.3f} over {k} seeds" if sd is not None else f" · {row['Seeds']} seeds"
+
     roc_mean, roc_ci = {}, {}
     pr_mean, pr_ci = {}, {}
+    seeded = set()
     het_mean, het_ci = {}, {}
     het_pr_mean, het_pr_ci = {}, {}
     structure = False
@@ -933,6 +949,8 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
             if row.get("Structure-assisted") == "yes":
                 structure = True
                 model = f"{model}{STRUCTURE_MARK}"
+            if "Seeds" in row:
+                seeded.add(str(row["Seeds"]).split("/")[1])
             n, pi = row.get("Pairs"), _to_float(row.get("Prevalence"))
             h_n, h_pos = row.get("Hetero pairs"), row.get("Hetero positives")
             h_pi = h_pos / h_n if h_n and h_pos is not None else None
@@ -957,10 +975,10 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
                 hp, row.get("Hetero PR AP CI"), h_n, h_pi,
                 f" · lift={hp / h_pi:.2f}×" if hp is not None and h_pi else "")
             roc_ci.setdefault(model, {})[db_name] = _cell(
-                rv, row.get("ROC AUC CI"), n, pi)
+                rv, row.get("ROC AUC CI"), n, pi, _seed_extra(row, "ROC AUC SD"))
             pr_ci.setdefault(model, {})[db_name] = _cell(
                 pv, row.get("PR AP CI"), n, pi,
-                f" · lift={lift:.2f}×" if lift is not None else "")
+                (f" · lift={lift:.2f}×" if lift is not None else "") + _seed_extra(row, "PR AP SD"))
 
     # Sort rows (models) alphabetically, columns (datasets) by --mqc_order.
     # Every row carries every column (None where undefined or suppressed):
@@ -1000,8 +1018,14 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
     het_ci = _rows(het_ci)
     het_pr_mean = _rows(het_pr_mean)
     het_pr_ci = _rows(het_pr_ci)
-    caveat = (f" {STRUCTURE_MARK.strip()} = structure-assisted (an AF3-complex feature or a "
-              f"structure-informed embedding). For AF3-complex features: {AF3_CAVEAT}") if structure else ""
+    seed_desc = (
+        f" Cells are means over {' / '.join(sorted(seeded))} training seeds. The 95 % CI is the "
+        "primary seed's bootstrap CI (test-set sampling only); ± SD is training variance "
+        "across seeds. They are different sources of error and are not added."
+    ) if seeded else ""
+    caveat = seed_desc + ((f" {STRUCTURE_MARK.strip()} = structure-assisted (an AF3-complex feature or a "
+                           f"structure-informed embedding). For AF3-complex features: {AF3_CAVEAT}")
+                          if structure else "")
 
     def _write_heatmap(block_id, title, data, fname, stops=colstops, description=""):
         block = {
@@ -1038,6 +1062,7 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None):
         block = {
             "id": block_id,
             "section_name": f"{title} — 95% CI labels",
+            **({"description": seed_desc.strip()} if seed_desc else {}),
             "plot_type": "table",
             "pconfig": {
                 "id": block_id,
@@ -1157,6 +1182,7 @@ def main():
     db_names = []
     source_sidecars = []
     enrichment = {}
+    seed_lists = set()
 
     # Collect and relabel all blocks from each report
     for report_dir in args.reports:
@@ -1171,6 +1197,11 @@ def main():
         if sidecar:
             sidecar.setdefault("db_name", db_name)
             source_sidecars.append(sidecar)
+        # Written by eval_multiqc.py for a multi-seed run only.
+        seed_path = os.path.join(report_dir, "seed_metrics.json")
+        if os.path.isfile(seed_path):
+            with open(seed_path, "r", encoding="utf-8") as fh:
+                seed_lists.add(tuple(json.load(fh)["seeds"]))
         enrichment_path = os.path.join(report_dir, ENRICHMENT_SIDECAR)
         if os.path.isfile(enrichment_path):
             with open(enrichment_path, "r", encoding="utf-8") as fh:
@@ -1227,8 +1258,11 @@ def main():
     print(f"[INFO] Dataset order: {', '.join(dataset_order) or '(none)'}")
 
     # Cross-database comparison
-    cross_db_comparison(all_blocks, outdir_json, dataset_order)
-    source_accuracy_bargraph(source_sidecars, outdir_json, dataset_order)
+    seed_note = "".join(
+        f" Primary seed only: seed {s[0]} of {', '.join(map(str, s))}." for s in sorted(seed_lists)
+    )
+    cross_db_comparison(all_blocks, outdir_json, dataset_order, seed_note)
+    source_accuracy_bargraph(source_sidecars, outdir_json, dataset_order, seed_note)
 
     enrichment = order_dataset_keys(enrichment, dataset_order)
     enrichment_ids = write_enrichment_blocks(enrichment, outdir_json)

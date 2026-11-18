@@ -14,7 +14,8 @@ process EVAL_ONE {
         tuple val(meta), path(predictions), path(ddi_dir)
 
     output:
-        tuple val(meta), path("per_model/${meta.model}.json"), emit: metrics
+        // One per (model, seed): EVALUATION stages every seed's JSON side by side.
+        tuple val(meta), path("per_model/${meta.model}.seed${meta.seed}.json"), emit: metrics
 
     script:
         // `<split>_sources.csv` carries each test DDI's comma-joined provenance
@@ -33,14 +34,14 @@ process EVAL_ONE {
             --predictions ${predictions} \\
             --model_name ${meta.model} \\
             ${sources_arg} \\
-            --seed ${params.seed} \\
-            --out per_model/${meta.model}.json
+            --seed ${meta.seed} \\
+            --out per_model/${meta.model}.seed${meta.seed}.json
         """
 
     stub:
         """
         mkdir -p per_model
-        echo '{}' > per_model/${meta.model}.json
+        echo '{}' > per_model/${meta.model}.seed${meta.seed}.json
         """
 }
 
@@ -88,6 +89,7 @@ process EVALUATION {
             --variant ${meta.variant ?: 'test'} \\
             --test_split ${test_split} \\
             --ppi_score_cutoff ${params.ppi_score_cutoff} \\
+            --seeds ${params.seeds.toString().replaceAll(/\s/, '')} \\
             ${enrichment_arg} \\
             ${meta.structure_features ? "--structure_features ${meta.structure_features}" : ''} \\
             ${meta.structure_informed ? "--structure_informed_features ${meta.structure_informed}" : ''} \\

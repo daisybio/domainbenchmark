@@ -32,7 +32,7 @@ process RANDOM_FOREST {
             --out_predictions_dir ${output_base} \\
             --test_splits ${test_splits} \\
             --out_model_dir ${output_model_dir} \\
-            --seed ${params.seed} ${allow_cpu}
+            --seed ${meta.seed} ${allow_cpu}
         """
 
     stub:

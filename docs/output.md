@@ -61,7 +61,9 @@ scored by the same trained model. A database with a single `test.sqlite3`
     databases the same run produced.
 - `<db_name>/nn_output/neural_network_<combo>/`,
   `<db_name>/rf_output/random_forest_<combo>/` and
-  `<db_name>/svm_output/svm_<combo>/`
+  `<db_name>/svm_output/svm_<combo>/` -- with several `--seeds`, one copy per
+  seed under `<x>_output/seed<N>/<model>_<combo>/` (`model_parameters.json`
+  records its `seed`; the thresholds are per model per seed)
   - `model/`: the fitted model plus `model_parameters.json` (chosen
     hyperparameters, balance method, a `selection` block describing how they
     were chosen, and a `thresholds` block with the two validation operating
@@ -93,10 +95,16 @@ scored by the same trained model. A database with a single `test.sqlite3`
 - `<db_name>/evaluation/<variant>/`
   - The per-(database, test variant) MultiQC report: `ddi_report.html`, its
     `ddi_report_data/`, and the JSON inputs under `multiqc_json/`.
+  - With several `--seeds` only: `seed_metrics.json` (one row per (model,
+    seed): AUC, AP and the thresholded metrics) and two more report sections,
+    "Per-seed results" and "ROC AUC order agreement across seeds". The metric
+    tables then hold means over seeds plus `Seeds`, `ROC AUC SD`, `PR AP SD`
+    and `ROC AUC min–max`; curves, coverage, by-source accuracy, pairwise
+    tests and enrichment are the primary (first) seed's.
 
 </details>
 
-A run is seeded end to end from `--seed` (see `bin/determinism.py`), and
+A run is seeded end to end from `--seeds` (see `bin/determinism.py`), and
 `PYTHONHASHSEED` is fixed for every task in `nextflow.config`. On the tested
 setup -- the CPU backend with the pinned containers, as the nf-test suite runs
 it (`-profile test,docker --allow_cpu_ml true`) -- two runs of the same commit on

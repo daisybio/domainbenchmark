@@ -518,10 +518,12 @@ def main():
     p.add_argument("--max_curve_points", type=int, default=600)
     p.add_argument("--bootstrap_n", type=int, default=1000,
                    help="Bootstrap resamples for ROC_AUC / PR_AP confidence intervals.")
-    # `--seed`, not `--bootstrap_seed`: the pipeline has exactly one RNG
-    # parameter (`params.seed`), and every entrypoint spells it the same way.
+    # `--seed`, not `--bootstrap_seed`: every entrypoint spells its one RNG
+    # parameter the same way. The pipeline passes the model's own training
+    # seed (one of `params.seeds`).
     p.add_argument("--seed", type=int, default=42,
-                   help="Master RNG seed. Seeds the bootstrap resampling below.")
+                   help="The model's training seed. Seeds the bootstrap resampling "
+                        "below and is recorded as `seed` in the output.")
     p.add_argument(
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only)."
@@ -579,6 +581,9 @@ def main():
 
     payload = {
         "model_name": args.model_name,
+        # The training seed of the model behind these predictions (it also
+        # seeds the bootstrap); eval_multiqc.py groups seeds by it.
+        "seed": int(args.seed),
         "metrics_summary": _summary(y_true, y_pred, args.model_name),
         "roc": [[float(x), float(y)] for x, y in zip(fp_d, tp_d)],
         "pr": [[float(x), float(y)] for x, y in zip(rec_d, prec_d)],

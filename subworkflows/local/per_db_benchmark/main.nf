@@ -29,7 +29,7 @@ include { GRAPH_MODEL                                   } from '../../../modules
 include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 include { VERIFY_EMBEDDINGS                             } from '../../../modules/local/verify_embeddings/main.nf'
 include { METADATA; ENRICHMENT                          } from '../../../modules/local/enrichment/main.nf'
-include { csvToList; runLabel; featureVariants          } from '../utils_nfcore_domainbenchmark_pipeline'
+include { csvToList; runLabel; featureVariants; parseSeeds } from '../utils_nfcore_domainbenchmark_pipeline'
 
 
 def embeddingsDir(features) {
@@ -132,8 +132,10 @@ def structuresFile(features) {
     return candidate
 }
 
-def comboFiles(files, combo, splits) {
-    // The feature files one model task stages: only those of its own combo.
+def comboFiles(files, combo, splits, seed) {
+    // The feature files one model task stages: only those of its own combo,
+    // and of a seeded feature only the copy drawn with this task's seed.
+    // `files` holds [seed, file] pairs; a seed-free file carries seed null.
     // Staging the whole database's set put every feature into every model's
     // task hash, so adding one feature re-ran every model on -resume.
     // Names follow resolve_feature_file (bin/machine_learning.py):
@@ -141,7 +143,7 @@ def comboFiles(files, combo, splits) {
     // `<feature>.h5` (published). Matched exactly, so `k_closest_distance`
     // does not pick up `k_closest_distance_5k`.
     def wanted = combo.collectMany { feat -> ["${feat}.h5".toString()] + splits.collect { "${feat}__${it}.h5".toString() } }
-    files.findAll { wanted.contains(it.name) }
+    files.findAll { s, f -> wanted.contains(f.name) && (s == null || s == seed) }.collect { pair -> pair[1] }
 }
 
 workflow PER_DB_BENCHMARK {
@@ -155,6 +157,17 @@ workflow PER_DB_BENCHMARK {
         // ---------------------------------------------------------------
 
         def skip_features        = csvToList(params.skip)
+
+        // Training seeds; the first is the primary seed (graph models,
+        // enrichment, seed-free feature encoders). Validated at launch.
+        def seeds                = parseSeeds(params.seeds)
+        def primary_seed         = seeds[0]
+        // Encoders that draw from the RNG, i.e. whose output depends on the
+        // seed: they are extracted once per seed, every other encoder once
+        // with the primary seed. A new sampling encoder must be added here, or
+        // every seed silently reuses the primary seed's vectors (CLAUDE.md,
+        // "Deriving per item beats drawing in a loop").
+        def seeded_features      = ['dummy']
 
         def all_ml_models        = csvToList(params.machine_learning_models)
         def ml_model_names       = all_ml_models.findAll { !skip_features.contains(it) }
@@ -224,8 +237,11 @@ workflow PER_DB_BENCHMARK {
         // exactly this many predictions. Known up front, which lets the
         // EVALUATION group below emit as soon as its own models are done
         // instead of waiting for the slowest model of every database.
-        def models_per_variant = feature_combos.size() * ((nn_enabled ? 1 : 0) + (rf_enabled ? 1 : 0) + (svm_enabled ? 1 : 0)) +
-            graph_model_names.size()
+        // ENRICHMENT sees the primary seed's predictions only, so its group
+        // has one prediction per model; EVAL_ONE's has one per (ML model, seed).
+        def ml_models_per_variant = feature_combos.size() * ((nn_enabled ? 1 : 0) + (rf_enabled ? 1 : 0) + (svm_enabled ? 1 : 0))
+        def models_per_variant = ml_models_per_variant + graph_model_names.size()
+        def evals_per_variant  = ml_models_per_variant * seeds.size() + graph_model_names.size()
         if (models_per_variant == 0) {
             error(
                 "Nothing to benchmark: no ML model, feature or graph model is left after " +
@@ -249,8 +265,10 @@ workflow PER_DB_BENCHMARK {
         def variants = featureVariants()
         def feature_specs = extracted_features.collect { name ->
             def v = variants[name]
+            def seeded = seeded_features.contains(name)
             [name: name, module: v ? v.module : name, params: v ? v.params : [:],
-             structure: structure_features.contains(name)]
+             structure: structure_features.contains(name),
+             seeded: seeded, seeds: seeded ? seeds : [primary_seed]]
         }
         def structures_file = structure_features ? structuresFile(structure_features) : null
 
@@ -298,9 +316,10 @@ workflow PER_DB_BENCHMARK {
         // start when its own features are done rather than when the last
         // feature task of any database is. `remainder: true` because the
         // output is optional: a short group still emits when the channel closes.
+        def n_feature_runs = feature_specs.sum(0) { spec -> spec.seeds.size() }
         extracted_per_db = FEATURE_EXTRACTION.out.h5
             .combine(db_ch.map { meta, _db_path -> tuple(meta.id, (meta.splits ?: ['test']).size()) }, by: 0)
-            .map { db_id, h5, n_splits -> tuple(groupKey(db_id, n_splits * feature_specs.size()), h5) }
+            .map { db_id, seeded_h5, n_splits -> tuple(groupKey(db_id, n_splits * n_feature_runs), seeded_h5) }
             .groupTuple(remainder: true)
             // GroupKey -> plain String again, or the joins below never match.
             .map { key, files -> tuple(key.toString(), files) }
@@ -325,10 +344,11 @@ workflow PER_DB_BENCHMARK {
             .join(extracted_per_db, remainder: true)
             .join(verified_per_db, remainder: true)
             .map { db_id, _marker, extracted, published ->
-                def files = (extracted ?: []) + (published ?: [])
-                tuple(db_id, files.toSorted { a, b -> a.name <=> b.name })
+                // [seed, file] pairs: seed null for a seed-free file.
+                def files = (extracted ?: []) + (published ?: []).collect { [null, it] }
+                tuple(db_id, files.toSorted { a, b -> (a[1].name <=> b[1].name) ?: ((a[0] == null ? -1 : a[0]) <=> (b[0] == null ? -1 : b[0])) })
             }
-        // emits: tuple(db_id, [aacomp__train.h5, ..., esm3_embeddings.h5, ...])
+        // emits: tuple(db_id, [[null, aacomp__train.h5], [42, dummy__train.h5], ..., [null, esm3_embeddings.h5], ...])
 
         // Key DDI outputs by db_id so we can join with feature_files_per_db.
         // Joined on PREFLIGHT: every ML input is built from this channel, so
@@ -344,8 +364,9 @@ workflow PER_DB_BENCHMARK {
         nn_input_ch = nn_enabled ? ddi_keyed
             .join(feature_files_per_db)
             .combine(Channel.fromList(feature_combos.collect { [it] }))
+            .combine(Channel.fromList(seeds))
             .combine(Channel.value(ml_config))
-            .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
+            .map { _db_id, meta, ddi_dir, feature_files, combo, seed, cfg ->
                 def combo_id = combo.id
                 def m = [
                     id      : "${meta.id}_neural_network_${combo_id}",
@@ -353,17 +374,19 @@ workflow PER_DB_BENCHMARK {
                     model   : 'neural_network',
                     features: combo.features,
                     combo_id: combo_id,
-                    tests   : meta.tests
+                    tests   : meta.tests,
+                    seed    : seed
                 ]
-                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test']), cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test'], seed), cfg)
             } : Channel.empty()
         NEURAL_NETWORK(nn_input_ch)
 
         rf_input_ch = rf_enabled ? ddi_keyed
             .join(feature_files_per_db)
             .combine(Channel.fromList(feature_combos.collect { [it] }))
+            .combine(Channel.fromList(seeds))
             .combine(Channel.value(rf_config))
-            .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
+            .map { _db_id, meta, ddi_dir, feature_files, combo, seed, cfg ->
                 def combo_id = combo.id
                 def m = [
                     id      : "${meta.id}_random_forest_${combo_id}",
@@ -371,17 +394,19 @@ workflow PER_DB_BENCHMARK {
                     model   : 'random_forest',
                     features: combo.features,
                     combo_id: combo_id,
-                    tests   : meta.tests
+                    tests   : meta.tests,
+                    seed    : seed
                 ]
-                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test']), cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test'], seed), cfg)
             } : Channel.empty()
         RANDOM_FOREST(rf_input_ch)
 
         svm_input_ch = svm_enabled ? ddi_keyed
             .join(feature_files_per_db)
             .combine(Channel.fromList(feature_combos.collect { [it] }))
+            .combine(Channel.fromList(seeds))
             .combine(Channel.value(svm_config))
-            .map { _db_id, meta, ddi_dir, feature_files, combo, cfg ->
+            .map { _db_id, meta, ddi_dir, feature_files, combo, seed, cfg ->
                 def combo_id = combo.id
                 def m = [
                     id      : "${meta.id}_svm_${combo_id}",
@@ -389,9 +414,10 @@ workflow PER_DB_BENCHMARK {
                     model   : 'svm',
                     features: combo.features,
                     combo_id: combo_id,
-                    tests   : meta.tests
+                    tests   : meta.tests,
+                    seed    : seed
                 ]
-                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test']), cfg)
+                tuple(m, ddi_dir, comboFiles(feature_files, combo.features, meta.splits ?: ['test'], seed), cfg)
             } : Channel.empty()
         SVM(svm_input_ch)
 
@@ -406,7 +432,9 @@ workflow PER_DB_BENCHMARK {
                     id   : "${meta.id}_${model_name}",
                     db   : meta.id,
                     model: model_name,
-                    tests: meta.tests
+                    tests: meta.tests,
+                    // Deprecated and off: primary seed only.
+                    seed : primary_seed
                 ]
                 tuple(m, db_path, modeljson)
             }
@@ -442,7 +470,9 @@ workflow PER_DB_BENCHMARK {
                         // right `<split>_sources.csv`.
                         split    : (meta.tests ? meta.tests[variant] : null),
                         run_label: run_label,
-                        model    : model_name
+                        model    : model_name,
+                        // The model's seed: EVAL_ONE bootstraps with it.
+                        seed     : meta.seed
                     ]
                     tuple(m_eval, pf)
                 }
@@ -467,7 +497,7 @@ workflow PER_DB_BENCHMARK {
             .map { meta, j -> tuple("${meta.db}::${meta.variant}".toString(), j) }
             // `remainder: true` so a group a failed-and-ignored task left short
             // still reaches EVALUATION rather than vanishing.
-            .groupTuple(size: models_per_variant, remainder: true)
+            .groupTuple(size: evals_per_variant, remainder: true)
             // groupTuple() emits in task-completion order. That list becomes
             // eval_multiqc.py's --per_model_metrics argument order, and MultiQC
             // writes its JSON in the order it was fed -- so without this sort
@@ -507,8 +537,11 @@ workflow PER_DB_BENCHMARK {
                     .map { _db_id, m, ddi_dir -> tuple(m, metadata_dir, ddi_dir) }
             )
             def by_variant = { m, f -> tuple("${m.db}::${m.variant}".toString(), f) }
+            // Primary seed only (W6-D1): one fit per model, labelled as such
+            // in the report.
             ENRICHMENT(
                 all_predictions_ch
+                    .filter { m, _pf -> m.seed == primary_seed }
                     .map { m, pf -> tuple("${m.db}::${m.variant}".toString(), m, pf) }
                     .combine(METADATA.out.table.map(by_variant), by: 0)
                     .map { _key, m, pf, table -> tuple(m, table, pf) }

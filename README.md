@@ -252,7 +252,7 @@ Used by CI and by `nf-test`.
 | `--embeddings` | `null` | domainsplit's `results/embeddings/` directory. Needed when `--published_features` is non-empty, but derived from `--input` when that is a directory (one level up, `embeddings/`). |
 | `--large_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings` | Features routed to the heavy memory-time envelope. |
 | `--machine_learning_models` | `neural_network,random_forest` | ML models to run. |
-| `--seed` | `42` | Master RNG seed. Reaches every randomised step, including workers in a process pool -- see [Reproducibility](#reproducibility). |
+| `--seeds` | `42` | Training seeds, comma-separated (`42,43,44`); the first is the primary seed. Each seed reaches every randomised step of its tasks, including workers in a process pool -- see [Several seeds](#several-seeds) and [Reproducibility](#reproducibility). |
 | `--allow_cpu_ml` | `false` | Let `RANDOM_FOREST` train with scikit-learn when no GPU is usable, instead of exiting 140 for a retry on another GPU node. For GPU-less machines (CI, laptops); the `test` profile sets it. |
 | `--ppi_score_cutoff` | `400` | Minimum STRING `combined_score` a PPI must reach to enter the interactome every graph model builds on. |
 | `--mqc_order` | `null` | Comma-separated dataset order for the MultiQC reports, e.g. `random_uniform_1_1,minimal_leakage_hrni_uniform_1_10,external_test` (a dataset is `<db>_<variant>` for a `test_<variant>` split, bare `<db>` for a single `test`). Orders the per-dataset sections, the dataset tabs inside the combined plots, and the heatmap columns. A name that matches no dataset is a hard failure; a dataset missing from the list warns and is appended alphabetically. |
@@ -263,14 +263,14 @@ Run `nextflow run . --help` for a CLI summary.
 
 ### Overriding numeric parameters
 
-`--seed`, `--ppi_score_cutoff` and `--min_embedding_coverage` are declared with
+`--ppi_score_cutoff` and `--min_embedding_coverage` are declared with
 their types in the `params { }` block at the top of `main.nf`, so
-`--seed 7 --ppi_score_cutoff 900 --min_embedding_coverage 0.8` works on the
-command line.
+`--ppi_score_cutoff 900 --min_embedding_coverage 0.8` works on the
+command line. (`--seeds` is a comma list and stays a string.)
 
 That block is load-bearing. Nextflow's v2 (strict) parser, the default since
-26.x, no longer infers types for command-line parameters: `--seed 7` arrives as
-the string `"7"` and parameter validation rejects it with
+26.x, no longer infers types for command-line parameters: `--ppi_score_cutoff 900`
+arrives as the string `"900"` and parameter validation rejects it with
 `Value is [string] but should be [integer]`. **A new numeric or boolean
 parameter has to be declared there too, or it cannot be set from the CLI.**
 A `-params-file` (YAML/JSON) preserves types on its own and needs no
@@ -332,9 +332,41 @@ together with a note for any model that scored less than the full source.
 
 A full description of each output is in [`docs/output.md`](docs/output.md).
 
+## Several seeds
+
+`--seeds 42,43,44` trains every ML model once per seed, so the report can show
+how much of a difference between models is training noise. Seed-dependent
+tasks run once per seed (NN / RF / SVM, the `dummy` feature, per-model
+evaluation); everything else runs once. The first seed is the **primary
+seed**: graph models, metadata enrichment, the ROC/PR curves, the by-source
+accuracy and the pairwise bootstrap tests use it alone, and say so.
+
+With more than one seed:
+
+- the metric tables show the **mean over seeds**, plus `Seeds` (k/n -- a model
+  whose task failed for some seed is averaged over the ones it has), `ROC AUC SD`,
+  `PR AP SD` and `ROC AUC min–max`. The 95 % CI stays the primary seed's
+  bootstrap CI (test-set sampling); the SD is training variance across seeds.
+  The two are different sources of error and are not added. The combined
+  heatmap CI cells read `0.734 [0.71, 0.75] · n=… · π=… ± 0.004 over 3 seeds`;
+- a **Per-seed results** table (also `seed_metrics.json`) lists every
+  (model, seed), including the thresholded metrics at each seed's own
+  validation FPR <= 0.01 threshold;
+- an **order agreement** table gives, for each model pair, in how many seeds
+  one has the higher AUC. It is a count, not a test: call an order stable only
+  when it holds in every seed.
+
+Outputs of seed-dependent tasks are published under `seed<N>/`
+(`<db>/nn_output/seed43/neural_network_<combo>/…`, `<db>/data/seed43/dummy__train.h5`).
+With the default single seed nothing changes: same paths, same files, same
+bytes. Use a fresh `--outdir` when changing the number of seeds. Adding a seed
+to an existing run with `-resume` reruns only the new seed's tasks and the
+reports; reordering the list changes the primary seed. Cost scales with the
+number of seeds (all GPU work runs n times).
+
 ## Reproducibility
 
-Two runs of the same commit, on the same input, with the same `--seed`, in the
+Two runs of the same commit, on the same input, with the same `--seeds`, in the
 same software environment (container tag or conda solve) on the CPU backend
 the nf-test suite exercises (`-profile test,docker --allow_cpu_ml true`)
 produce byte-identical DDI tables, feature files, trained models, predictions
@@ -345,7 +377,7 @@ MultiQC's own report metadata
 (`ddi_report.html` and parts of `ddi_report_data/`), which embed a run
 timestamp, absolute work-dir paths and the MultiQC version.
 
-What that takes, beyond passing `--seed` around:
+What that takes, beyond passing the seed around:
 
 - **`PYTHONHASHSEED=0`**, set for every task in the `env` scope of
   `nextflow.config`. Python salts string hashing per interpreter, so iterating

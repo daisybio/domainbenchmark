@@ -575,3 +575,81 @@ def aggregate_per_model_metrics(per_model_files):
         model_list.append(name)
     metrics_df = pd.DataFrame(metrics_rows)
     return metrics_aucap, roc_curves, pr_curves, metrics_df, model_list
+
+
+def parse_seeds(raw) -> list:
+    """`--seeds 42,43` -> [42, 43], in the order given; the first is the primary
+    seed. Nextflow's parseSeeds() has validated the list at launch."""
+    return [int(t) for t in str(raw).split(",")] if raw not in (None, "") else []
+
+
+def split_by_seed(per_model_files, seeds) -> dict:
+    """{seed: [eval_one.py JSON paths]}, input order kept, one key per seed.
+
+    Fails on a JSON without `seed` or with a seed not in `seeds`: either means
+    the inputs do not belong to this run. A seed without any JSON (every task
+    of it failed and was ignored) keeps an empty list.
+    """
+    by_seed = {s: [] for s in seeds}
+    for fp in per_model_files:
+        with open(fp, "r", encoding="utf-8") as fh:
+            seed = json.load(fh).get("seed")
+        if seed is None:
+            raise SystemExit(f"[seeds] {fp} has no `seed` key; it was not written by this run's eval_one.py.")
+        if seed not in by_seed:
+            raise SystemExit(f"[seeds] {fp} has seed {seed}, which is not one of --seeds {seeds}.")
+        by_seed[seed].append(fp)
+    return by_seed
+
+
+def seed_means(primary_rows, per_seed_rows, n_seeds, spread=(), minmax=None) -> dict:
+    """Replace every numeric cell of `primary_rows` by its mean over seeds.
+
+    @primary_rows:  {model: row} built from the primary seed (decides the
+                    model set and every non-numeric cell, e.g. the CI strings)
+    @per_seed_rows: {seed: {model: row}}, the same row builder per seed
+    @spread:        columns that also get `<col> SD` (sample SD, ddof=1)
+    @minmax:        a column that also gets `<col> min–max`
+    Adds `Seeds` = "k/n". k < n would mean a failed-and-ignored task; no
+    process carries error_ignore, so every seed of every model succeeded
+    by the time EVALUATION runs and k = n in practice. NaN cells (an undefined metric) are left out
+    of the mean; all-NaN stays NaN.
+    """
+    def finite(rows, col):
+        vals = np.array([float(r.get(col, float("nan"))) for r in rows], dtype=float)
+        return vals[np.isfinite(vals)]
+
+    out = {}
+    for m, row in primary_rows.items():
+        rows = [rs[m] for rs in per_seed_rows.values() if m in rs]
+        new = {}
+        for col, v in row.items():
+            if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
+                vals = finite(rows, col)
+                new[col] = float(vals.mean()) if vals.size else float("nan")
+            else:
+                new[col] = v
+        new["Seeds"] = f"{len(rows)}/{n_seeds}"
+        for col in spread:
+            vals = finite(rows, col)
+            new[f"{col} SD"] = float(np.std(vals, ddof=1)) if vals.size >= 2 else float("nan")
+        if minmax:
+            vals = finite(rows, minmax)
+            new[f"{minmax} min–max"] = f"[{vals.min():.3f}, {vals.max():.3f}]" if vals.size else "n/a"
+        out[m] = new
+    return out
+
+
+def order_agreement(auc_by_seed, models, n_seeds) -> dict:
+    """`{a: {b: "k/n"}}`: AUC(a) > AUC(b) in k of the n requested seeds. A
+    seed where either AUC is missing or undefined counts as no win, so k = n
+    (the stability criterion) needs a win in every requested seed. A count,
+    not a test (CR-17.6: no 2 × SD verdict)."""
+    def cell(a, b):
+        if a == b:
+            return "—"
+        wins = sum(1 for s in auc_by_seed.values()
+                   if a in s and b in s and np.isfinite(s[a]) and np.isfinite(s[b]) and s[a] > s[b])
+        return f"{wins}/{n_seeds}"
+
+    return {a: {b: cell(a, b) for b in models} for a in models}

@@ -66,4 +66,145 @@ nextflow_pipeline {
             assert (workflow.stdout + workflow.stderr).any { it.contains('structure_informed_features lists aacomp, which is not in published_features') }
         }
     }
+
+    test("--seeds with a repeated seed fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = '42,42'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains("--seeds '42,42': seed 42 given more than once") }
+        }
+    }
+
+    test("--seeds with a non-integer fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = '42,4a'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains("'4a' is not an integer") }
+        }
+    }
+
+    test("--seeds with an empty token fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = '42,'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains("--seeds '42,': '' is not an integer") }
+        }
+    }
+
+    test("--seeds with a negative seed fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = '-1'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains("'-1' is not an integer") }
+        }
+    }
+
+    test("--seeds above 2^31-1 fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = '2147483648'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains("'2147483648' is not an integer") }
+        }
+    }
+
+    test("--seeds none fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = 'none'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains("'none' is not an integer") }
+        }
+    }
+
+    test("bare --seeds fails at launch") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = true   // what a bare `--seeds` arrives as
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains("--seeds arrived without a value") }
+        }
+    }
+
+    test("--seeds as an Integer (params file `seeds: 42`) passes validation") {
+
+        // Stopped by the duplicate-feature check, which runs after parseSeeds()
+        // and schema validation: reaching it means both accepted the value.
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = 42
+                machine_learning_features = 'aacomp,dummy,aacomp'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains('Feature(s) listed more than once: aacomp') }
+        }
+    }
+
+    test("--seeds 42,43 passes validation") {
+
+        // Stopped by the duplicate-feature check, which runs after parseSeeds()
+        // and schema validation: reaching it means both accepted the value.
+        when {
+            params {
+                outdir = "$outputDir"
+                seeds = ' 42, 43'
+                machine_learning_features = 'aacomp,dummy,aacomp'
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains('Feature(s) listed more than once: aacomp') }
+        }
+    }
 }

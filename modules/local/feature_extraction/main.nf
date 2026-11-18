@@ -116,7 +116,7 @@ process FEATURE_EXTRACTION_ONE {
                 --db ${database_dir}/${dataset}.sqlite3 \\
                 --feature ${feature_name} ${module_arg} ${params_arg} ${struct_arg} \\
                 --out ${out} \\
-                --seed ${params.seed}
+                --seed ${meta.seed}
         else
             echo "Database ${database_dir} has no ${dataset}.sqlite3 — nothing to extract."
         fi
@@ -131,18 +131,20 @@ process FEATURE_EXTRACTION_ONE {
 
 workflow FEATURE_EXTRACTION {
     take:
-        feature_ch     // queue of feature specs: [name, module, params (Map), structure (bool)]
+        feature_ch     // queue of feature specs: [name, module, params (Map), structure (bool),
+                       //   seeded (bool), seeds (one task per seed; [primary] when seed-free)]
         db_ch          // channel: tuple(meta, db_path)  — multi-DB capable
         structures     // value channel: structures.h5, or Channel.empty() without structure features
         sasa_db_ch     // db_ch gated on PREFLIGHT: the SASA build waits for every database to pass
 
     main:
-        // Build per-(db, feature, split) tasks. The split list is per-database
-        // (`meta.splits`), not a pipeline constant.
+        // Build per-(db, feature, split, seed) tasks. The split list is
+        // per-database (`meta.splits`), not a pipeline constant; a seed-free
+        // feature has one seed (the primary), a seeded one every seed.
         per_task = db_ch
             .combine(feature_ch)
             .flatMap { db_meta, db_path, feat ->
-                (db_meta.splits ?: ['test']).collect { ds ->
+                [db_meta.splits ?: ['test'], feat.seeds].combinations().collect { ds, seed ->
                     def m = [
                         id       : "${db_meta.id}_${feat.name}_${ds}",
                         db       : db_meta.id,
@@ -150,7 +152,9 @@ workflow FEATURE_EXTRACTION {
                         module   : feat.module,
                         params   : feat.params,
                         structure: feat.structure,
-                        dataset  : ds
+                        dataset  : ds,
+                        seeded   : feat.seeded,
+                        seed     : seed
                     ]
                     tuple(m, db_path)
                 }
@@ -178,7 +182,8 @@ workflow FEATURE_EXTRACTION {
         per_split = FEATURE_EXTRACTION_ONE(plain_tasks.mix(structure_tasks))
 
     emit:
-        // tuple(db_id, h5) — one item per (db, feature, split). The caller
-        // groupTuple()s by db_id to get every feature file of one database.
-        h5 = per_split.h5.map { meta, h5 -> tuple(meta.db, h5) }
+        // tuple(db_id, [seed, h5]) — one item per (db, feature, split, seed);
+        // seed is null for a seed-free feature. The caller groupTuple()s by
+        // db_id to get every feature file of one database.
+        h5 = per_split.h5.map { meta, h5 -> tuple(meta.db, [meta.seeded ? meta.seed : null, h5]) }
 }

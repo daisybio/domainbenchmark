@@ -59,6 +59,7 @@ workflow PIPELINE_INITIALISATION {
     command = "nextflow run ${workflow.manifest.name} -profile <docker/singularity/.../institute> --input samplesheet.csv --outdir <OUTDIR>"
 
     checkListParamsNotBoolean()
+    parseSeeds(params.seeds)
     UTILS_NFSCHEMA_PLUGIN (
         workflow,
         validate_params,
@@ -243,6 +244,32 @@ def csvToList(s) {
     }
     def items = s instanceof List ? s : (s ? s.tokenize(',') : [])
     items*.trim().findAll { it && it.toLowerCase() != 'none' }
+}
+
+//
+// `--seeds 42,43` -> [42, 43], in the order given. The first one is the
+// primary seed: graph models, ENRICHMENT, seed-free feature encoders and the
+// report's curves / pairwise tests use it. A String from the CLI or an Integer
+// from a -params-file (`seeds: 42`). Fails naming the bad token on a bare
+// `--seeds` (Boolean), an empty token, a non-integer (`none` included), a
+// value outside 0..2^31-1 (numpy rejects negatives late) or a repeat.
+//
+def parseSeeds(s) {
+    if (s instanceof Boolean || s == null) {
+        error("--seeds arrived without a value (or as ''). Give a comma list of integers, e.g. --seeds 42,43.")
+    }
+    def tokens = s.toString().split(',', -1)*.trim()
+    def seeds = tokens.collect { t ->
+        if (!(t ==~ /\d+/) || t.toBigInteger() > Integer.MAX_VALUE) {
+            error("--seeds '${s}': '${t}' is not an integer in 0..${Integer.MAX_VALUE}. Give a comma list, e.g. --seeds 42,43.")
+        }
+        t.toInteger()
+    }
+    def repeated = seeds.countBy { seed -> seed }.findAll { _seed, n -> n > 1 }.keySet()
+    if (repeated) {
+        error("--seeds '${s}': seed ${repeated.join(', ')} given more than once.")
+    }
+    seeds
 }
 
 //

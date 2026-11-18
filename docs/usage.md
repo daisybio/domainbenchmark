@@ -96,6 +96,23 @@ To further assist in reproducibility, you can use share and reuse [parameter fil
 > [!TIP]
 > If you wish to share such profile (such as upload as supplementary material for academic publications), make sure to NOT include cluster specific paths to files, nor institutional specific profiles.
 
+### Several training seeds
+
+`--seeds 42,43,44` (default `42`) trains every ML model once per seed; the
+first seed listed is the primary seed (graph models, enrichment, curves,
+by-source accuracy and pairwise tests use it alone). The reports show the mean
+over seeds with SD, a per-seed table and an order-agreement table; see the
+README's "Several seeds" section. In a params file, quote the list:
+
+```yaml
+seeds: '42,43,44'
+```
+
+A repeated seed, an empty token (`42,`), a non-integer or a value outside
+0..2147483647 fails at launch. Use a fresh `--outdir` when changing the number
+of seeds: with several seeds the seed-dependent outputs move under `seed<N>/`,
+and the flat copies of a single-seed run would remain beside them.
+
 ### Release gate: results-tree invariants
 
 CI runs the unit tests in `tests/python` (`.github/workflows/pytest.yml`), but the

@@ -95,9 +95,15 @@ RESULTS = os.environ.get("DOMAINBENCHMARK_RESULTS")
 needs_results = pytest.mark.skipif(not RESULTS, reason="DOMAINBENCHMARK_RESULTS not set")
 
 
-def _model_dirs():
+def _glob_seeds(pattern):
+    """`<db>/<x>_output/<model>` (one seed) and `<db>/<x>_output/seed<N>/<model>` (several)."""
     root = Path(RESULTS)
-    return sorted(root.glob("*/nn_output/neural_network_*")) + sorted(root.glob("*/rf_output/random_forest_*"))
+    head, tail = pattern.rsplit("/", 1)
+    return sorted(root.glob(pattern)) + sorted(root.glob(f"{head}/seed*/{tail}"))
+
+
+def _model_dirs():
+    return _glob_seeds("*/nn_output/neural_network_*") + _glob_seeds("*/rf_output/random_forest_*")
 
 
 @needs_results
@@ -134,8 +140,8 @@ def test_predictions_canonical_and_rf_differs_from_nn():
             assert (df["domain_a"] <= df["domain_b"]).all(), pq
             assert not df.duplicated(["domain_a", "domain_b"]).any(), pq
     compared = 0
-    for nn in Path(RESULTS).glob("*/nn_output/neural_network_*"):
-        rf = nn.parent.parent / "rf_output" / nn.name.replace("neural_network_", "random_forest_")
+    for nn in _glob_seeds("*/nn_output/neural_network_*"):
+        rf = Path(str(nn.parent).replace("/nn_output", "/rf_output")) / nn.name.replace("neural_network_", "random_forest_")
         for pq in nn.glob("predictions_*.parquet"):
             compared += 1
             a = pd.read_parquet(pq).sort_values(["domain_a", "domain_b"])

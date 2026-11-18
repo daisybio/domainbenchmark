@@ -112,7 +112,7 @@ Please also refer to the [pipeline-specific contribution guidelines](#pipeline-s
 - [ ] Update any diagrams or pipeline images as necessary.
 - [ ] If the process produces something the report should show, add it in `bin/eval_multiqc.py` / `bin/combine_eval.py` -- those write the MultiQC config themselves; there is no pipeline-level MULTIQC process or `assets/multiqc_config.yml`.
 - [ ] Add a description of the output files and, if relevant, images from the MultiQC report to `docs/output.md`.
-- [ ] If the process draws from an RNG, seed it: take a `--seed`, call `seed_everything` from `bin/determinism.py`, and use `derive_seed` for anything running in a worker process. An unseeded draw silently breaks the pipeline's end-to-end reproducibility.
+- [ ] If the process draws from an RNG, seed it: take a `--seed` (the module passes `meta.seed`, one of `params.seeds`), call `seed_everything` from `bin/determinism.py`, and use `derive_seed` for anything running in a worker process. An unseeded draw silently breaks the pipeline's end-to-end reproducibility.
 
 To update the minimum required Nextflow version, see the [Nextflow version bumping](#nextflow-version-bumping) section below. For more information about pipeline contributions, see [pipeline-specific contribution guidelines](#pipeline-specific-contribution-guidelines).
 

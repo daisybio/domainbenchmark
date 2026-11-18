@@ -27,7 +27,11 @@ from eval_multiqc_functions import (
     curve_label,
     holm,
     no_skill_series,
+    order_agreement,
     paired_bootstrap_diff,
+    parse_seeds,
+    seed_means,
+    split_by_seed,
     variant_of_split,
 )
 from load_data_gm import DEFAULT_PPI_SCORE_CUTOFF
@@ -154,6 +158,17 @@ def parse_arguments():
              "Omitted: no enrichment section.",
     )
     p.add_argument(
+        "--seeds",
+        default=None,
+        help="Comma-separated training seeds of this run (params.seeds); the "
+             "first is the primary seed. With more than one, every per-model "
+             "JSON must carry one of them as `seed`: curves, pairwise tests, "
+             "coverage and by-source accuracy use the primary seed, the metric "
+             "tables the mean over seeds (+ SD, min–max, Seeds), and two more "
+             "blocks show each seed and the order agreement. One seed or "
+             "omitted: the single-seed report, unchanged.",
+    )
+    p.add_argument(
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only).",
     )
@@ -251,6 +266,8 @@ def write_multiqc_json_metrics(
     prefix,
     structure_features=(),
     af3_features=(),
+    seed_sets=None,
+    seeds=(),
 ) -> None:
     # Write MultiQC JSON blocks for metrics, ROC and PR curves
     # @metrics_aucap: dict with AUC and AP metrics per model
@@ -259,6 +276,9 @@ def write_multiqc_json_metrics(
     # @metrics_df: DataFrame with overall metrics per model
     # @outdir: output directory to write MultiQC JSON files
     # @prefix: prefix for block IDs and filenames
+    # @seed_sets: multi-seed runs only, {seed: aggregate_per_model_metrics()
+    #             of that seed}; the other arguments are the primary seed's
+    # @seeds: --seeds, primary first
 
     n_models = len(metrics_aucap)
 
@@ -328,10 +348,8 @@ def write_multiqc_json_metrics(
     # Numeric mean kept as float (enables table colour-scale + downstream
     # heatmap clustering); CI rendered in a sibling string column.
     table_id = f"{prefix}_metrics_table"
-    table_data = {}
-    for m in metrics_aucap:
-        e = metrics_aucap[m]
-        table_data[m] = {
+    def _table_row(m, e):
+        return {
             "Pairs": int(e.get("SAMPLES", 0)),
             "Prevalence": float(e.get("PREVALENCE", float("nan"))),
             "ROC AUC": float(e["ROC_AUC"]),
@@ -345,7 +363,36 @@ def write_multiqc_json_metrics(
             "Self-indicator AUC": _self_indicator(e),
             "Structure-assisted": "yes" if m in structure_models else "no",
         }
-    description = PAIRS_NOTE
+
+    table_data = {m: _table_row(m, metrics_aucap[m]) for m in metrics_aucap}
+    # Multi-seed: means over seeds; the CI strings stay the primary seed's.
+    seed_headers, primary_note, means_note, seeds_desc = {}, "", "", ""
+    if seed_sets:
+        seeds_txt = ", ".join(map(str, seeds))
+        primary_note = f" Primary seed only: seed {seeds[0]} of {seeds_txt}."
+        means_note = f" Numbers are means over the training seeds ({seeds_txt})."
+        seeds_desc = (
+            f"{means_note[:-1]}; the 95% CI is the primary seed's ({seeds[0]}) bootstrap CI (test-set "
+            "sampling only), the SD is training variance across seeds (sample SD). "
+            "They are different sources of error and are not added."
+        )
+        table_data = seed_means(
+            table_data,
+            {sd: {m: _table_row(m, a[0][m]) for m in a[0]} for sd, a in seed_sets.items()},
+            len(seeds),
+            spread=("ROC AUC", "PR AP"),
+            minmax="ROC AUC",
+        )
+        seed_headers = {
+            "Seeds": {"title": "Seeds", "description": "Seeds this model has / seeds requested.",
+                      "scale": False},
+            "ROC AUC SD": {"title": "ROC AUC SD", "description": "Sample SD over seeds.",
+                           "scale": False, "format": "{:,.3f}"},
+            "PR AP SD": {"title": "PR AP SD", "description": "Sample SD over seeds.",
+                         "scale": False, "format": "{:,.3f}"},
+            "ROC AUC min–max": {"title": "ROC AUC min–max", "scale": False},
+        }
+    description = PAIRS_NOTE + seeds_desc
     if af3_models:
         description += " " + AF3_CAVEAT
     table_block = {
@@ -451,6 +498,7 @@ def write_multiqc_json_metrics(
                 "available with no features at all. A reference, not a model.",
                 "scale": False,
             },
+            **seed_headers,
         },
         "data": table_data,
     }
@@ -471,6 +519,7 @@ def write_multiqc_json_metrics(
     roc_block = {
         "id": roc_id,
         "section_name": "ROC curves",
+        **({"description": primary_note.strip()} if primary_note else {}),
         "plot_type": "linegraph",
         "pconfig": {
             "id": roc_id,
@@ -499,7 +548,7 @@ def write_multiqc_json_metrics(
     pr_block = {
         "id": pr_id,
         "section_name": "Precision Recall curves",
-        "description": NO_SKILL_NOTE,
+        "description": NO_SKILL_NOTE + primary_note,
         "plot_type": "linegraph",
         "pconfig": {
             "extra_series": no_skill_series(
@@ -528,10 +577,19 @@ def write_multiqc_json_metrics(
     # Row-wise, so each column keeps its own dtype: the transposed frame
     # turned the TP/TN/FP/FN counts into floats.
     metrics_data = metrics_df.set_index("Model").to_dict(orient="index")
+    if seed_sets:
+        metrics_data = seed_means(
+            metrics_data,
+            {sd: a[3].set_index("Model").to_dict(orient="index") for sd, a in seed_sets.items()},
+            len(seeds),
+            # Each (model, seed) is thresholded at its own fitted operating point.
+            spread=THRESHOLDED_COLS,
+        )
     metrics_block = {
         "id": metrics_id,
         "section_name": "Overview Model Evaluation Metrics",
-        "description": THRESHOLD_CAVEAT,
+        "description": THRESHOLD_CAVEAT + means_note
+        + (" `<metric> SD` is the sample SD over seeds." if seed_sets else ""),
         "plot_type": "table",
         "pconfig": {
             "id": metrics_id,
@@ -554,7 +612,7 @@ def write_multiqc_json_metrics(
         pairwise_block = {
             "id": pairwise_id,
             "section_name": "Bootstrap AUC difference (ROC AUC)",
-            "description": PAIRWISE_CAPTION,
+            "description": PAIRWISE_CAPTION + primary_note,
             "plot_type": "table",
             "pconfig": {
                 "id": pairwise_id,
@@ -586,7 +644,7 @@ def write_multiqc_json_metrics(
                 f"by more than {COVERAGE_GAP_PP:g} percentage points is scored "
                 "on a label-shifted subset, which can move every metric "
                 "without any change in skill."
-            ),
+            ) + primary_note,
             "plot_type": "table",
             "pconfig": {
                 "id": coverage_id,
@@ -610,7 +668,72 @@ def write_multiqc_json_metrics(
         with open(os.path.join(outdir, f"{coverage_id}_mqc.json"), "w") as f:
             json.dump(coverage_block, f, indent=2)
 
+    if seed_sets:
+        write_seed_blocks(seed_sets, seeds, outdir, prefix)
+
     logging.info("[OK] Wrote MultiQC JSON (ROC + PR)")
+
+
+#: Per-seed columns of the seed_variance block (eval_one.py metrics_summary,
+#: i.e. the validation FPR <= 0.01 operating point of W-5).
+THRESHOLDED_COLS = ("Accuracy", "Recall", "Specificity", "Precision",
+                    "Balanced Accuracy", "F1 Score", "MCC")
+SEED_SUMMARY_COLS = ("Samples",) + THRESHOLDED_COLS
+
+
+def write_seed_blocks(seed_sets, seeds, outdir, prefix) -> None:
+    """`seed_variance` (one row per (model, seed), also seed_metrics.json) and
+    `order_agreement` (AUC(a) > AUC(b) in k/n seeds). Raw per-seed detail; no
+    significance call (CR-17.6)."""
+    rows = []
+    for sd in seeds:
+        if sd not in seed_sets:
+            continue
+        aucap, _roc, _pr, df, _models = seed_sets[sd]
+        summary = df.set_index("Model").to_dict(orient="index")
+        for m in sorted(aucap):
+            rows.append({"Model": m, "Seed": sd,
+                         "ROC AUC": float(aucap[m]["ROC_AUC"]),
+                         "PR AP": float(aucap[m]["PR_AP"]),
+                         **{c: summary[m][c] for c in SEED_SUMMARY_COLS if c in summary[m]}})
+    rows.sort(key=lambda r: (r["Model"], seeds.index(r["Seed"])))
+    with open(os.path.join(outdir, "seed_metrics.json"), "w", encoding="utf-8") as fh:
+        json.dump({"seeds": list(seeds), "rows": rows}, fh, indent=1, default=float)
+
+    seeds_txt = ", ".join(map(str, seeds))
+    variance_id = f"{prefix}_seed_variance"
+    with open(os.path.join(outdir, f"{variance_id}_mqc.json"), "w") as f:
+        json.dump({
+            "id": variance_id,
+            "section_name": "Per-seed results",
+            "description": f"One row per (model, training seed) for seeds {seeds_txt}: "
+                           "the raw values behind the means and SDs above. Thresholded "
+                           "columns: NN, RF and SVM rows are at that model's and seed's own "
+                           "validation FPR <= 0.01 threshold; graph models use the labels "
+                           "they emit themselves (primary seed only).",
+            "plot_type": "table",
+            "pconfig": {"id": variance_id, "title": "Per-seed results", "col1_header": "Model · seed"},
+            "data": {f"{r['Model']} · seed {r['Seed']}": {k: v for k, v in r.items() if k != "Model"}
+                     for r in rows},
+        }, f, indent=2, default=float)
+
+    auc_by_seed = {sd: {m: float(e["ROC_AUC"]) for m, e in seed_sets[sd][0].items()}
+                   for sd in seeds if sd in seed_sets}
+    models = sorted({m for a in auc_by_seed.values() for m in a})
+    agreement_id = f"{prefix}_order_agreement"
+    with open(os.path.join(outdir, f"{agreement_id}_mqc.json"), "w") as f:
+        json.dump({
+            "id": agreement_id,
+            "section_name": "ROC AUC order agreement across seeds",
+            "description": "Cell (row a, column b) = k/n: AUC(a) > AUC(b) in k of the "
+                           f"n = {len(seeds)} requested training seeds ({seeds_txt}); a seed "
+                           "where either model has no AUC counts as no win. Not a test. Call "
+                           "the order stable only when k = n, i.e. a wins in every requested seed.",
+            "plot_type": "table",
+            "pconfig": {"id": agreement_id, "title": "ROC AUC order agreement across seeds",
+                        "col1_header": "Model"},
+            "data": order_agreement(auc_by_seed, models, len(seeds)),
+        }, f, indent=2)
 
 
 def is_structure_assisted(model, structure_features) -> bool:
@@ -746,6 +869,7 @@ def write_multiqc_config(outdir, enrichment_ids=()) -> str:
     pr_blocks = pick(r"_pr$")
     metric_blocks = pick(r"model_eval_metrics$")
     pairwise_blocks = pick(r"_pairwise_significance$")
+    seed_blocks = pick(r"_seed_variance$") + pick(r"_order_agreement$")
     coverage_blocks = pick(r"_coverage$")
 
     db_blocks = pick(r"database_analysis")
@@ -756,6 +880,7 @@ def write_multiqc_config(outdir, enrichment_ids=()) -> str:
         + auc_ap_tbl
         + coverage_blocks
         + pairwise_blocks
+        + seed_blocks
         + roc_blocks
         + pr_blocks
         + list(enrichment_ids)
@@ -958,8 +1083,18 @@ def main():
     print(
         f"[INFO] Aggregating per-model JSON sidecars (n={len(args.per_model_metrics)})"
     )
+    # Several seeds: every per-seed-agnostic block is built from the primary
+    # seed's JSONs, the metric tables average over all of them.
+    seeds = parse_seeds(args.seeds)
+    per_model_metrics, seed_sets = args.per_model_metrics, None
+    if len(seeds) > 1:
+        by_seed = split_by_seed(args.per_model_metrics, seeds)
+        per_model_metrics = by_seed[seeds[0]]
+        if not per_model_metrics:
+            raise SystemExit(f"[seeds] No per-model JSON for the primary seed {seeds[0]}.")
+        seed_sets = {sd: aggregate_per_model_metrics(fs) for sd, fs in by_seed.items() if fs}
     metrics_auc_pr, roc_curves, pr_curves, metrics_df, model_list = (
-        aggregate_per_model_metrics(args.per_model_metrics)
+        aggregate_per_model_metrics(per_model_metrics)
     )
 
     db_analysis = analyse_database(
@@ -984,12 +1119,14 @@ def main():
             if f.strip()
         ],
         af3_features=[f.strip() for f in (args.structure_features or "").split(",") if f.strip()],
+        seed_sets=seed_sets,
+        seeds=seeds,
     )
     print("[INFO] MultiQC JSON blocks written for model evaluation metrics and curves.")
 
     # Per-source accuracy travels as a plain sidecar for combine_eval.py.
     write_source_accuracy_sidecar(
-        args.per_model_metrics, args.out_dir, db_name, args.test_split,
+        per_model_metrics, args.out_dir, db_name, args.test_split,
         db_id=args.db_id, variant=args.variant,
     )
 
@@ -998,6 +1135,9 @@ def main():
     enrichment_ids = []
     if args.enrichment:
         enrichment = load_enrichment_inputs(args.enrichment)
+        if seed_sets:
+            # Read by enrichment_plots.status_block: fitted on the primary seed only.
+            enrichment["seeds"] = seeds
         with open(os.path.join(args.out_dir, ENRICHMENT_SIDECAR), "w", encoding="utf-8") as fh:
             json.dump({"db_name": db_name, "db_id": args.db_id or db_name,
                        "variant": args.variant or variant_of_split(args.test_split),
