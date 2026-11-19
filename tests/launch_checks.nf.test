@@ -190,6 +190,28 @@ nextflow_pipeline {
         }
     }
 
+    test("two 1:1 test sets next to a 1:k one fail at launch") {
+
+        // W-10 pairs every 1:k test set with the single 1:1 one. Only the file
+        // names are read at launch, so empty files are enough.
+        when {
+            params {
+                def db = new File("${outputDir}/ambiguous/db")
+                db.mkdirs()
+                ['train', 'validation', 'test_matched_1_1', 'test_uniform_1_1', 'test_uniform_1_10'].each {
+                    new File(db, "${it}.sqlite3").text = ''
+                }
+                outdir = "$outputDir"
+                input = "${outputDir}/ambiguous"
+            }
+        }
+
+        then {
+            assert workflow.failed
+            assert (workflow.stdout + workflow.stderr).any { it.contains('has 2 1:1 test sets (test_matched_1_1.sqlite3, test_uniform_1_1.sqlite3) next to 1:k test set(s) test_uniform_1_10.sqlite3') }
+        }
+    }
+
     test("--seeds 42,43 passes validation") {
 
         // Stopped by the duplicate-feature check, which runs after parseSeeds()

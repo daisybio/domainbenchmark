@@ -283,6 +283,31 @@ def runLabel(db_id, variant) {
 }
 
 //
+// Class ratio [a, b] of a variant: its trailing `<a>_<b>` (`uniform_1_10` ->
+// [1, 10], bare `1_1` -> [1, 1]), or null (`test`, `balanced`). Same rule as
+// combine_eval._RATIO; change both together.
+//
+def variantRatio(variant) {
+    def m = (variant =~ /(?:^|_)(\d+)_(\d+)$/)
+    m.find() ? [m.group(1).toLong(), m.group(2).toLong()] : null
+}
+
+//
+// W-10: the 1:1 variant a 1:k (k > 1) variant of the same database is compared
+// against (same trained model, both test sets). null for a variant that is not
+// a 1:k target, or whose database has no 1:1 variant. Two 1:1 variants next to
+// a target are rejected at launch by validateDatasets().
+//
+def referenceVariant(variant, tests) {
+    def r = variantRatio(variant)
+    if (!r || r[0] != 1 || r[1] <= 1) {
+        return null
+    }
+    def refs = tests.keySet().findAll { variantRatio(it) == [1L, 1L] }.sort()
+    refs.size() == 1 ? refs[0] : null
+}
+
+//
 // Launch-time checks over the whole dataset list.
 //
 // Every one of these used to surface late or not at all: two samplesheet rows
@@ -304,6 +329,14 @@ def validateDatasets(datasets) {
         def bad_splits = meta.splits.findAll { !(it ==~ /[A-Za-z0-9_]+/) }
         if (bad_splits) {
             error("Database ${ds[1]} has split file name(s) ${bad_splits.collect { it + '.sqlite3' }.join(', ')}; split names may contain only letters, digits and '_'.")
+        }
+        // W-10 pairs each 1:k test set with the database's 1:1 one; with two
+        // 1:1 sets there is no single reference to compare against.
+        def variants = meta.tests.keySet()
+        def ones = variants.findAll { variantRatio(it) == [1L, 1L] }.sort()
+        def targets = variants.findAll { def r = variantRatio(it); r && r[0] == 1L && r[1] > 1L }.sort()
+        if (ones.size() > 1 && targets) {
+            error("Database ${ds[1]} has ${ones.size()} 1:1 test sets (${ones.collect { 'test_' + it + '.sqlite3' }.join(', ')}) next to 1:k test set(s) ${targets.collect { 'test_' + it + '.sqlite3' }.join(', ')}; the 1:1 -> 1:k comparison needs exactly one 1:1 set.")
         }
     }
 

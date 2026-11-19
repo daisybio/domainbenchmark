@@ -152,7 +152,21 @@ runs: it embeds a timestamp, absolute work-dir paths and the MultiQC version.
     across all models. After the AUC/AP heatmaps comes "Test TPR at validation
     FPR ≤ 0.01" (model × dataset) with a details table per cell (realised test
     FPR, validation FPR, scored positives/negatives, test prevalence,
-    'indicative'). The per-dataset operating-point tables follow, primary and
+    'indicative'). A database with a 1:1 and a 1:k test set (e.g.
+    `uniform_1_1` and `uniform_1_10`; a 1:k variant needs exactly one matching
+    1:1 variant in its database) also gets two tables before it, built from
+    each 1:k report's `test_set_shift.json`. "Same trained model: 1:1 test set
+    vs 1:k test set": per model, AUC, TPR and FPR on both sets (TPR/FPR at the
+    validation-selected threshold), Δ = 1:k − 1:1 with a 95% bootstrap CI that
+    draws DDIs present in both sets jointly, counts, shared DDIs, and whether
+    the 1:1 positives and negatives are subsets of the 1:k ones. "Model
+    ranking: 1:1 vs 1:k": Spearman ρ of the AUC ranking. Points, CIs and ρ are
+    the primary seed's; with several seeds, `Δ… SD (k/n)` is the sample SD of
+    Δ across seeds (training variation, not test-set sampling). On `random` the
+    negative sampler is uniform at both ratios and only prevalence changes; on
+    matched → uniform splits the sampler changes too. Prevalence alone moves
+    precision and AP, not FPR or AUC. Neither measures unseen proteins or
+    families. The per-dataset operating-point tables follow, primary and
     prior together. The per-source section ("Per-source rate at validation
     FPR ≤ 0.01") names each bar group's rate: TPR on a positive-only source, TNR
     on a negative-only one, accuracy on a mixed one. It has one tab per dataset

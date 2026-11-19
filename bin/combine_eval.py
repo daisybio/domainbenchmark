@@ -4,6 +4,7 @@
 Combine a List of existing reports in one report
 """
 
+import math
 import re
 import os
 import sys
@@ -199,6 +200,8 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
         + pr_heatmap_ci
         + hetero_pr_heatmap_block
         + hetero_pr_heatmap_ci
+        + present("test_set_shift")
+        + present("test_set_shift_rank_agreement")
         + tpr_heatmap_blocks
         + db_blocks
         + metric_blocks
@@ -378,6 +381,7 @@ AVERAGE_CAT = "Mean over shown models"
 #: own name. Pools are read from the data (every key held by >= 2 datasets). A
 #: database with a single `test` split (e.g. external_test) joins no pool.
 SINGLE_SPLIT_VARIANT = "test"
+# Same rule as variantRatio() in the utils subworkflow (W-10 pairing); change both together.
 _RATIO = re.compile(r"(?:^|_)(\d+_\d+)$")
 
 
@@ -1245,6 +1249,177 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None, eval
         )
 
 
+#: W-10 sidecar written by eval_multiqc.py for a 1:k test set.
+TEST_SET_SHIFT_SIDECAR = "test_set_shift.json"
+SHIFT_METRICS = (("roc_auc", "AUC"), ("tpr", "TPR"), ("fpr", "FPR"))
+
+SHIFT_DESCRIPTION = (
+    "The same trained model scored on a database's 1:1 test set and on its 1:k "
+    "test set; Δ = 1:k − 1:1. 1:1 → 1:k measures the change of negative sampler "
+    "(none on `random`) and of prevalence (which moves precision/AP, not "
+    "FPR/AUC); it does not measure unseen proteins, families or pairs. Scheme "
+    "names (`uniform`, `matched`) come from the split file names; domainsplit "
+    "defines what they mean. `Relation` is measured on this model's scored DDIs: "
+    "whether the 1:1 positives are a subset of the 1:k positives, and the 1:1 "
+    "negatives a subset of the 1:k negatives. On `random` both ratios sample "
+    "negatives uniformly, so the sampler does not change; on matched → uniform "
+    "splits it does. Prevalence alone moves only precision and AP. "
+    "TPR and FPR are at each model's threshold selected on validation (FPR ≤ "
+    "0.01) and applied unchanged to both sets, so a test FPR may exceed 0.01; no "
+    "threshold is chosen on a test set. ΔTPR is expected ≈ 0, because the "
+    "positives are identical; a non-zero ΔTPR means instance resolution or "
+    "coverage differs between the two splits. AP and precision move with "
+    "prevalence alone and are not compared here (each dataset's table shows the "
+    "AP lift). CI: 95% percentile bootstrap of test-set sampling, conditional on "
+    "the class and overlap counts and the fitted model; a DDI in both sets is "
+    "drawn jointly, everything else separately. DDIs sharing a domain are treated "
+    "as independent. With no false positive on a side, that side's FPR has no "
+    "sampling spread: a limit of the observed sample, not certainty."
+)
+
+
+def read_test_set_shift(report_dir):
+    path = os.path.join(report_dir, TEST_SET_SHIFT_SIDECAR)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _fmt(v, digits=3, signed=False):
+    return "n/a" if v is None else (f"{v:+.{digits}f}" if signed else f"{v:.{digits}f}")
+
+
+def _relation(row) -> str:
+    if row["ref_pos_subset"] and row["ref_neg_subset"]:
+        return "nested: 1:1 ⊂ 1:k"
+    if row["ref_pos_subset"]:
+        return "positives nested, negatives differ"
+    return "positives differ"
+
+
+def _delta_sd(rows, metric, n_seeds) -> str:
+    """Sample SD of the per-seed Δ over the k seeds where it is defined (k/n)."""
+    deltas = [r["metrics"][metric]["delta"] for r in rows
+              if r["metrics"][metric]["delta"] is not None]
+    k = len(deltas)
+    if k < 2:
+        return f"— ({k}/{n_seeds})"
+    mean = sum(deltas) / k
+    sd = (sum((d - mean) ** 2 for d in deltas) / (k - 1)) ** 0.5
+    return f"{sd:.3f} ({k}/{n_seeds})"
+
+
+def _rank_agreement(rows) -> tuple:
+    """(Spearman ρ text, model count) of the AUC ranking on both sets."""
+    from scipy.stats import spearmanr
+
+    pairs = [(r["metrics"]["roc_auc"]["ref"], r["metrics"]["roc_auc"]["target"]) for r in rows]
+    pairs = [p for p in pairs if all(v is not None and math.isfinite(v) for v in p)]
+    if len(pairs) < 3:
+        return "n/a (< 3 models)", len(pairs)
+    a, b = zip(*pairs)
+    if len(set(a)) == 1 or len(set(b)) == 1:
+        return "constant ranks", len(pairs)
+    return f"{float(spearmanr(a, b).statistic):.3f}", len(pairs)
+
+
+def write_test_set_shift_blocks(sidecars, outdir, dataset_order=None) -> list:
+    """The two W-10 blocks from {target run label: test_set_shift.json}.
+    Returns the block ids written (none without a sidecar)."""
+    if not sidecars:
+        return []
+    labels = sort_by_dataset(list(sidecars), dataset_order)
+    seeds_seen = sorted({tuple(sidecars[lb]["seeds"]) for lb in labels})
+    multi = any(len(s) > 1 for s in seeds_seen)
+    table, ranks = {}, {}
+    for label in labels:
+        sc = sidecars[label]
+        seeds = sc["seeds"]
+        primary = seeds[0] if seeds else None
+        sets = f"{sc['reference_variant']} → {sc['target_variant']}"
+        by_model = {}
+        for r in sc["rows"]:
+            by_model.setdefault(r["model"], []).append(r)
+        prim_rows = []
+        for model in sorted(by_model):
+            rows = by_model[model]
+            row = next((r for r in rows if r["seed"] == primary), None)
+            if row is None:
+                continue
+            prim_rows.append(row)
+            m = row["metrics"]
+            pi = lambda p, n: _fmt(p / (p + n)) if p + n else "n/a"
+            cells = {
+                "Database": sc["db_id"],
+                "Model": model + (STRUCTURE_MARK if row.get("structure_assisted") else ""),
+                "Sets": sets,
+                "Relation": _relation(row),
+                "Pos 1:1 / 1:k": f"{row['n_ref_pos']:,} / {row['n_pos']:,}",
+                "Neg 1:1 / 1:k": f"{row['n_ref_neg']:,} / {row['n_neg']:,}",
+                "π 1:1 / 1:k": f"{pi(row['n_ref_pos'], row['n_ref_neg'])} / {pi(row['n_pos'], row['n_neg'])}",
+                "Shared pos": f"{row['n_shared_pos']:,}",
+                "Shared neg": f"{row['n_shared_neg']:,}",
+            }
+            for key, name in SHIFT_METRICS:
+                e = m[key]
+                if key == "fpr":
+                    cells["FPR 1:1 (FP/neg)"] = f"{_fmt(e['ref'])} ({row['fp_ref']}/{row['n_ref_neg']})"
+                    cells["FPR 1:k (FP/neg)"] = f"{_fmt(e['target'])} ({row['fp']}/{row['n_neg']})"
+                else:
+                    cells[f"{name} 1:1"] = _fmt(e["ref"])
+                    cells[f"{name} 1:k"] = _fmt(e["target"])
+                cells[f"Δ{name} [95% CI]"] = (
+                    f"{_fmt(e['delta'], signed=True)} [{_fmt(e['delta_ci'][0], signed=True)}, "
+                    f"{_fmt(e['delta_ci'][1], signed=True)}]"
+                    if e["delta"] is not None else f"n/a ({e['reason']})"
+                )
+            cells["Operating point"] = row["point_status"]
+            if multi:
+                for key, name in SHIFT_METRICS:
+                    cells[f"Δ{name} SD (k/n)"] = _delta_sd(rows, key, len(seeds))
+            table[f"{label} | {model}"] = cells
+        rho, n_models = _rank_agreement(prim_rows)
+        ranks[label] = {"Database": sc["db_id"], "Sets": sets,
+                        "Spearman ρ (AUC rank)": rho, "Models": n_models}
+
+    seed_note = "".join(
+        f" Points and CIs: primary seed {s[0]} of {', '.join(map(str, s))}; 'SD (k/n)' = "
+        "sample SD of Δ over the k seeds where it is defined, of n requested (training "
+        "variation; the CI is test-set sampling)." for s in seeds_seen if len(s) > 1
+    )
+
+    def write(block_id, title, description, data, col1):
+        cols = list(next(iter(data.values())))
+        block = {
+            "id": block_id,
+            "section_name": title,
+            "description": description,
+            "plot_type": "table",
+            "pconfig": {"id": block_id, "title": title, "col1_header": col1,
+                        "no_violin": True, "sortRows": False},
+            "headers": {c: {"title": c, "scale": False} for c in cols},
+            "data": data,
+        }
+        with open(os.path.join(outdir, f"{block_id}_mqc.json"), "w", encoding="utf-8") as fh:
+            json.dump(block, fh, indent=2)
+        return block_id
+
+    ids = []
+    if table:
+        ids.append(write("test_set_shift", "Same trained model: 1:1 test set vs 1:k test set",
+                         SHIFT_DESCRIPTION + seed_note
+                         + f" {STRUCTURE_MARK.strip()} = structure-assisted.",
+                         table, "Dataset | model"))
+        ids.append(write(
+            "test_set_shift_rank_agreement", "Model ranking: 1:1 vs 1:k (primary seed)",
+            "Spearman ρ between the models' ROC AUC on the 1:1 and on the 1:k test set "
+            "(average ranks), over the models with a finite AUC on both. No p-value. "
+            "Structure-assisted models rank on their covered subset (see Pos/Neg in "
+            "the table above).", ranks, "Dataset"))
+    return ids
+
+
 # `combine_db_analysis()` lived here. It merged the per-dataset degree,
 # betweenness and clustering box plots into one tabbed block each. All three
 # series are gone (two were hardcoded [1..10] placeholders, the third duplicated
@@ -1282,6 +1457,7 @@ def main():
     db_names = []
     source_sidecars = []
     enrichment = {}
+    shift_sidecars = {}
     seed_lists = set()
 
     # Collect and relabel all blocks from each report
@@ -1302,6 +1478,10 @@ def main():
         if os.path.isfile(seed_path):
             with open(seed_path, "r", encoding="utf-8") as fh:
                 seed_lists.add(tuple(json.load(fh)["seeds"]))
+        # W-10: keyed by the target run label (the staged dir name).
+        shift = read_test_set_shift(report_dir)
+        if shift:
+            shift_sidecars[db_name] = shift
         enrichment_path = os.path.join(report_dir, ENRICHMENT_SIDECAR)
         if os.path.isfile(enrichment_path):
             with open(enrichment_path, "r", encoding="utf-8") as fh:
@@ -1363,6 +1543,7 @@ def main():
     )
     cross_db_comparison(all_blocks, outdir_json, dataset_order, seed_note)
     source_accuracy_bargraph(source_sidecars, outdir_json, dataset_order, seed_note)
+    write_test_set_shift_blocks(shift_sidecars, outdir_json, dataset_order)
 
     enrichment = order_dataset_keys(enrichment, dataset_order)
     enrichment_ids = write_enrichment_blocks(enrichment, outdir_json)

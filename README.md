@@ -306,8 +306,17 @@ For each database split processed, a subdirectory under `--outdir/<db_name>/`:
 └── evaluation/
     └── <variant>/                          # one report per test split
         ├── ddi_report.html
-        └── source_accuracy.json            # per-source rates, for COMBINE_EVAL
+        ├── source_accuracy.json            # per-source rates, for COMBINE_EVAL
+        └── test_set_shift.json             # 1:k variants only: 1:1 vs 1:k, for COMBINE_EVAL
 ```
+
+`test_set_shift.json` is written only for a 1:k variant (`uniform_1_10`) whose
+database has exactly one matching 1:1 variant (`uniform_1_1` or
+`matched_1_1`): the same trained model on both test sets, every seed. The
+combined report turns it into two tables, "Same trained model: 1:1 test set vs
+1:k test set" (AUC, TPR, FPR per set, Δ with a 95% bootstrap CI) and "Model
+ranking: 1:1 vs 1:k" (Spearman ρ). Points, CIs and ρ are the primary seed's;
+with several seeds the `SD (k/n)` columns give the across-seed SD of Δ.
 
 Shared work (DDI CSVs, features, fitted models) sits directly under the
 database directory; only `evaluation/` fans out per test variant. A top-level

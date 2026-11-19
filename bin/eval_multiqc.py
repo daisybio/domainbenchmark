@@ -172,8 +172,9 @@ def parse_arguments():
         "--test_split",
         default="test",
         help="Test split of --database to profile: `test` or any "
-             "`test_<variant>` (currently test_matched_1_1 or test_uniform_1_1, "
-             "in distribution, and test_uniform_1_10, out of distribution). "
+             "`test_<variant>` (currently test_matched_1_1 or test_uniform_1_1 "
+             "and test_uniform_1_10, all in distribution; 1:10 holds the same "
+             "positives as 1:1 with more negatives). "
              "Each test set of a database is "
              "reported as its own dataset.",
     )
@@ -1138,6 +1139,60 @@ def write_source_accuracy_sidecar(
     print(f"[INFO] Wrote {out_path} ({len(models)} models, {len(totals)} sources)")
 
 
+#: W-10 sidecar: the same model's 1:1 vs 1:k comparison, one row per (model,
+#: seed). Like source_accuracy.json, rendered only by combine_eval.py.
+TEST_SET_SHIFT_SIDECAR = "test_set_shift.json"
+
+
+def write_test_set_shift_sidecar(per_model_paths, outdir, db_id, target_variant, seeds,
+                                 structure_features=()) -> None:
+    """Collect `test_set_shift` from every eval_one JSON (every seed) into
+    `test_set_shift.json`; no rows -> no file (a stale one is removed). Rows
+    sorted by model, then seed in `seeds` order. Fails on a duplicate (model,
+    seed), on rows naming different reference variants, and on a row whose
+    `variant` is not `target_variant`. Without `seeds`, the rows' single seed
+    is the primary one; several distinct seeds then fail."""
+    out_path = os.path.join(outdir, TEST_SET_SHIFT_SIDECAR)
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    rows = []
+    for path in per_model_paths or []:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        shift = obj.get("test_set_shift")
+        if shift:
+            model = obj["model_name"]
+            rows.append({"model": model, "seed": obj.get("seed"),
+                         "structure_assisted": is_structure_assisted(model, structure_features),
+                         **shift})
+    if not rows:
+        return
+    if not seeds:
+        distinct = sorted({r["seed"] for r in rows}, key=str)
+        if len(distinct) > 1:
+            raise SystemExit(f"[test_set_shift] no --seeds, but rows carry seeds {distinct}; "
+                             "the primary seed is ambiguous.")
+        seeds = distinct
+    wrong = sorted({r["model"] for r in rows if r.get("variant") != target_variant})
+    if wrong:
+        raise SystemExit(f"[test_set_shift] rows of {wrong} were scored on another variant "
+                         f"than {target_variant!r}.")
+    keys = [(r["model"], r["seed"]) for r in rows]
+    dup = sorted({k for k in keys if keys.count(k) > 1}, key=str)
+    if dup:
+        raise SystemExit(f"[test_set_shift] duplicate (model, seed) rows: {dup}")
+    refs = sorted({r["reference_variant"] for r in rows})
+    if len(refs) > 1:
+        raise SystemExit(f"[test_set_shift] rows name different reference variants: {refs}")
+    rank = {s: i for i, s in enumerate(seeds or [])}
+    rows.sort(key=lambda r: (r["model"], rank.get(r["seed"], len(rank)), str(r["seed"])))
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump({"db_id": db_id, "reference_variant": refs[0],
+                   "target_variant": target_variant, "seeds": list(seeds or []),
+                   "rows": rows}, fh, indent=1)
+    print(f"[INFO] Wrote {out_path} ({len(rows)} rows)")
+
+
 def main():
     args = parse_arguments()
     # print arguments for logging
@@ -1178,6 +1233,11 @@ def main():
     write_multiqc_json_database_analysis(db_analysis, args.out_dir, db_name)
     print(f"[INFO] Database analysis completed for: {db_name}")
 
+    structure_features = [
+        f.strip()
+        for f in f"{args.structure_features or ''},{args.structure_informed_features or ''}".split(",")
+        if f.strip()
+    ]
     # Part4: MultiQC JSON
     write_multiqc_json_metrics(
         metrics_auc_pr,
@@ -1186,11 +1246,7 @@ def main():
         metrics_df,
         args.out_dir,
         PREFIX,
-        structure_features=[
-            f.strip()
-            for f in f"{args.structure_features or ''},{args.structure_informed_features or ''}".split(",")
-            if f.strip()
-        ],
+        structure_features=structure_features,
         af3_features=[f.strip() for f in (args.structure_features or "").split(",") if f.strip()],
         seed_sets=seed_sets,
         seeds=seeds,
@@ -1201,6 +1257,12 @@ def main():
     write_source_accuracy_sidecar(
         per_model_metrics, args.out_dir, db_name, args.test_split,
         db_id=args.db_id, variant=args.variant,
+    )
+
+    # W-10: every seed's rows, not only the primary seed's.
+    write_test_set_shift_sidecar(
+        args.per_model_metrics, args.out_dir, args.db_id or db_name,
+        args.variant or variant_of_split(args.test_split), seeds, structure_features,
     )
 
     # Enrichment travels as a sidecar too: combine_eval.py rebuilds its blocks

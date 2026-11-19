@@ -13,7 +13,9 @@ process EVAL_ONE {
     input:
         // model_params: the model's model_parameters.json (validation
         // operating points), reported beside the realised test rates.
-        tuple val(meta), path(predictions), path(ddi_dir), path(model_params, stageAs: 'model_parameters.json')
+        // reference: W-10, the same model's 1:1 parquet when this is a 1:k
+        // test set (meta.reference_variant), else [] -- nothing staged.
+        tuple val(meta), path(predictions), path(ddi_dir), path(model_params, stageAs: 'model_parameters.json'), path(reference, stageAs: 'reference/*')
 
     output:
         // One per (model, seed): EVALUATION stages every seed's JSON side by side.
@@ -29,6 +31,13 @@ process EVAL_ONE {
             error("EVAL_ONE ${meta.id}: no test split for variant '${meta.variant}' of ${meta.db}; per-source metrics would be skipped.")
         }
         def sources_arg = "--sources ${ddi_dir}/${meta.split}_sources.csv"
+        def reference_arg = ''
+        if (meta.reference_variant) {
+            if (!reference || !meta.reference_split) {
+                error("EVAL_ONE ${meta.id}: 1:k test set without its 1:1 reference predictions (${meta.reference_variant}).")
+            }
+            reference_arg = "--reference_predictions ${reference} --reference_variant ${meta.reference_variant} --reference_sources ${ddi_dir}/${meta.reference_split}_sources.csv --variant ${meta.variant}"
+        }
         """
         mkdir -p per_model
 
@@ -37,6 +46,7 @@ process EVAL_ONE {
             --model_name ${meta.model} \\
             ${sources_arg} \\
             --model_parameters model_parameters.json \\
+            ${reference_arg} \\
             --seed ${meta.seed} \\
             --out per_model/${meta.model}.seed${meta.seed}.json
         """

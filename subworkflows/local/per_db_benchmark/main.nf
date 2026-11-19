@@ -29,7 +29,7 @@ include { GRAPH_MODEL                                   } from '../../../modules
 include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 include { VERIFY_EMBEDDINGS                             } from '../../../modules/local/verify_embeddings/main.nf'
 include { METADATA; ENRICHMENT                          } from '../../../modules/local/enrichment/main.nf'
-include { csvToList; runLabel; featureVariants; parseSeeds } from '../utils_nfcore_domainbenchmark_pipeline'
+include { csvToList; runLabel; referenceVariant; featureVariants; parseSeeds } from '../utils_nfcore_domainbenchmark_pipeline'
 
 
 def embeddingsDir(features) {
@@ -485,19 +485,40 @@ workflow PER_DB_BENCHMARK {
                         // The model's seed: EVAL_ONE bootstraps with it.
                         seed     : meta.seed
                     ]
-                    tuple(m_eval, pf, model_params)
+                    // W-10: the 1:1 variant this 1:k one is compared against
+                    // (null otherwise). Kept out of m_eval so ENRICHMENT's
+                    // meta, and with it its task hash, stays as it was.
+                    def ref_variant = meta.tests ? referenceVariant(variant, meta.tests) : null
+                    def ref = [
+                        reference_variant: ref_variant,
+                        reference_split  : ref_variant ? meta.tests[ref_variant] : null
+                    ]
+                    tuple(m_eval, pf, model_params, ref)
                 }
             }
-        all_predictions_ch = scored_ch.map { m, pf, _p -> tuple(m, pf) }
+        all_predictions_ch = scored_ch.map { m, pf, _p, _r -> tuple(m, pf) }
+
+        // W-10: a 1:k target also gets its 1:1 reference parquet -- from the
+        // same model task (one task writes every variant), so same model and
+        // seed. Non-targets get [] (nothing staged).
+        def ref_preds_ch = scored_ch.map { m, pf, _p, _r -> tuple([m.db, m.model, m.seed, m.variant], pf) }
+        def with_ref_ch = scored_ch
+            .filter { _m, _pf, _p, r -> r.reference_variant }
+            .map { m, pf, mp, r -> tuple([m.db, m.model, m.seed, r.reference_variant], m + r, pf, mp) }
+            .combine(ref_preds_ch, by: 0)
+            .map { _key, m, pf, mp, ref_pf -> tuple(m, pf, mp, ref_pf) }
+            .mix(scored_ch
+                .filter { _m, _pf, _p, r -> !r.reference_variant }
+                .map { m, pf, mp, r -> tuple(m + r, pf, mp, []) })
 
         // Per-source accuracy needs each test DDI's provenance list, so the
         // scatter task gets its database's DDI directory alongside the
         // predictions. `combine(by: 0)` rather than `join`: one DDI dir fans out
         // to every (model x variant) prediction of that database.
-        eval_one_input_ch = scored_ch
-            .map { m, pf, mp -> tuple(m.db, m, pf, mp) }
+        eval_one_input_ch = with_ref_ch
+            .map { m, pf, mp, ref_pf -> tuple(m.db, m, pf, mp, ref_pf) }
             .combine(ddi_keyed.map { id, _meta, ddi_dir -> tuple(id, ddi_dir) }, by: 0)
-            .map { _db_id, m, pf, mp, ddi_dir -> tuple(m, pf, ddi_dir, mp) }
+            .map { _db_id, m, pf, mp, ref_pf, ddi_dir -> tuple(m, pf, ddi_dir, mp, ref_pf) }
         EVAL_ONE(eval_one_input_ch)
 
         // ---------------------------------------------------------------

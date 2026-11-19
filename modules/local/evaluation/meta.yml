@@ -32,16 +32,31 @@ input:
           Groovy Map with database and model information.
     - predictions:
         type: file
-        description: Predictions parquet file (one model × DB × feature combo).
+        description: Predictions parquet file (one model × DB × feature combo × test variant).
+        pattern: "*.parquet"
+    - ddi_dir:
+        type: directory
+        description: DDI_EXTRACTION output of the database; holds every split's `<split>_sources.csv`.
+    - model_params:
+        type: file
+        description: The model's `model_parameters.json` (validation operating points), staged as `model_parameters.json`.
+        pattern: "model_parameters.json"
+    - reference:
+        type: file
+        description: |
+          W-10: for a 1:k test set (`meta.reference_variant` set), the same model
+          task's 1:1 predictions, staged under `reference/`; `[]` otherwise.
         pattern: "*.parquet"
 output:
   metrics:
     - - meta:
           type: map
           description: Groovy Map with database and model info.
-      - "per_model/${meta.model}.json":
+      - "per_model/${meta.model}.seed${meta.seed}.json":
           type: file
-          description: Per-model metric JSON (metrics + downsampled curves).
+          description: |
+            Per-model metric JSON (metrics + downsampled curves); a 1:k test set
+            also carries `test_set_shift`.
           pattern: "*.json"
   report:
     - - meta:

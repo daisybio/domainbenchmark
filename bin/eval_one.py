@@ -683,6 +683,152 @@ def _ap_baseline(pr_ap: float, y_true) -> dict:
     }
 
 
+#: W-10 metrics, in output order: (name, class each side needs, reason).
+SHIFT_METRICS = (
+    ("roc_auc", (0, 1), "needs both classes in both test sets"),
+    ("tpr", (1,), "needs positives in both test sets"),
+    ("fpr", (0,), "needs negatives in both test sets"),
+)
+
+
+def _shift_metric(name, y, score, decision) -> float:
+    if name == "roc_auc":
+        return float(roc_auc_score(y, score))
+    cls = 1 if name == "tpr" else 0
+    return float(decision[y == cls].mean())
+
+
+def _shift_strata(ref: pd.DataFrame, tgt: pd.DataFrame) -> list:
+    """Six bootstrap strata, label x {shared, reference only, target only}, in
+    a fixed order: (ref row indices, target row indices) per stratum, aligned
+    for shared keys (the same DDI's row in each set), one side empty otherwise.
+    Fails on a shared key labelled differently in the two sets."""
+    rk = pd.Series(np.arange(len(ref)), index=_pair_keys(ref["domain_a"], ref["domain_b"]))
+    tk = pd.Series(np.arange(len(tgt)), index=_pair_keys(tgt["domain_a"], tgt["domain_b"]))
+    shared = rk.index.intersection(tk.index).sort_values()
+    ry = ref["true_interaction"].to_numpy()
+    ty = tgt["true_interaction"].to_numpy()
+    ri, ti = rk[shared].to_numpy(), tk[shared].to_numpy()
+    if (ry[ri] != ty[ti]).any():
+        raise SystemExit(
+            f"[eval_one] {int((ry[ri] != ty[ti]).sum())} DDI(s) in both test sets "
+            f"carry different labels. e.g. {_examples(shared[ry[ri] != ty[ti]])}"
+        )
+    r_only = np.setdiff1d(np.arange(len(ref)), ri)
+    t_only = np.setdiff1d(np.arange(len(tgt)), ti)
+    empty = np.empty(0, dtype=np.int64)
+    strata = []
+    for label in (1, 0):
+        strata.append((ri[ry[ri] == label], ti[ty[ti] == label]))
+        strata.append((r_only[ry[r_only] == label], empty))
+        strata.append((empty, t_only[ty[t_only] == label]))
+    return strata
+
+
+def _shift_samples(ref: pd.DataFrame, tgt: pd.DataFrame, n: int, seed: int) -> dict:
+    """{metric: per-resample Δ (target - reference)} of the joint bootstrap.
+
+    Each resample draws every stratum of `_shift_strata` with replacement at
+    its own size, in the fixed stratum order, from one `default_rng(seed)`. A
+    shared DDI drawn once enters both sets, each with its own set's score and
+    decision. Class and overlap counts are therefore fixed, so a metric is
+    defined in every resample or in none (those stay NaN).
+    """
+    strata = _shift_strata(ref, tgt)
+    sides = [(ref["true_interaction"].to_numpy(), ref["predicted_probability"].to_numpy(),
+              ref["predicted_interaction"].to_numpy()),
+             (tgt["true_interaction"].to_numpy(), tgt["predicted_probability"].to_numpy(),
+              tgt["predicted_interaction"].to_numpy())]
+    eligible = {name: all(set(need) <= set(np.unique(side[0])) for side in sides)
+                for name, need, _ in SHIFT_METRICS}
+    rng = np.random.default_rng(seed)
+    out = {name: np.full(n, np.nan) for name, _, _ in SHIFT_METRICS}
+    for i in range(n):
+        picks = [[], []]
+        for r_idx, t_idx in strata:
+            size = max(len(r_idx), len(t_idx))
+            if not size:
+                continue
+            draw = rng.integers(0, size, size=size)
+            for side, idx in ((0, r_idx), (1, t_idx)):
+                if len(idx):
+                    picks[side].append(idx[draw])
+        rows = [np.concatenate(p) for p in picks]
+        for name, _, _ in SHIFT_METRICS:
+            if eligible[name]:
+                vals = [_shift_metric(name, *(a[r] for a in side)) for side, r in zip(sides, rows)]
+                out[name][i] = vals[1] - vals[0]
+    return out
+
+
+def _test_set_shift(ref: pd.DataFrame, tgt: pd.DataFrame, op: dict, reference_variant: str,
+                    seed: int, n: int, variant: str = None) -> dict:
+    """W-10: the same trained model on its 1:1 test set (`ref`) vs a 1:k one
+    (`tgt`). AUC (ties half credit), TPR and FPR at the `fpr0.01` labels (the
+    validation-selected threshold, applied unchanged to both sets), the
+    difference target - reference and its joint-bootstrap 95% percentile CI.
+    Each endpoint is computed from its own side's rows wherever that side has
+    the classes it needs; Δ and its CI only where both sides do. Undefined
+    values are None."""
+    def counts(df):
+        y = df["true_interaction"].to_numpy()
+        return int(y.sum()), int(len(y) - y.sum())
+
+    def keyset(df, label):
+        d = df[df["true_interaction"] == label]
+        return set(_pair_keys(d["domain_a"], d["domain_b"]))
+
+    samples = _shift_samples(ref, tgt, n, seed)
+    metrics = {}
+    for name, need, reason in SHIFT_METRICS:
+        valid = samples[name][~np.isnan(samples[name])]
+        vals = [
+            _shift_metric(name, df["true_interaction"].to_numpy(),
+                          df["predicted_probability"].to_numpy(),
+                          df["predicted_interaction"].to_numpy())
+            if set(need) <= set(np.unique(df["true_interaction"].to_numpy())) else None
+            for df in (ref, tgt)
+        ]
+        entry = {"ref": vals[0], "target": vals[1], "delta": None, "delta_ci": [None, None],
+                 "n_valid": int(valid.size), "reason": None}
+        if valid.size:
+            entry.update(delta=vals[1] - vals[0],
+                         delta_ci=[float(np.quantile(valid, 0.025)), float(np.quantile(valid, 0.975))])
+        else:
+            entry["reason"] = reason
+        metrics[name] = entry
+
+    n_ref_pos, n_ref_neg = counts(ref)
+    n_pos, n_neg = counts(tgt)
+    ref_keys = _pair_keys(ref["domain_a"], ref["domain_b"])
+    tgt_keys = _pair_keys(tgt["domain_a"], tgt["domain_b"])
+    shared = np.intersect1d(ref_keys, tgt_keys)
+    diff = np.abs(
+        ref["predicted_probability"].to_numpy()[np.isin(ref_keys, shared)].astype(np.float64)
+        - tgt["predicted_probability"].to_numpy()[np.isin(tgt_keys, shared)].astype(np.float64)
+    )  # both frames are key-sorted, so the masked rows align
+    fp = lambda df: int(((df["true_interaction"] == 0) & (df["predicted_interaction"] == 1)).sum())
+    return {
+        "reference_variant": reference_variant,
+        "variant": variant,
+        "n_ref_pos": n_ref_pos, "n_ref_neg": n_ref_neg, "n_pos": n_pos, "n_neg": n_neg,
+        "n_shared_pos": len(keyset(ref, 1) & keyset(tgt, 1)),
+        "n_shared_neg": len(keyset(ref, 0) & keyset(tgt, 0)),
+        "ref_pos_subset": keyset(ref, 1) <= keyset(tgt, 1),
+        "ref_neg_subset": keyset(ref, 0) <= keyset(tgt, 0),
+        "fp_ref": fp(ref), "fp": fp(tgt),
+        "point_status": (
+            f"validation FPR ≤ 0.01 (achieved {op['val_fpr']:.4f} on {op['val_n_neg']} neg)"
+            if op["resolvable"] else UNRESOLVED[PRIMARY]
+        ),
+        "bootstrap_n": int(n),
+        # Diagnostic only: the same DDI may score differently per split when
+        # its instance pairs differ.
+        "shared_max_abs_score_diff": float(diff.max()) if diff.size else None,
+        "metrics": metrics,
+    }
+
+
 def _downsample_curve(xs, ys, max_points: int = 600):
     """Keep curves cheap to send through MultiQC (no perceptible quality loss)."""
     n = len(xs)
@@ -722,7 +868,27 @@ def main():
         "--id", dest="run_id", default=None,
         help="Optional run ID (logged only)."
     )
+    # W-10: all three or none. Given for a 1:k test set: the same model task's
+    # 1:1 predictions, that variant's name and its split's sources CSV.
+    p.add_argument("--reference_predictions", default=None,
+                   help="The same model's predictions on the 1:1 test set.")
+    p.add_argument("--reference_variant", default=None,
+                   help="Variant name of --reference_predictions (e.g. uniform_1_1).")
+    p.add_argument("--reference_sources", default=None,
+                   help="`<split>_sources.csv` of the reference split; its keys and "
+                        "labels are checked like --sources.")
+    p.add_argument("--variant", default=None,
+                   help="Variant of --predictions (the 1:k target); recorded in "
+                        "`test_set_shift`. Required with the --reference_* args.")
     args = p.parse_args()
+    ref_args = (args.reference_predictions, args.reference_variant, args.reference_sources)
+    if any(ref_args) and not all(ref_args):
+        p.error("--reference_predictions, --reference_variant and --reference_sources "
+                "go together: give all three or none.")
+    if any(ref_args) and not args.variant:
+        p.error("--variant is required with the --reference_* args.")
+    if any(ref_args) and args.bootstrap_n < 1:
+        p.error("--bootstrap_n must be >= 1 with the --reference_* args.")
     if args.run_id:
         print(f"[eval_one] run_id={args.run_id}")
 
@@ -813,6 +979,15 @@ def main():
         # these sidecars (the scatter that fixed the 300 GB evaluation OOM).
         "per_source": _per_source_metrics(df, args.sources),
     }
+    if args.reference_predictions:
+        # Validated exactly like the target: same thresholds (one model task
+        # wrote both files), keys and labels against its own split's CSV.
+        ref = _read_predictions(args.reference_predictions, args.model_name, points)
+        _per_source_metrics(ref, args.reference_sources)
+        payload["test_set_shift"] = _test_set_shift(
+            ref, df, operating_points[PRIMARY], args.reference_variant,
+            args.seed, args.bootstrap_n, variant=args.variant,
+        )
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
