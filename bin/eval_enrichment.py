@@ -5,15 +5,17 @@ Metadata enrichment of one model's predictions on one (database, test variant).
 Regresses a target on the DDI metadata covariates of `create_metadata.py`'s
 table and writes one JSON:
 
+    observed        true label                       Logit
     predicted       predicted label                  Logit
     combined        TN / FP / FN / TP                MNLogit
     error_positive  |y - p| on the positives only    OLS
     error_negative  |y - p| on the negatives only    OLS
 
 `error` is fit per class because |y - p| on a mixed set is mostly a function
-of the label. `observed` (true label, Logit) does not depend on the model and
-is fit once per (database, variant) by create_metadata.py, through the same
-`analyse()`.
+of the label. `observed` is refitted here for every model on the same input
+rows (the DDIs it scored with complete metadata) and candidate columns as
+`predicted`, so the two can be compared; create_metadata.py fits it once more
+on every complete test DDI as the reference, through the same `analyse()`.
 
 Per target: full-model R^2 (OLS, HC3 standard errors) or McFadden pseudo-R^2
 (Logit/MNLogit, HC0 sandwich standard errors -- statsmodels accepts "HC3" for
@@ -22,7 +24,9 @@ coefficients with p- and Benjamini-Hochberg q-values (BH over every slope of
 that fit, all MNLogit equations jointly), drop-one ΔR^2 (full minus reduced
 R^2, McFadden for Logit/MNLogit -- not the normalised partial R^2),
 leave-group-out ΔR^2 (af_* / interpro_* / biochem), and single-feature
-R^2 and log-odds. Features are standardised per fit, so coefficients are per SD.
+R^2 and log-odds. Features are standardised per fit; slopes and standard
+errors are then reported per SD of the whole (database, variant) metadata
+table (`table_sd`), so they are comparable across models and row subsets.
 
 A fit that cannot be estimated on this data (one class, a class under
 MIN_CLASS_SIZE rows, under MIN_ROWS_PER_PARAMETER rows (OLS) or
@@ -87,6 +91,12 @@ def feature_columns(table):
     if not cols:
         raise SystemExit("[enrichment] The metadata table has no feature column.")
     return cols
+
+
+def table_sd(table):
+    """Per feature column, the SD over every table row with a value (ddof=0):
+    the unit every reported slope is expressed in."""
+    return table[feature_columns(table)].std(ddof=0)
 
 
 def complete_cases(df, features):
@@ -202,8 +212,12 @@ def _sub_fit(kind, X, y, llnull, slopes=False):
     return _r2(kind, res, llnull), (params if slopes and kind != "ols" else None), None
 
 
-def analyse(target, X, y, threads=1):
-    """Every statistic for one target. X: DataFrame of features, y: array."""
+def analyse(target, X, y, table_sd, threads=1):
+    """Every statistic for one target. X: DataFrame of features, y: array,
+    table_sd: `table_sd()` of the metadata table X was taken from.
+
+    The fit runs on X standardised over these rows, so gates, p, q and R^2 do
+    not depend on table_sd; slopes and SEs are rescaled to per table SD."""
     kind = KIND[target]
     y = np.asarray(y)
     X = X[sorted(X.columns)]
@@ -241,6 +255,12 @@ def analyse(target, X, y, threads=1):
                 f"{n_events} {unit} for {n_params} parameters (need {MIN_ROWS_PER_PARAMETER} per parameter)"
             )
         cols = list(Z.columns)
+        tsd = pd.Series(table_sd).reindex(cols).to_numpy(dtype=float)
+        if not (np.isfinite(tsd) & (tsd > 0)).all():
+            raise SystemExit(f"[enrichment] {target}: table SD not finite and positive for a retained column "
+                             f"{dict(zip(cols, tsd))} (metadata table does not match these rows?)")
+        # Slope per fit SD -> per table SD.
+        scale = (tsd / sd[cols].to_numpy(dtype=float))[:, None]
         Z = Z.to_numpy(dtype=float)
         res = _fit(kind, Z, y)
     except Degenerate as e:
@@ -253,8 +273,8 @@ def analyse(target, X, y, threads=1):
     r2_adj = float(res.rsquared_adj) if kind == "ols" else 1.0 - (res.llf - n_slopes) / llnull
 
     shape = (len(cols) + 1, n_eq)
-    coef = np.asarray(res.params).reshape(shape)[1:]
-    se = np.asarray(res.bse).reshape(shape)[1:]
+    coef = np.asarray(res.params).reshape(shape)[1:] * scale
+    se = np.asarray(res.bse).reshape(shape)[1:] * scale
     p = np.asarray(res.pvalues).reshape(shape)[1:]
     q = bh_qvalues(p.ravel()).reshape(p.shape)
     if kind == "mnlogit":
@@ -289,7 +309,7 @@ def analyse(target, X, y, threads=1):
         if task == "single":
             single_r2[name] = None if r2_sub is None else _num(r2_sub)
             for j, eq in enumerate(single_log_odds):
-                single_log_odds[eq][name] = None if slopes is None else _num(slopes[0, j])
+                single_log_odds[eq][name] = None if slopes is None else _num(slopes[0, j] * scale[cols.index(name), 0])
         else:
             dest = partial if task == "drop" else group_partial
             dest[name] = None if r2_sub is None else _num(r2 - r2_sub)
@@ -350,6 +370,7 @@ def prediction_targets(df):
     prob = df["predicted_probability"].to_numpy(dtype=float)
     everything = np.ones(len(df), dtype=bool)
     return {
+        "observed": (everything, t),
         "predicted": (everything, pred),
         "combined": (everything, 2 * t + pred),
         "error_positive": (t == 1, 1.0 - prob),
@@ -372,10 +393,16 @@ def main():
     complete, used, dropped, counts = complete_cases(df, feature_columns(table))
     print(f"[enrichment] {len(pred)} predictions, {counts['n_complete']} with every metadata value")
 
+    sd = table_sd(table)
     targets = {
-        name: analyse(name, complete.loc[mask, used], y[mask], args.threads)
+        name: analyse(name, complete.loc[mask, used], y[mask], sd, args.threads)
         for name, (mask, y) in prediction_targets(complete).items()
     }
+    # Same rows and candidate columns; constant/alias drops depend only on X.
+    obs, pred_fit = targets["observed"], targets["predicted"]
+    if obs["status"] == pred_fit["status"] == "ok" and set(obs["equations"][""]) != set(pred_fit["equations"][""]):
+        raise SystemExit(f"[enrichment] observed and predicted retained different columns: "
+                         f"{sorted(obs['equations'][''])} vs {sorted(pred_fit['equations'][''])}")
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(
             {

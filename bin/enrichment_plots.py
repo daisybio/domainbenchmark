@@ -25,7 +25,9 @@ GROUP_ORDER = ("af", "interpro", "biochem")
 #: Written by EVALUATION next to source_accuracy.json; read by combine_eval.py.
 ENRICHMENT_SIDECAR = "enrichment.json"
 PREFIX = "enrichment_"
-OBSERVED = "observed (model-independent)"
+OBSERVED = "test DDIs with complete metadata (reference)"
+#: A full-model log2(OR) cell (and an agreement slope) counts only below this BH q-value.
+Q_MAX = 0.05
 TIDY_COLUMNS = ["dataset", "model", "target", "quantity", "feature", "value", "n", "status", "reason"]
 TARGET_LABELS = {
     "observed": "Observed label (Logit)",
@@ -43,6 +45,9 @@ HEATMAPS = {
     "single_feature_log2_odds": ("Single-feature log2(odds ratio) per SD (feature × model)", "log2(OR)", True),
 }
 BARS = {"delta_r2": "Drop-one ΔR²", "log2_odds_ratio": "Full-model log2(odds ratio)"}
+#: tidy() key of one per-feature number.
+KEY = ["dataset", "model", "target", "feature"]
+DESCRIPTIVE = "Descriptive: no per-feature test."
 
 
 def load_inputs(paths):
@@ -122,6 +127,12 @@ def _fit_rows(ds, model, target, t, ln2):
             for f, v in vals.items()
         ]
     return rows
+
+
+def _with(sub, T, quantity):
+    """sub plus a column `quantity` joined from T on KEY (NaN where absent)."""
+    other = T.loc[T.quantity == quantity, KEY + ["value"]].rename(columns={"value": quantity})
+    return sub.merge(other, on=KEY, how="left")
 
 
 def _z(values):
@@ -229,8 +240,14 @@ def status_block(datasets, outdir):
                        "rows with a missing value are left out of every fit (counted here, never imputed). "
                        "Constant and aliased columns are dropped per fit. Logit/MNLogit need 10 events of "
                        "the smallest class per parameter, OLS 10 rows. "
-                       "Features are standardised per fit; OLS uses HC3, Logit/MNLogit "
-                       "HC0 robust standard errors; q-values are Benjamini-Hochberg per fit." + seed_note
+                       "`observed` is refitted for each model on the same input rows and candidate columns "
+                       "as its `predicted` target; `error_*` use that model's positives or negatives only. "
+                       f"The row '{OBSERVED}' is `observed` on every complete test DDI. "
+                       "Slopes are per SD of this (database, variant)'s metadata table, comparable across "
+                       "models. OLS uses HC3, Logit/MNLogit HC0 robust standard errors; intervals and "
+                       "q-values assume independent DDIs. R² and McFadden pseudo-R² describe association, "
+                       "not prediction quality. |y − p| is a class-conditional score residual, not a "
+                       "calibration error. q-values are Benjamini-Hochberg within one fit only." + seed_note
                        + " Primary operating point — NN/RF/SVM: validation FPR ≤ 0.01 threshold. "
                        + SCORE_NOTE,
         "plot_type": "table",
@@ -256,13 +273,18 @@ def r2_bar_block(T, ds_order, outdir):
     if not entries:
         return []
     return [_html_block(outdir, f"{PREFIX}r2_adj", "Enrichment — adjusted (pseudo-)R² per model and target",
-                        "OLS: adjusted R². Logit/MNLogit: adjusted McFadden pseudo-R².",
+                        "OLS: adjusted R². Logit/MNLogit: adjusted McFadden pseudo-R². "
+                        "Association fit, not prediction quality.",
                         [("dataset", "Dataset", ds_order)], entries, 500)]
 
 
 def heatmap_block(T, quantity, ds_order, outdir):
     title, unit, diverging = HEATMAPS[quantity]
     sub = T[T.quantity == quantity]
+    if quantity == "log2_odds_ratio":
+        # Masked before the colour bound; a missing or non-finite q is blank.
+        sub = _with(sub, T, "q")
+        sub = sub.assign(value=sub.value.where(np.isfinite(sub.q) & (sub.q < Q_MAX)))
     targets = _target_order(sub.target)
     entries = {}
     for (tk, ds), s in sub.groupby(["target", "dataset"]):
@@ -280,67 +302,114 @@ def heatmap_block(T, quantity, ds_order, outdir):
     if not entries:
         return []
     return [_html_block(outdir, f"{PREFIX}heatmap_{quantity}", f"Enrichment — {title}",
-                        "Blue = negative, red = positive." if diverging else "",
+                        ("Blue = negative, red = positive. " if diverging else "")
+                        + (f"Blank: q ≥ {Q_MAX} (Benjamini-Hochberg within that fit) or not estimated. "
+                           "q-values assume independent DDIs." if quantity == "log2_odds_ratio" else DESCRIPTIVE),
                         [("target", "Target", targets), ("dataset", "Dataset", ds_order)], entries, 560)]
 
 
 def bar_block(T, quantity, ds_order, outdir):
     sub = T[(T.quantity == quantity) & T.value.notna()]
+    if quantity == "log2_odds_ratio":
+        sub = _with(sub, T, "se")
     entries = {}
     for (tk, model, ds), s in sub.groupby(["target", "model", "dataset"]):
         s = s.sort_values(["value", "feature"], ascending=[False, True])
+        trace = {"type": "bar", "x": list(s.feature), "y": list(s.value)}
+        if quantity == "log2_odds_ratio":
+            half = 1.959964 * s.se.to_numpy(dtype=float) / np.log(2.0)
+            trace["error_y"] = {"type": "data", "symmetric": True, "array": _z([half])[0]}
         entries[f"{tk}||{model}||{ds}"] = {
-            "traces": [{"type": "bar", "x": list(s.feature), "y": list(s.value)}],
+            "traces": [trace],
             "layout": {"title": f"{model}: {_label(tk)}", "xaxis": {"title": "Feature"},
                        "yaxis": {"title": BARS[quantity]}}}
     if not entries:
         return []
     axes = [("target", "Target", _target_order(sub.target)), ("model", "Model", _model_order(sub.model)),
             ("dataset", "Dataset", ds_order)]
+    description = (
+        "95 % Wald interval from the robust (HC0) SE, within one fit, not multiplicity-adjusted, "
+        "assuming independent DDIs. It says nothing about the difference between two fits."
+        if quantity == "log2_odds_ratio" else DESCRIPTIVE + " No interval (no standard error)."
+    )
     return [_html_block(outdir, f"{PREFIX}bars_{quantity}", f"Enrichment — {BARS[quantity]} per feature",
-                        "", axes, entries)]
+                        description, axes, entries)]
 
 
-def agreement_blocks(T, ds_order, outdir):
-    """Does the model use a feature in the same direction as the truth?
+def _agreement(targets):
+    """("k of m" or "n/a (<reason>)", {feature: +1 same sign, -1 not}) for one
+    model payload's targets; the order of the checks is the contract."""
+    obs, pred = targets.get("observed"), targets.get("predicted")
+    if obs is None:
+        return "n/a (no observed analysis)", {}
+    if obs["status"] != "ok":
+        return "n/a (observed skipped)", {}
+    if pred is None or pred["status"] != "ok":
+        return "n/a (predicted skipped)", {}
+    S = {f: v["coef"] for f, v in obs["equations"][""].items()
+         if v["coef"] is not None and v["q"] is not None and np.isfinite(v["coef"])
+         and np.isfinite(v["q"]) and v["q"] < Q_MAX}
+    if not S:
+        return f"n/a (no observed slope with q < {Q_MAX})", {}
+    slopes = {f: (pred["equations"][""].get(f) or {}).get("coef") for f in S}
+    lacking = sorted(f for f, v in slopes.items() if v is None or not np.isfinite(v))
+    if lacking:
+        return f"n/a (predicted lacks {', '.join(lacking)})", {}
+    # A zero predicted slope never matches, also against a zero observed slope.
+    match = {f: 1 if slopes[f] != 0 and np.sign(slopes[f]) == np.sign(S[f]) else -1 for f in sorted(S)}
+    return f"{sum(v == 1 for v in match.values())} of {len(S)}", match
 
-    Compares the sign of each feature's coefficient in the `predicted` fit
-    with its sign in the `observed` fit, nothing else.
+
+def agreement_blocks(datasets, ds_order, outdir):
+    """Descriptive association-sign agreement of `observed` and `predicted`.
+
+    Read from the model payloads, so a skipped fit is told apart from an
+    absent one. Per (dataset, model): of the m `observed` slopes with q <
+    Q_MAX, k have the same sign in `predicted`, which is fitted on the same
+    input rows and candidate columns. It does not show whether or how a model
+    uses a feature. Emitted iff some model payload has an `observed` or
+    `predicted` target, whatever its status.
     """
-    coef = T[T.quantity == "coef"]
+    if not any({"observed", "predicted"} & set(js["targets"])
+               for d in datasets.values() for js in d["models"].values()):
+        return []
     summary, entries = {}, {}
     for ds in ds_order:
-        obs = coef[(coef.dataset == ds) & (coef.model == OBSERVED) & (coef.target == "observed")]
-        pred = coef[(coef.dataset == ds) & (coef.target == "predicted")]
-        if obs.empty or pred.empty:
+        models = sorted(datasets[ds]["models"])
+        if not models:
             continue
-        signs = pd.concat([obs, pred]).pivot(index="feature", columns="model", values="value")
-        signs = np.sign(signs.reindex(columns=_model_order(signs.columns)))
-        for model in signs.columns[1:]:
-            both = signs[[OBSERVED, model]].dropna()
-            if len(both):
-                summary.setdefault(model, {})[ds] = round(100.0 * float((both[OBSERVED] == both[model]).mean()), 1)
-        entries[ds] = {"traces": [{"type": "heatmap", "z": _z(signs.to_numpy()), "x": list(signs.columns),
-                                   "y": list(signs.index), "colorscale": "RdBu", "reversescale": True,
-                                   "zmin": -1, "zmax": 1, "colorbar": {"title": "sign"}}],
-                       "layout": {"title": "Sign of the coefficient: observed fit vs each model's predicted fit",
-                                  "xaxis": {"title": ""}, "yaxis": {"title": "Feature"}}}
-    if not entries:
-        return []
+        detail = {}
+        for model in models:
+            summary.setdefault(model, {})[ds], detail[model] = _agreement(datasets[ds]["models"][model]["targets"])
+        features = sorted({f for m in detail.values() for f in m})
+        entries[ds] = {"traces": [{"type": "heatmap", "z": [[detail[m].get(f) for m in models] for f in features],
+                                   "x": models, "y": features, "colorscale": [[0, "#d73027"], [1, "#1a9850"]],
+                                   "zmin": -1, "zmax": 1,
+                                   "colorbar": {"title": "sign", "tickvals": [-1, 1],
+                                                "ticktext": ["Opposite sign or zero", "Same sign"]}}],
+                       "layout": {"title": f"Association-sign agreement per feature (observed q < {Q_MAX} only)",
+                                  "xaxis": {"title": "Model"}, "yaxis": {"title": "Feature"}}}
     table = _write(outdir, {
         "id": f"{PREFIX}agreement_summary",
-        "section_name": "Enrichment — effect-direction agreement with the truth",
-        "description": "Share of features whose coefficient has the same sign in the model's `predicted` "
-                       "fit as in the `observed` fit (features finite in both).",
+        "section_name": "Enrichment — descriptive association-sign agreement",
+        "description": "For each model, `observed` (true label) and `predicted` are fitted on the same input "
+                       "rows and candidate columns: the DDIs that model scored with complete metadata. Of the "
+                       f"m slopes of `observed` with q < {Q_MAX} (BH within that fit; q assumes independent "
+                       f"DDIs), k have the same sign in `predicted` ({TARGET_LABELS['predicted']}). "
+                       "Descriptive association-sign agreement: it does not show whether or how a model "
+                       "uses a feature.",
         "plot_type": "table",
-        "pconfig": {"id": f"{PREFIX}agreement_summary_table", "title": "Sign agreement (%)", "col1_header": "Model"},
-        "headers": {ds: {"title": ds, "min": 0, "max": 100, "suffix": "%", "scale": "RdYlGn"}
-                    for ds in ds_order if any(ds in row for row in summary.values())},
+        "pconfig": {"id": f"{PREFIX}agreement_summary_table", "title": "Association-sign agreement (k of m)",
+                    "col1_header": "Model"},
+        "headers": {ds: {"title": ds} for ds in ds_order if any(ds in row for row in summary.values())},
         "data": dict(sorted(summary.items())),
     })
     detail = _html_block(outdir, f"{PREFIX}agreement_detail",
-                         "Enrichment — effect direction per feature (observed vs predicted)",
-                         "Blue = negative, red = positive.", [("dataset", "Dataset", list(entries))], entries, 560)
+                         f"Enrichment — association-sign agreement per feature (observed q < {Q_MAX} only)",
+                         "Green (+1) = same sign in `predicted`, red (−1) = opposite sign or zero. Blank = "
+                         f"not significant in `observed` (q < {Q_MAX} not reached), or the comparison is "
+                         "unavailable (a fit skipped or absent).",
+                         [("dataset", "Dataset", list(entries))], entries, 560)
     return [table, detail]
 
 
@@ -355,4 +424,4 @@ def write_enrichment_blocks(datasets, outdir):
         ids += heatmap_block(T, quantity, ds_order, outdir)
     for quantity in BARS:
         ids += bar_block(T, quantity, ds_order, outdir)
-    return ids + agreement_blocks(T, ds_order, outdir)
+    return ids + agreement_blocks(datasets, ds_order, outdir)

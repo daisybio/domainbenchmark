@@ -14,8 +14,9 @@ split's `<split>_instances.csv` and the run-wide metadata directory:
   averaged per DDI. Every numeric column is kept.
 
 Missing values stay missing (no imputation); eval_enrichment counts the rows
-they cost. The `observed` target (true label) is model-independent, so it is
-fit here once rather than once per model.
+they cost. The `observed` target (true label) is fit here once on every
+complete test DDI, as the reference row of the report; eval_enrichment.py
+refits it per model on that model's rows. Slopes are per SD of this table.
 """
 
 import argparse
@@ -25,7 +26,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from eval_enrichment import analyse, complete_cases, feature_columns
+from eval_enrichment import analyse, complete_cases, feature_columns, table_sd
 from load_data_gm import canonical_pair
 
 DOMAIN_ID_COLS = {"instance_id", "pfam_id", "uniprot_id"}
@@ -133,7 +134,8 @@ def observed_result(table, threads=1, n_partial_pair_metadata=0):
         "counts": {"n_ddis": int(len(table)), **counts,
                    "n_ddis_partial_pair_metadata": n_partial_pair_metadata},
         "dropped_columns": dropped,
-        "targets": {"observed": analyse("observed", complete[used], complete["label"].to_numpy(), threads)},
+        "targets": {"observed": analyse("observed", complete[used], complete["label"].to_numpy(),
+                                         table_sd(table), threads)},
     }
 
 

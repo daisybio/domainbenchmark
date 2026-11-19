@@ -117,6 +117,17 @@ scored by the same trained model. A database with a single `test.sqlite3`
     π-precision is shown only if it is defined in every seed. Curves,
     coverage, by-source rates, pairwise tests and enrichment are the primary
     (first) seed's.
+  - With `--metadata` only: `enrichment.json`, the enrichment inputs of this
+    variant (`observed` reference fit plus one entry per model), which the
+    combined report reads, and the "Metadata enrichment" report sections. Each
+    model gets `observed` (true label), refitted on the DDIs that model scored
+    with complete metadata, so it shares input rows and candidate columns with
+    its `predicted` target. The row "test DDIs with complete metadata
+    (reference)" is `observed` on every complete test DDI. Slopes are per SD of
+    the variant's metadata table. Full-model log2(odds ratio) heatmap cells are
+    blank unless q is finite and below 0.05; the bars carry 95 % Wald intervals; the agreement
+    table reads "k of m" (of the m `observed` slopes with q < 0.05, k have the
+    same sign in `predicted`) or "n/a (<reason>)".
 
 </details>
 
@@ -151,6 +162,17 @@ runs: it embeds a timestamp, absolute work-dir paths and the MultiQC version.
     unweighted mean (macro-average) of the per-dataset rates. A single-`test` dataset such
     as `external_test` joins no pooled tab. The `Mean over shown models` bar is
     the mean of the bars beside it, not an ensemble.
+  - `enrichment_data.csv` (with `--metadata` only): the enrichment report's
+    tidy export, one row per (dataset, model, target, quantity, feature), with
+    the fit's `n`, `status` and `reason`; skipped targets keep a `status` row.
+    Quantities are `status`, `r2_adj`, `delta_r2`, `group_delta_r2`,
+    `single_feature_r2`, `coef`, `se`, `p`, `q`, `log2_odds_ratio` and
+    `single_feature_log2_odds`: the raw full-fit `r2` is not in it, and
+    single-feature log-odds appear only as log2 odds ratios. Per-equation
+    numbers carry an equation-qualified target, e.g. `combined: FP vs TN`,
+    `combined: FN vs TN`, `combined: TP vs TN` (MNLogit, against TN). The model
+    `test DDIs with complete metadata (reference)` is the reference `observed`
+    fit; `coef`/`se` are per SD of that dataset's metadata table.
 
 </details>
 
