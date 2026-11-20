@@ -343,6 +343,13 @@ with a single `test` split (e.g. `external_test`) joins no pooled tab. A DDI who
 and do not sum to the `ALL` group. The DDI counts per source sit in the section
 description, together with a note for any model that scored less than the full
 source.
+Threshold-free source views sit in each per-dataset report: a box plot of each
+model's scores per (source, class) and, when a dataset has more than one
+positive or negative source, a "ROC AUC by source pair" heatmap (each positive
+source against each negative source, cells with < 10 DDIs of a class
+suppressed, class-stratified bootstrap CI), which the combined report copies
+through. The default `external_test` (PPIDM_Gold vs hub-depleted
+INVERSE_PPIDM_Gold) has one source per class, so it gets the box plot only.
 
 Each per-dataset report shows the two validation operating points of every
 NN/RF/SVM model side by side with the realised test numbers: "Operating point:
@@ -360,7 +367,8 @@ how much of a difference between models is training noise. Seed-dependent
 tasks run once per seed (NN / RF / SVM, the `dummy` feature, per-model
 evaluation); everything else runs once. The first seed is the **primary
 seed**: graph models, metadata enrichment, the ROC/PR curves, the by-source
-rates and the pairwise bootstrap tests use it alone, and say so.
+rates, the source-pair AUC and score-distribution sections and the pairwise
+bootstrap tests use it alone, and say so.
 
 With more than one seed:
 

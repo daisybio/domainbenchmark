@@ -15,6 +15,7 @@ import json
 
 from eval_multiqc_functions import (
     AF3_CAVEAT,
+    AUC_COLSTOPS,
     NO_SKILL_NOTE,
     SCORE_NOTE,
     is_retired_block,
@@ -62,12 +63,6 @@ SELF_INDICATOR_ROW = (
 #: Suffix on heatmap rows of structure-assisted models.
 STRUCTURE_MARK = " [S]"
 
-#: AUC heatmaps: diverging, centred on chance (0.5 sits mid-scale on [0, 1]).
-_div = plt.get_cmap("RdYlGn")
-auc_colstops = [
-    [i / 8, "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in _div(i / 8)[:3]))]
-    for i in range(9)
-]
 
 AP_DESCRIPTION = (
     "Raw AP depends on prevalence (a no-skill ranker scores AP = prevalence), "
@@ -171,6 +166,12 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
     coverage_blocks = pick(r"^combined_coverage_")
 
     source_block = pick(r"source_accuracy_by_ddi_source")
+    # W-11: per dataset, the cross-source AUC heatmap then its CI table.
+    cross_source_blocks = [
+        b for heat in sort_by_dataset(pick(r"^combined_cross_source_auc_"), dataset_order)
+        for b in (heat, heat.replace("combined_cross_source_auc_", "combined_cross_source_ci_", 1))
+        if b in all_ids
+    ]
 
     db_blocks = pick(r"database_analysis")
 
@@ -212,6 +213,7 @@ def write_multiqc_config(outdir, dataset_order=None, enrichment_ids=()) -> str:
         + pr_curves_block
         + list(enrichment_ids)
         + source_block
+        + cross_source_blocks
     )
 
     # Now add old report blocks that are not already present
@@ -1131,7 +1133,7 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None, eval
         "AUC Heatmap",
         roc_mean,
         "model_performance_heatmap_roc_mqc.json",
-        stops=auc_colstops,
+        stops=AUC_COLSTOPS,
         description="Colour diverges at 0.5 (chance). Each model is scored on "
         "its own pairs; n and prevalence are in the CI table below. " + SCORE_NOTE,
     )
@@ -1154,7 +1156,7 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None, eval
             "Hetero-pair AUC Heatmap (same-family pairs removed)",
             het_mean,
             "model_performance_heatmap_hetero_roc_mqc.json",
-            stops=auc_colstops,
+            stops=AUC_COLSTOPS,
         )
     if _has_text(het_ci):
         _write_ci_table(
@@ -1506,6 +1508,9 @@ def main():
                 stem = block.get("id", "")
                 # Rebuilt below from the enrichment sidecars, across datasets.
                 if stem.startswith(ENRICHMENT_PREFIX):
+                    continue
+                # W11-D2: score distributions stay in the per-dataset report.
+                if stem == "combined_score_by_source":
                     continue
                 block = relabel_multiqc_block(block, db_name)
                 # Write to output dir with new name

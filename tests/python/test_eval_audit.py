@@ -730,3 +730,313 @@ def test_enrichment_labels_and_status_description(tmp_path):
     enrichment_plots.status_block({"ds": {"observed": js, "models": {}}}, str(tmp_path))
     desc = json.loads(next(tmp_path.glob("*status*_mqc.json")).read_text())["description"]
     assert "NN/RF/SVM: validation FPR ≤ 0.01 threshold" in desc and "not probabilities" in desc
+
+
+# --- W-11: cross-source AUC matrix and per-source score distributions -------
+
+from sklearn.metrics import roc_auc_score  # noqa: E402
+
+
+def _merged(groups):
+    """`_join_sources`' exploded frame from (source, label, scores) groups; one
+    distinct pair per score."""
+    rows, i = [], 0
+    for source, label, scores in groups:
+        for s in scores:
+            rows.append((f"p{i}", source, label, float(s)))
+            i += 1
+    return pd.DataFrame(rows, columns=["pair", "source", "true_interaction", "score"])
+
+
+def _payload_json(tmp_path, model, groups, **extra):
+    merged = _merged(groups)
+    path = tmp_path / f"{model}.json"
+    path.write_text(json.dumps({
+        "model_name": model,
+        "cross_source_auc": eval_one._cross_source_auc(merged, 20, 1),
+        "score_by_source": eval_one._score_by_source(merged), **extra}))
+    return str(path)
+
+
+def _three_by_two(tmp_path, ties=False):
+    """Sources CSV + predictions: positives P1/P2/P3 (12 each), negatives N1/N2
+    (15 each); scores rounded to 0.1 with `ties`."""
+    rng = np.random.default_rng(5)
+    src, preds, i = [], [], 0
+    for source, y, n in (("P1", 1, 12), ("P2", 1, 12), ("P3", 1, 12), ("N1", 0, 15), ("N2", 0, 15)):
+        for _ in range(n):
+            a, b = f"PF{i:05d}", f"PF{i + 500:05d}"
+            p = float(0.3 * y + 0.7 * rng.random())
+            p = round(p, 1) if ties else p
+            src.append((a, b, y, source))
+            preds.append((a, b, y, int(p > 0.5), p))
+            i += 1
+    return _sources(tmp_path, src), _preds(preds)
+
+
+def test_cross_source_cells_equal_hand_built_auc_with_ties(tmp_path):
+    src, df = _three_by_two(tmp_path, ties=True)
+    _, merged, _ = eval_one._join_sources(df, src)
+    out = eval_one._cross_source_auc(merged, 0, 1)
+    assert out["positive_sources"] == ["P1", "P2", "P3"]
+    assert out["negative_sources"] == ["N1", "N2"] and not out["single_pair"]
+    assert len(out["cells"]) == 6
+    assert merged["score"].duplicated().any()  # ties present
+    for c in out["cells"]:
+        ps = merged.loc[merged["source"] == c["positive_source"], "score"]
+        ns = merged.loc[merged["source"] == c["negative_source"], "score"]
+        expected = roc_auc_score([1] * len(ps) + [0] * len(ns), list(ps) + list(ns))
+        assert c["roc_auc"] == pytest.approx(expected)
+        assert c["status"] == "ok" and c["roc_auc_ci"] is None  # bootstrap_n 0
+    p1 = [c["roc_auc"] for c in out["cells"] if c["positive_source"] == "P1"]
+    assert out["positive_means"]["P1"] == {"mean": pytest.approx(np.mean(p1)), "k": 2}
+    assert out["negative_means"]["N1"]["k"] == 3
+
+
+def test_cross_source_auc_source_holding_both_classes():
+    # A holds a positive (0.7) and a negative (0.9); B a negative (0.6).
+    merged = _merged([("A", 1, [0.7] * 10), ("A", 0, [0.9] * 10), ("B", 0, [0.6] * 10)])
+    out = eval_one._cross_source_auc(merged, 0, 1)
+    assert out["positive_sources"] == ["A"] and out["negative_sources"] == ["A", "B"]
+    y, src = merged["true_interaction"], merged["source"]
+    for c in out["cells"]:
+        ps = merged.loc[(y == 1) & (src == c["positive_source"]), "score"]
+        ns = merged.loc[(y == 0) & (src == c["negative_source"]), "score"]
+        assert c["roc_auc"] == pytest.approx(
+            roc_auc_score([1] * len(ps) + [0] * len(ns), list(ps) + list(ns)))
+    auc = {(c["positive_source"], c["negative_source"]): c["roc_auc"] for c in out["cells"]}
+    assert auc == {("A", "A"): 0.0, ("A", "B"): 1.0}
+    assert out["positive_means"]["A"] == {"mean": 0.5, "k": 2}
+
+
+def test_one_pair_model_below_min_class_is_suppressed(tmp_path):
+    rng = np.random.default_rng(4)
+    small = eval_one._cross_source_auc(_merged([("P", 1, rng.random(9)), ("N", 0, rng.random(12))]), 10, 1)
+    (cell,) = small["cells"]
+    assert cell["status"] == "suppressed" and cell["roc_auc"] is None
+    assert small["positive_means"]["P"] == {"mean": None, "k": 0}
+    assert small["negative_means"]["N"] == {"mean": None, "k": 0}
+    # Next to a model that also scores N2, the cell renders suppressed.
+    p = tmp_path / "small.json"
+    p.write_text(json.dumps({"model_name": "small", "cross_source_auc": small}))
+    other = _payload_json(tmp_path, "other", [("P", 1, rng.random(12)), ("N", 0, rng.random(12)),
+                                              ("N2", 0, rng.random(12))])
+    out = tmp_path / "rep"
+    out.mkdir()
+    eval_multiqc.write_source_blocks([str(p), other], [], str(out))
+    ci = json.loads((out / "combined_cross_source_ci_mqc.json").read_text())["data"]["small"]
+    heat = json.loads((out / "combined_cross_source_auc_mqc.json").read_text())["data"]["small"]
+    assert ci["P vs N"] == "suppressed · 9+/12− (< 10 of a class)"
+    assert ci["P vs N2"] == "not scored"
+    assert ci["P: mean across eligible negative sources"] == "no eligible cell"
+    assert heat["P vs N"] is None and heat["N: mean across eligible positive sources"] is None
+
+
+def test_multi_source_pair_counts_in_each_source_once_in_all(tmp_path):
+    src = _sources(tmp_path, [("PF00001", "PF00002", 1, "A,B"), ("PF00003", "PF00004", 0, "N")])
+    df = _preds([("PF00001", "PF00002", 1, 1, 0.9), ("PF00003", "PF00004", 0, 0, 0.2)])
+    _, merged, _ = eval_one._join_sources(df, src)
+    out = eval_one._cross_source_auc(merged, 0, 1)
+    assert {(c["positive_source"], c["n_pos"]) for c in out["cells"]} == {("A", 1), ("B", 1)}
+    boxes = eval_one._score_by_source(merged)
+    assert boxes["positive"]["A"]["n"] == boxes["positive"]["B"]["n"] == 1
+    per_source = eval_one._per_source_metrics(df, src)
+    assert per_source["ALL"]["n_scored"] == 2 and per_source["ALL"]["correct"] == 2
+    assert (per_source["ALL"]["n_pos"], per_source["ALL"]["n_neg"]) == (1, 1)
+    assert per_source["A"]["n_scored"] == per_source["B"]["n_scored"] == 1
+
+
+def test_cross_source_suppression():
+    rng = np.random.default_rng(0)
+    out = eval_one._cross_source_auc(_merged([
+        ("P1", 1, rng.random(9)), ("P2", 1, rng.random(10)),
+        ("N1", 0, rng.random(10)), ("N2", 0, rng.random(9)),
+    ]), 10, 1)
+    status = {(c["positive_source"], c["negative_source"]): c["status"] for c in out["cells"]}
+    assert status == {("P1", "N1"): "suppressed", ("P1", "N2"): "suppressed",
+                      ("P2", "N1"): "ok", ("P2", "N2"): "suppressed"}
+    assert all(c["roc_auc"] is None for c in out["cells"] if c["status"] == "suppressed")
+    assert out["positive_means"]["P1"] == {"mean": None, "k": 0}
+    assert out["positive_means"]["P2"]["k"] == 1
+    assert out["negative_means"]["N2"] == {"mean": None, "k": 0}
+
+
+def test_true_one_by_one_skips_bootstrap(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(eval_one, "_stratified_auc_ci", lambda *a: calls.append(a))
+    rng = np.random.default_rng(0)
+    merged = _merged([("P", 1, rng.random(20)), ("N", 0, rng.random(20))])
+    out = eval_one._cross_source_auc(merged, 100, 1)
+    assert out["single_pair"] and not calls
+    (cell,) = out["cells"]
+    assert cell["status"] == "single_pair" and cell["roc_auc_ci"] is None
+    assert cell["roc_auc"] == pytest.approx(roc_auc_score(merged["true_interaction"], merged["score"]))
+    # Through eval_one.py: the one cell is the payload's ROC AUC.
+    pairs, src, rows = _fixture(tmp_path)
+    obj = json.loads(open(_run_eval_one(tmp_path, "m", rows(pairs, 0.6), src)).read())
+    assert obj["cross_source_auc"]["single_pair"]
+    assert obj["cross_source_auc"]["cells"][0]["roc_auc"] == pytest.approx(obj["roc_auc"])
+
+
+def test_stratified_bootstrap_keeps_class_counts(monkeypatch):
+    rng = np.random.default_rng(0)
+    # Disjoint ranges: a resampled score tells which class it was drawn from.
+    pos, neg = 1 + rng.random(12), rng.random(15)
+    seen = []
+    real = eval_one.roc_auc_score
+
+    def spy(y, s):
+        n_pos = int(np.sum(y))
+        assert (s[:n_pos] >= 1).all() and (s[n_pos:] < 1).all()
+        seen.append((n_pos, int(len(y) - n_pos), len(s)))
+        return real(y, s)
+
+    monkeypatch.setattr(eval_one, "roc_auc_score", spy)
+    ci = eval_one._stratified_auc_ci(pos, neg, 40, 7)
+    assert len(seen) == 40 and set(seen) == {(12, 15, 27)}
+    assert ci == eval_one._stratified_auc_ci(pos, neg, 40, 7)
+    assert 0 <= ci[0] <= ci[1] <= 1
+
+
+def test_eval_one_writes_cross_source_payload_without_nan(tmp_path):
+    src, df = _three_by_two(tmp_path)
+    rows = list(df.itertuples(index=False, name=None))
+    obj = json.loads(open(_run_eval_one(tmp_path, "m", rows, src)).read())
+    text = json.dumps({k: obj[k] for k in ("cross_source_auc", "score_by_source")})
+    assert "NaN" not in text
+    cross = obj["cross_source_auc"]
+    assert cross["bootstrap_n"] == 50 and len(cross["cells"]) == 6
+    # A percentile CI need not contain the point.
+    assert all(0 <= c["roc_auc_ci"][0] <= c["roc_auc_ci"][1] <= 1 for c in cross["cells"])
+
+
+def test_cross_source_single_class_and_missing_sources(tmp_path):
+    out = eval_one._cross_source_auc(_merged([("P", 1, [0.1, 0.2])]), 10, 1)
+    assert out["cells"] == [] and out["negative_sources"] == []
+    # No --sources: both keys null.
+    pairs, src, rows = _fixture(tmp_path)
+    params = tmp_path / "np.model_parameters.json"
+    pq = _write_ml_parquet(tmp_path, rows(pairs, 0.6), _model_parameters(params), "np.parquet")
+    out_json = tmp_path / "np.json"
+    subprocess.run([sys.executable, str(BIN / "eval_one.py"), "--predictions", pq,
+                    "--model_name", "np", "--out", str(out_json), "--model_parameters",
+                    str(params), "--bootstrap_n", "5", "--seed", "1"],
+                   check=True, cwd=BIN, capture_output=True,
+                   env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    obj = json.loads(out_json.read_text())
+    assert obj["cross_source_auc"] is None and obj["score_by_source"] is None
+    with pytest.raises(SystemExit, match="does not exist"):
+        eval_one._per_source_metrics(_preds(rows(pairs, 0.6)), str(tmp_path / "missing.csv"))
+
+
+def test_score_by_source_stats():
+    rng = np.random.default_rng(1)
+    a, b = rng.random(17), rng.random(11)
+    out = eval_one._score_by_source(_merged([("A", 1, a), ("B", 0, b)]))
+    for got, v in ((out["positive"]["A"], a), (out["negative"]["B"], b)):
+        q1, med, q3 = np.quantile(v, [0.25, 0.5, 0.75])
+        assert got == pytest.approx({"n": len(v), "min": v.min(), "q1": q1, "median": med,
+                                     "q3": q3, "max": v.max(), "mean": v.mean()})
+
+
+def test_source_blocks_renderer(tmp_path):
+    rng = np.random.default_rng(2)
+    full = [("P1", 1, rng.random(12)), ("P2", 1, rng.random(12)),
+            ("N1", 0, rng.random(12)), ("N2", 0, rng.random(12))]
+    a = _payload_json(tmp_path, "a", full)
+    # b: no P2 at all, and only 4 N2 negatives.
+    b = _payload_json(tmp_path, "b", [full[0], full[2], ("N2", 0, rng.random(4))])
+    # c: one source pair only, inside the 2 x 2 union grid; no operating point.
+    c = _payload_json(tmp_path, "c", [full[0], full[2]], operating_points=None)
+    out = tmp_path / "rep"
+    out.mkdir()
+    ids = eval_multiqc.write_source_blocks([c, b, a], [], str(out))
+    assert ids == ["combined_cross_source_auc", "combined_cross_source_ci",
+                   "combined_score_by_source"]
+    heat = json.loads((out / "combined_cross_source_auc_mqc.json").read_text())
+    ci = json.loads((out / "combined_cross_source_ci_mqc.json").read_text())
+    assert list(heat["data"]) == ["a", "b", "c"]
+    assert list(heat["data"]["a"])[:4] == ["P1 vs N1", "P1 vs N2", "P2 vs N1", "P2 vs N2"]
+    assert heat["data"]["b"]["P2 vs N1"] is None and heat["data"]["b"]["P1 vs N2"] is None
+    assert ci["data"]["b"]["P2 vs N1"] == "not scored"
+    assert ci["data"]["b"]["P1 vs N2"] == "suppressed · 12+/4− (< 10 of a class)"
+    assert ci["data"]["c"]["P1 vs N1"].endswith("12+/12− (only source pair; = its ROC AUC)")
+    assert heat["data"]["c"]["P1 vs N1"] is not None
+    assert ci["data"]["a"]["P1: mean across eligible negative sources"].endswith("(k=2 cells)")
+    assert ci["data"]["b"]["N2: mean across eligible positive sources"] == "no eligible cell"
+    assert ci["data"]["a"]["P1 vs N1"].count("[") == 1
+    assert heat["pconfig"]["colstops"] == eval_multiqc.AUC_COLSTOPS
+    assert "Primary seed" not in heat["description"]
+    box = json.loads((out / "combined_score_by_source_mqc.json").read_text())
+    assert [d["name"] for d in box["pconfig"]["data_labels"]] == ["a", "b", "c"]
+    assert list(box["data"][1]) == ["P1 (+, n=12)", "N1 (−, n=12)", "N2 (−, n=4)"]
+    assert set(box["data"][0]["P1 (+, n=12)"]) == {"min", "q1", "median", "q3", "max", "mean"}
+    assert "hides the shape" in box["description"]
+    # MultiQC 1.32 re-keys every tab by the first tab's samples when sorting.
+    assert box["pconfig"]["sort_samples"] is False
+
+    # Union 1 x 1: no matrix files (stale ones removed), the note in the box.
+    ids = eval_multiqc.write_source_blocks([c], [], str(out))
+    assert ids == ["combined_score_by_source"]
+    assert not (out / "combined_cross_source_auc_mqc.json").exists()
+    assert not (out / "combined_cross_source_ci_mqc.json").exists()
+    assert "one positive and one negative source" in json.loads(
+        (out / "combined_score_by_source_mqc.json").read_text())["description"]
+
+    # A JSON from before W-11: nothing written, no crash.
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"model_name": "old", "roc_auc": 0.7}))
+    assert eval_multiqc.write_source_blocks([str(legacy)], [], str(out)) == []
+    assert not list(out.glob("*_mqc.json"))
+
+
+def test_auc_colstops_unchanged_after_move():
+    assert combine_eval.AUC_COLSTOPS == [
+        [0.0, "#a50026"], [0.125, "#de3f2e"], [0.25, "#f88e52"], [0.375, "#fdd481"],
+        [0.5, "#fefebd"], [0.625, "#cbe881"], [0.75, "#84ca66"], [0.875, "#2a9f54"],
+        [1.0, "#006837"]]
+
+
+def _dataset_report(monkeypatch, tmp_path, ds, jsons):
+    """eval_multiqc.main() into <tmp>/<ds>/evaluation, without the database
+    profile and the MultiQC run."""
+    out = tmp_path / ds / "evaluation"
+    out.mkdir(parents=True)
+    monkeypatch.setattr(eval_multiqc, "analyse_database", lambda *a, **k: {})
+    monkeypatch.setattr(eval_multiqc, "write_multiqc_json_database_analysis", lambda *a, **k: None)
+    monkeypatch.setattr(eval_multiqc, "run_multiqc", lambda *a, **k: None)
+    monkeypatch.setattr(eval_multiqc, "fix_trailing_punctuation_in_report", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", [
+        "eval_multiqc.py", "--database", str(tmp_path), "--out_dir", str(out),
+        "--db_name", ds, "--test_split", "test_1_1", "--per_model_metrics", *jsons])
+    eval_multiqc.main()
+    return out
+
+
+@pytest.mark.parametrize("order", [None, "ds_b_1_1,ds_a_1_1"])
+def test_cross_source_blocks_through_combine(monkeypatch, tmp_path, order):
+    src, df = _three_by_two(tmp_path)
+    rows = list(df.itertuples(index=False, name=None))
+    reports = []
+    for ds in ("ds_a_1_1", "ds_b_1_1"):
+        js = [_run_eval_one(tmp_path, f"{ds}_{m}", rows, src) for m in ("nn", "rf")]
+        reports.append(str(_dataset_report(monkeypatch, tmp_path, ds, js)))
+    cfg = (Path(reports[0]) / "multiqc_config.yaml").read_text()
+    assert (cfg.index("combined_pr\n") < cfg.index("combined_score_by_source")
+            < cfg.index("combined_cross_source_auc") < cfg.index("combined_cross_source_ci"))
+
+    monkeypatch.setattr(combine_eval, "run_multiqc", lambda *a, **k: None)
+    monkeypatch.setattr(combine_eval, "fix_trailing_punctuation_in_report", lambda *a, **k: None)
+    combined = tmp_path / "combined"
+    monkeypatch.setattr(sys, "argv", ["combine_eval.py", "--reports", *reports,
+                                      "--out_dir", str(combined),
+                                      *(["--mqc_order", order] if order else [])])
+    combine_eval.main()
+    lines = [ln.strip(" -") for ln in
+             (combined / "multiqc_json" / "multiqc_config.yaml").read_text().splitlines()]
+    first, second = ("ds_b_1_1", "ds_a_1_1") if order else ("ds_a_1_1", "ds_b_1_1")
+    cross = [ln for ln in lines if ln.startswith("combined_cross_source_")]
+    assert cross == [f"combined_cross_source_auc_{first}", f"combined_cross_source_ci_{first}",
+                     f"combined_cross_source_auc_{second}", f"combined_cross_source_ci_{second}"]
+    assert not list((combined / "multiqc_json").glob("combined_score_by_source*"))
+    assert (combined / "multiqc_json" / f"combined_cross_source_ci_{first}_mqc.json").exists()

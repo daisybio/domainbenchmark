@@ -42,6 +42,14 @@ SCORE_NOTE = (
     "scores across models."
 )
 
+#: AUC heatmaps (combined report and the W-11 cross-source matrix): diverging,
+#: centred on chance (0.5 sits mid-scale on [0, 1]).
+_div = matplotlib.colormaps["RdYlGn"]
+AUC_COLSTOPS = [
+    [i / 8, "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in _div(i / 8)[:3]))]
+    for i in range(9)
+]
+
 #: D9: a dataset without same-family pairs has hetero = full.
 NO_SELF_PAIRS_FULL = "= full (no same-family pairs)"
 NO_SELF_PAIRS_NA = "n/a — no same-family pairs"

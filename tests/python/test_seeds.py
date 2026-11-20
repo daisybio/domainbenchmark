@@ -8,7 +8,8 @@ import sys
 import numpy as np
 import pytest
 
-from test_eval_audit import DISTINCT_POINTS, _fixture, _run_eval_one, combine_eval, eval_multiqc  # noqa: F401
+from test_eval_audit import (  # noqa: F401
+    DISTINCT_POINTS, _fixture, _merged, _run_eval_one, combine_eval, eval_multiqc, eval_one)
 from eval_multiqc_functions import order_agreement, parse_seeds, seed_means
 
 
@@ -75,6 +76,16 @@ def test_one_seed_report_is_the_unseeded_report(monkeypatch, tmp_path):
 
 def test_two_seeds_mean_sd_and_primary_blocks(monkeypatch, tmp_path):
     jsons = _seeded_jsons(tmp_path)
+    # W-11 panels: a different 2 x 2 source grid per seed.
+    for (m, s), path in jsons.items():
+        rng = np.random.default_rng(s)
+        merged = _merged([(f"P{s}a", 1, rng.random(12)), (f"P{s}b", 1, rng.random(12)),
+                          ("N1", 0, rng.random(12)), ("N2", 0, rng.random(12))])
+        obj = json.loads(open(path).read())
+        obj["cross_source_auc"] = eval_one._cross_source_auc(merged, 10, s)
+        obj["score_by_source"] = eval_one._score_by_source(merged)
+        with open(path, "w") as fh:
+            json.dump(obj, fh)
     # 43 listed first: it is the primary seed although 42 sorts lower.
     out = _run_main(monkeypatch, tmp_path, "two", list(jsons.values()), seeds="43,42")
     primary = _run_main(monkeypatch, tmp_path, "primary",
@@ -122,6 +133,14 @@ def test_two_seeds_mean_sd_and_primary_blocks(monkeypatch, tmp_path):
             == json.loads((primary / "source_accuracy.json").read_text())["models"])
     assert "Primary seed only: seed 43 of 43, 42" in json.loads(
         (out / "combined_pairwise_significance_mqc.json").read_text())["description"]
+
+    for f in ("combined_cross_source_auc_mqc.json", "combined_cross_source_ci_mqc.json",
+              "combined_score_by_source_mqc.json"):
+        block = json.loads((out / f).read_text())
+        assert block["data"] == json.loads((primary / f).read_text())["data"]
+        assert block["data"] != json.loads((other_seed / f).read_text())["data"]
+        assert "Primary seed only: seed 43 of 43, 42" in block["description"]
+    assert "P43a vs N1" in json.loads((out / "combined_cross_source_auc_mqc.json").read_text())["data"][m]
 
     seed_rows = json.loads((out / "seed_metrics.json").read_text())
     assert seed_rows["seeds"] == [43, 42] and len(seed_rows["rows"]) == 4

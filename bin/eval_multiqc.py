@@ -19,6 +19,7 @@ import shutil
 import numpy as np
 from eval_multiqc_functions import (
     AF3_CAVEAT,
+    AUC_COLSTOPS,
     NO_SELF_PAIRS_FULL,
     NO_SELF_PAIRS_NA,
     NO_SKILL_NOTE,
@@ -324,6 +325,13 @@ def write_multiqc_json_database_analysis(db_analysis, outdir, db_name) -> None:
     # See `analyse_interaction_network` in eval_multiqc_functions.py.
 
 
+def primary_seed_note(seeds) -> str:
+    """Note on every block built from the primary seed only; empty with one seed."""
+    if len(seeds or ()) < 2:
+        return ""
+    return f" Primary seed only: seed {seeds[0]} of {', '.join(map(str, seeds))}."
+
+
 def write_multiqc_json_metrics(
     metrics_aucap,
     roc_curves,
@@ -436,7 +444,7 @@ def write_multiqc_json_metrics(
     seed_headers, primary_note, means_note, seeds_desc = {}, "", "", ""
     if seed_sets:
         seeds_txt = ", ".join(map(str, seeds))
-        primary_note = f" Primary seed only: seed {seeds[0]} of {seeds_txt}."
+        primary_note = primary_seed_note(seeds)
         means_note = f" Numbers are means over the training seeds ({seeds_txt})."
         seeds_desc = (
             f"{means_note[:-1]}; the 95% CI is the primary seed's ({seeds[0]}) bootstrap CI (test-set "
@@ -945,6 +953,7 @@ def write_multiqc_config(outdir, enrichment_ids=()) -> str:
     pairwise_blocks = pick(r"_pairwise_significance$")
     seed_blocks = pick(r"_seed_variance$") + pick(r"_order_agreement$")
     coverage_blocks = pick(r"_coverage$")
+    source_blocks = [SOURCE_BLOCKS[k] for k in ("box", "auc", "ci") if SOURCE_BLOCKS[k] in all_ids]
 
     db_blocks = pick(r"database_analysis")
 
@@ -957,6 +966,7 @@ def write_multiqc_config(outdir, enrichment_ids=()) -> str:
         + seed_blocks
         + roc_blocks
         + pr_blocks
+        + source_blocks
         + list(enrichment_ids)
         + db_blocks
     )
@@ -1139,6 +1149,166 @@ def write_source_accuracy_sidecar(
     print(f"[INFO] Wrote {out_path} ({len(models)} models, {len(totals)} sources)")
 
 
+#: W-11 per-dataset block ids: the cross-source AUC heatmap, its CI table and
+#: the per-source score box plot.
+SOURCE_BLOCKS = {
+    "auc": "combined_cross_source_auc",
+    "ci": "combined_cross_source_ci",
+    "box": "combined_score_by_source",
+}
+
+CROSS_SOURCE_DESCRIPTION = (
+    "ROC AUC = probability that a scored positive of source P outranks a scored "
+    "negative of source N (ties count half). Class balance alone does not change it "
+    "when the score distributions of each class are fixed; which pairs a model scored "
+    "and how sources are composed can. Means are unweighted over eligible cells (k in "
+    "the CI table), not a pooled AUC. A negative method near 1.0 against every "
+    "positive source is worth investigating; separation alone cannot show an artefact "
+    "or generalisation. A pair with several sources counts in each. Empty cell = "
+    "suppressed (< 10 of a class) or not scored; see the CI table."
+)
+CROSS_SOURCE_CI_DESCRIPTION = (
+    "Class-stratified bootstrap over scored DDIs, conditional on the trained "
+    "primary-seed model. DDIs sharing a Pfam family are not independent, so intervals "
+    "are narrow for new-family claims. Do not read CI overlap, means or seed SD as a "
+    "significance test."
+)
+SCORE_BOX_DESCRIPTION = (
+    "Box = quartiles, line = median, whiskers = minimum and maximum. A box hides the "
+    "shape of the distribution, e.g. two modes. Compare sources within one model's "
+    "tab, never across tabs. A pair with several sources appears in each of its boxes."
+)
+
+
+def _cross_source_cells(cross, pos, neg) -> tuple:
+    """One model's heatmap row and CI-table row over the union grid `pos` x `neg`."""
+    cells = {(c["positive_source"], c["negative_source"]): c for c in cross.get("cells", [])}
+    heat, text = {}, {}
+    for p in pos:
+        for n in neg:
+            col = f"{p} vs {n}"
+            c = cells.get((p, n))
+            heat[col] = None
+            if c is None:
+                text[col] = "not scored"
+                continue
+            counts = f"{c['n_pos']}+/{c['n_neg']}−"
+            if c["status"] == "suppressed":
+                text[col] = f"suppressed · {counts} (< {cross.get('min_class', 10)} of a class)"
+                continue
+            heat[col] = c["roc_auc"]
+            if c["status"] == "single_pair":
+                text[col] = f"{c['roc_auc']:.3f} · {counts} (only source pair; = its ROC AUC)"
+            elif c.get("roc_auc_ci"):
+                lo, hi = c["roc_auc_ci"]
+                text[col] = f"{c['roc_auc']:.3f} [{lo:.3f}, {hi:.3f}] · {counts}"
+            else:
+                text[col] = f"{c['roc_auc']:.3f} · {counts}"
+    for key, names, other in (("positive_means", pos, "negative"),
+                              ("negative_means", neg, "positive")):
+        for name in names:
+            col = f"{name}: mean across eligible {other} sources"
+            m = cross.get(key, {}).get(name)
+            heat[col] = m["mean"] if m else None
+            if m is None:
+                text[col] = "not scored"
+            elif m["mean"] is None:
+                text[col] = "no eligible cell"
+            else:
+                text[col] = f"{m['mean']:.2f} (k={m['k']} cell{'s' if m['k'] != 1 else ''})"
+    return heat, text
+
+
+def write_source_blocks(primary_paths, seeds, outdir) -> list:
+    """W-11: the cross-source AUC heatmap, its CI table and the per-source score
+    box plot, from the primary seed's eval_one JSONs (`primary_paths`). A JSON
+    without `cross_source_auc` / `score_by_source` contributes nothing. The
+    matrix is omitted when the union grid is 1 x 1 or a class has no source;
+    the box plot's description then says why. Returns the block ids written."""
+    for bid in SOURCE_BLOCKS.values():
+        stale = os.path.join(outdir, f"{bid}_mqc.json")
+        if os.path.exists(stale):
+            os.remove(stale)
+    cross, boxes = {}, {}
+    for path in primary_paths or []:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        if obj.get("cross_source_auc"):
+            cross[obj["model_name"]] = obj["cross_source_auc"]
+        if obj.get("score_by_source"):
+            boxes[obj["model_name"]] = obj["score_by_source"]
+    note = primary_seed_note(seeds)
+    pos = sorted({s for c in cross.values() for s in c.get("positive_sources", [])})
+    neg = sorted({s for c in cross.values() for s in c.get("negative_sources", [])})
+    written = []
+
+    def dump(key, block):
+        bid = SOURCE_BLOCKS[key]
+        block = {"id": bid, **block}
+        block["pconfig"] = {"id": bid, **block["pconfig"]}
+        with open(os.path.join(outdir, f"{bid}_mqc.json"), "w") as f:
+            json.dump(block, f, indent=2)
+        written.append(bid)
+
+    matrix_note = ""
+    if cross and (not pos or not neg):
+        matrix_note = (" No source-pair AUC matrix: single-class split (no "
+                       f"{'positive' if not pos else 'negative'} source).")
+    elif cross and len(pos) == 1 and len(neg) == 1:
+        matrix_note = (
+            " No source-pair AUC matrix: this dataset has one positive and one negative "
+            "source, so the single cell equals the ROC AUC of each model that scored both "
+            "classes, on the primary seed. In a multi-seed run the overview tables show the mean over seeds."
+        )
+    elif cross:
+        rows = {m: _cross_source_cells(cross[m], pos, neg) for m in sorted(cross)}
+        title = "ROC AUC by source pair"
+        dump("auc", {
+            "section_name": title,
+            "description": CROSS_SOURCE_DESCRIPTION + note + " " + SCORE_NOTE,
+            "plot_type": "heatmap",
+            "pconfig": {"title": title, "xlab": "Source pair", "ylab": "Model",
+                        "colstops": AUC_COLSTOPS, "min": 0.0, "max": 1.0,
+                        "decimalPlaces": 3, "display_values": True},
+            "data": {m: heat for m, (heat, _) in rows.items()},
+        })
+        cols = list(next(iter(rows.values()))[1])
+        title = "ROC AUC by source pair — 95 % CI"
+        dump("ci", {
+            "section_name": title,
+            "description": CROSS_SOURCE_CI_DESCRIPTION + note,
+            "plot_type": "table",
+            "pconfig": {"title": title, "col1_header": "Model", "no_violin": True,
+                        "sortRows": False},
+            "headers": {c: {"title": c, "scale": False} for c in cols},
+            "data": {m: text for m, (_, text) in rows.items()},
+        })
+    if boxes:
+        stats = ("min", "q1", "median", "q3", "max", "mean")
+        models = sorted(boxes)
+        data = []
+        for m in models:
+            tab = {}
+            for cls, sign in (("positive", "+"), ("negative", "−")):
+                for source in sorted(boxes[m].get(cls, {})):
+                    st = boxes[m][cls][source]
+                    tab[f"{source} ({sign}, n={st['n']})"] = {k: st[k] for k in stats}
+            data.append(tab)
+        title = "Score distribution by source"
+        dump("box", {
+            "section_name": title,
+            "description": SCORE_BOX_DESCRIPTION + matrix_note + note + " " + SCORE_NOTE,
+            "plot_type": "box",
+            # sort_samples off: MultiQC 1.32 re-keys every tab by the first
+            # tab's samples (KeyError when tabs hold different sources), and
+            # the + then − order is ours.
+            "pconfig": {"title": title, "xlab": "Score", "sort_samples": False,
+                        "data_labels": [{"name": m, "title": m} for m in models]},
+            "data": data,
+        })
+    return written
+
+
 #: W-10 sidecar: the same model's 1:1 vs 1:k comparison, one row per (model,
 #: seed). Like source_accuracy.json, rendered only by combine_eval.py.
 TEST_SET_SHIFT_SIDECAR = "test_set_shift.json"
@@ -1258,6 +1428,9 @@ def main():
         per_model_metrics, args.out_dir, db_name, args.test_split,
         db_id=args.db_id, variant=args.variant,
     )
+
+    # W-11 panels: primary seed only, like the curves.
+    write_source_blocks(per_model_metrics, seeds, args.out_dir)
 
     # W-10: every seed's rows, not only the primary seed's.
     write_test_set_shift_sidecar(

@@ -108,6 +108,30 @@ scored by the same trained model. A database with a single `test.sqlite3`
     resolved on too few validation negatives (`fpr0.01`) or without a
     validation false positive (`universe_prior`). Each model's JSON under
     `per_model/` carries the same numbers as an `operating_points` object.
+  - After the PR curves, three threshold-free source sections, built from the
+    primary seed (each model's JSON carries them as `cross_source_auc` and
+    `score_by_source`, for every seed):
+    - "Score distribution by source": one box per (source, class), one tab per
+      model (sample `<source> (+, n=…)` / `<source> (−, n=…)`). Box =
+      quartiles, whiskers = minimum and maximum; a box hides the shape of the
+      distribution (e.g. two modes). Compare sources within one tab, never
+      across tabs: scores are model-specific rankings.
+    - "ROC AUC by source pair" (heatmap, models × `<P> vs <N>`): the ROC AUC of
+      positive source P's scored DDIs against negative source N's only, then
+      the unweighted mean over each source's eligible cells (not a pooled AUC).
+      A cell with fewer than 10 DDIs of either class is suppressed; a cell for
+      a source the model did not score is blank too.
+    - "ROC AUC by source pair — 95 % CI": per cell `AUC [lo, hi] · n+/n−`
+      from a class-stratified bootstrap, "suppressed · …", "not scored", or
+      the mean's `k` (eligible cells). DDIs sharing a Pfam family are not
+      independent, so the intervals are narrow for new-family claims.
+
+    A DDI with several sources counts in each of them. The two AUC sections
+    are omitted when the dataset has one positive and one negative source
+    (the one cell would equal the ROC AUC of each model that scored both
+    classes; e.g. the default `external_test`, PPIDM_Gold vs hub-depleted
+    INVERSE_PPIDM_Gold) or a
+    single class; the box section's description then says so.
   - With several `--seeds` only: `seed_metrics.json` (one row per (model,
     seed): AUC, AP and both points' status, rates and counts) and two more
     report sections, "Per-seed results" and "ROC AUC order agreement across
@@ -115,8 +139,8 @@ scored by the same trained model. A database with a single `test.sqlite3`
     `Seeds`, `ROC AUC SD`, `PR AP SD`, `ROC AUC min–max` and `<rate> SD` for
     every thresholded rate; a status reads "resolved in k/n seeds", and
     π-precision is shown only if it is defined in every seed. Curves,
-    coverage, by-source rates, pairwise tests and enrichment are the primary
-    (first) seed's.
+    coverage, by-source rates, the source sections, pairwise tests and
+    enrichment are the primary (first) seed's.
   - With `--metadata` only: `enrichment.json`, the enrichment inputs of this
     variant (`observed` reference fit plus one entry per model), which the
     combined report reads, and the "Metadata enrichment" report sections. Each
@@ -175,7 +199,10 @@ runs: it embeds a timestamp, absolute work-dir paths and the MultiQC version.
     `matched_1_1` pool together) present in at least two datasets, each the
     unweighted mean (macro-average) of the per-dataset rates. A single-`test` dataset such
     as `external_test` joins no pooled tab. The `Mean over shown models` bar is
-    the mean of the bars beside it, not an ensemble.
+    the mean of the bars beside it, not an ensemble. Last, each dataset's
+    "ROC AUC by source pair" heatmap and its CI table are copied through,
+    heatmap then CI per dataset in `--mqc_order`; the per-source score box
+    plots stay in the per-dataset reports.
   - `enrichment_data.csv` (with `--metadata` only): the enrichment report's
     tidy export, one row per (dataset, model, target, quantity, feature), with
     the fit's `n`, `status` and `reason`; skipped targets keep a `status` row.

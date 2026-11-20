@@ -179,23 +179,19 @@ def _read_sources(path: str) -> tuple:
     return exploded[["pair", "source", "interaction"]], totals
 
 
-def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
-    """Accuracy per DDI source for one model's predictions.
+def _join_sources(df: pd.DataFrame, sources_path: str) -> tuple:
+    """Join one model's predictions to `<split>_sources.csv`.
 
-    Sources are usually single-class (`3did` is all positive, `sampled_negative`
-    all negative), so accuracy is the only metric that survives for most rows --
-    everything else would either be undefined or degenerate. `n_scored` is
-    reported next to the split's ground-truth `n` so partial coverage (a model
-    that could not score every DDI) is visible instead of silently inflating or
-    deflating the row.
+    Returns ``(preds, merged, totals)``: `preds` one row per scored pair
+    (`pair`, `correct`, `true_interaction`, `score`), `merged` the same rows
+    exploded to one per (pair, source) with the split's `interaction`, and
+    `totals` from `_read_sources`.
 
-    Raises SystemExit when any scored pair has no row in the source table: that
-    is a key-space mismatch between the predictions and the CSVs, and a report
-    built on it is meaningless rather than merely incomplete.
+    Raises SystemExit when the file is missing, when any scored pair has no
+    row in the source table (a key-space mismatch between the predictions and
+    the CSVs, so a report built on it is meaningless rather than merely
+    incomplete), and when a prediction's truth differs from the split's label.
     """
-    if not sources_path:
-        print("[eval_one] no --sources given; skipping per-source metrics")
-        return {}
     # Given but absent is not "no provenance": DDI_EXTRACTION writes this file
     # for every split it extracts, so a miss is a wiring or staging error.
     if not os.path.isfile(sources_path):
@@ -210,6 +206,7 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
                 df["true_interaction"].to_numpy() == df["predicted_interaction"].to_numpy()
             ).astype(np.int8),
             "true_interaction": df["true_interaction"].to_numpy(),
+            "score": df["predicted_probability"].to_numpy(),
         }
     )
 
@@ -255,6 +252,26 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
             f"scored domain pairs carry a true_interaction that differs from "
             f"their label in {sources_path}. e.g. {_examples(wrong)}"
         )
+    return preds, merged, totals
+
+
+def _per_source_metrics(df: pd.DataFrame, sources_path, joined: tuple = None) -> dict:
+    """Accuracy per DDI source for one model's predictions.
+
+    Sources are usually single-class (`3did` is all positive, `sampled_negative`
+    all negative), so accuracy is the only metric that survives for most rows --
+    everything else would either be undefined or degenerate. `n_scored` is
+    reported next to the split's ground-truth `n` so partial coverage (a model
+    that could not score every DDI) is visible instead of silently inflating or
+    deflating the row.
+
+    `joined` is `_join_sources(df, sources_path)` when the caller already has
+    it; the join's failures (see there) apply either way.
+    """
+    if not sources_path:
+        print("[eval_one] no --sources given; skipping per-source metrics")
+        return {}
+    preds, merged, totals = joined or _join_sources(df, sources_path)
 
     per_source = {}
     for source, grp in merged.groupby("source", sort=True):
@@ -292,6 +309,88 @@ def _per_source_metrics(df: pd.DataFrame, sources_path) -> dict:
         per_source.pop(UNKNOWN_SOURCE, None)
 
     return per_source
+
+
+def _stratified_auc_ci(pos, neg, n: int, seed: int) -> list:
+    """95% percentile CI of ROC AUC from a class-stratified bootstrap: every
+    resample draws len(pos) positives and len(neg) negatives with replacement
+    within their class, so no draw is single-class."""
+    rng = np.random.default_rng(seed)
+    y = np.r_[np.ones(len(pos), dtype=np.int8), np.zeros(len(neg), dtype=np.int8)]
+    samples = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        s = np.r_[pos[rng.integers(0, len(pos), len(pos))], neg[rng.integers(0, len(neg), len(neg))]]
+        samples[i] = roc_auc_score(y, s)
+    return [float(np.quantile(samples, 0.025)), float(np.quantile(samples, 0.975))]
+
+
+def _cross_source_auc(merged: pd.DataFrame, bootstrap_n: int, seed: int) -> dict:
+    """W-11: ROC AUC of each positive source's scored pairs against each
+    negative source's, from `_join_sources`' exploded frame (a pair with
+    several sources counts in each of their cells).
+
+    A cell with fewer than MIN_STRATUM_CLASS of either class is suppressed
+    (`roc_auc` null), one-pair models included. With exactly one positive and
+    one negative source the one (eligible) cell is the model's own ROC AUC,
+    so it gets no bootstrap (`single_pair`). Means are unweighted over a source's eligible cells, with
+    their count `k`. Unavailable values are null, never NaN.
+    """
+    y = merged["true_interaction"].to_numpy()
+    src = merged["source"].to_numpy()
+    score = merged["score"].to_numpy().astype(np.float64)
+    pos_sources = sorted(set(src[y == 1]))
+    neg_sources = sorted(set(src[y == 0]))
+    single = len(pos_sources) == 1 and len(neg_sources) == 1
+    cells = []
+    for p_src in pos_sources:
+        for n_src in neg_sources:
+            ps = score[(y == 1) & (src == p_src)]
+            ns = score[(y == 0) & (src == n_src)]
+            cell = {"positive_source": p_src, "negative_source": n_src,
+                    "n_pos": int(len(ps)), "n_neg": int(len(ns)),
+                    "status": "ok", "roc_auc": None, "roc_auc_ci": None}
+            y_cell = np.r_[np.ones(len(ps)), np.zeros(len(ns))]
+            if min(len(ps), len(ns)) < MIN_STRATUM_CLASS:
+                cell["status"] = "suppressed"
+            elif single:
+                cell.update(status="single_pair", roc_auc=float(roc_auc_score(y_cell, np.r_[ps, ns])))
+            else:
+                cell["roc_auc"] = float(roc_auc_score(y_cell, np.r_[ps, ns]))
+                if bootstrap_n > 0:
+                    cell["roc_auc_ci"] = _stratified_auc_ci(ps, ns, bootstrap_n, seed)
+            cells.append(cell)
+
+    def means(key, sources):
+        out = {}
+        for name in sources:
+            vals = [c["roc_auc"] for c in cells if c[key] == name and c["roc_auc"] is not None]
+            out[name] = {"mean": float(np.mean(vals)) if vals else None, "k": len(vals)}
+        return out
+
+    return {
+        "min_class": MIN_STRATUM_CLASS,
+        "single_pair": single,
+        "bootstrap_n": int(bootstrap_n),
+        "positive_sources": pos_sources,
+        "negative_sources": neg_sources,
+        "cells": cells,
+        "positive_means": means("positive_source", pos_sources),
+        "negative_means": means("negative_source", neg_sources),
+    }
+
+
+def _score_by_source(merged: pd.DataFrame) -> dict:
+    """W-11: per (class, source) the scored pairs' score quartiles, min, max
+    and mean -- the stats a MultiQC box plot consumes."""
+    out = {"positive": {}, "negative": {}}
+    for (label, source), grp in merged.groupby(["true_interaction", "source"], sort=True):
+        v = grp["score"].to_numpy().astype(np.float64)
+        q1, med, q3 = np.quantile(v, [0.25, 0.5, 0.75])
+        out["positive" if label == 1 else "negative"][source] = {
+            "n": int(len(v)), "min": float(v.min()), "q1": float(q1), "median": float(med),
+            "q3": float(q3), "max": float(v.max()), "mean": float(v.mean()),
+        }
+    return out
 
 
 def _drop_duplicate_pairs(df: pd.DataFrame, path: str) -> pd.DataFrame:
@@ -846,8 +945,10 @@ def main():
     p.add_argument(
         "--sources", default=None,
         help="`<split>_sources.csv` from DDI_EXTRACTION (domain pair -> comma-joined "
-             "provenance list). Enables the per-source accuracy block; skipped when "
-             "not given, fatal when given but missing.",
+             "provenance list). Enables the per-source accuracy block, the "
+             "cross-source AUC matrix (`cross_source_auc`) and the per-source score "
+             "distributions (`score_by_source`); skipped when not given (both keys "
+             "null), fatal when given but missing.",
     )
     p.add_argument(
         "--model_parameters", required=True,
@@ -939,6 +1040,7 @@ def main():
                                           args.max_curve_points)
 
     strata, self_indicator_auc = _strata_metrics(df, args.bootstrap_n, args.seed)
+    joined = _join_sources(df, args.sources) if args.sources else None
 
     payload = {
         "model_name": args.model_name,
@@ -977,7 +1079,11 @@ def main():
         # Per-DDI-source accuracy. Computed here because this is the only stage
         # that holds the predictions themselves -- `eval_multiqc.py` sees only
         # these sidecars (the scatter that fixed the 300 GB evaluation OOM).
-        "per_source": _per_source_metrics(df, args.sources),
+        "per_source": _per_source_metrics(df, args.sources, joined),
+        # W-11 panels; threshold-free, so independent of `operating_points`.
+        "cross_source_auc": (_cross_source_auc(joined[1], args.bootstrap_n, args.seed)
+                             if joined else None),
+        "score_by_source": _score_by_source(joined[1]) if joined else None,
     }
     if args.reference_predictions:
         # Validated exactly like the target: same thresholds (one model task
