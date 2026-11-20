@@ -52,6 +52,18 @@ def test_aggregate_rejects_nonbinary_before_cast():
         ml._aggregate_to_ddi_level([P], [257], [0.5])  # int8 would make it 1
 
 
+# D-W15-1: a constant float32 score must give equal DDI scores whatever the
+# instance count; the float32 group mean of 23 copies drifted by an ulp.
+def test_aggregate_constant_score_is_exact():
+    from sklearn.metrics import roc_auc_score
+    Q = ("PF00003", "PF00004")
+    s = np.float32(0.999)  # HEAD: positive DDI mean 0.99900007, AUC 1.0
+    agg = ml._aggregate_to_ddi_level([P] + [Q] * 23, [0] + [1] * 23, [s] * 24)
+    assert agg["predicted_probability"].dtype == np.float32
+    assert (agg["predicted_probability"] == s).all()
+    assert roc_auc_score(agg["true_interaction"], agg["predicted_probability"]) == 0.5
+
+
 def _write_split(root: Path, ddi_rows, instances=True):
     (root / "DDI").mkdir(exist_ok=True)
     (root / "features").mkdir(exist_ok=True)

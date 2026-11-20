@@ -273,6 +273,11 @@ def _aggregate_to_ddi_level(ddi_pairs, y_true, y_score):
             f"scores are NaN/inf (first: {first.domain_a}/{first.domain_b}). "
             "The model produced non-finite output; refusing to average it away."
         )
+    # Mean in float64 (D-W15-1): pandas' float32 group mean of k identical
+    # scores often misses the score by an ulp, which split constant-score DDIs
+    # by instance count and could turn a tie into AUC 0. Scores stay float32
+    # in and out, so thresholds still compare against the same dtype.
+    df["predicted_probability"] = df["predicted_probability"].astype(np.float64)
     # sort=False: row order is first-appearance order over the *sorted*
     # `labeled_domain_pairs`, so it is a function of the data and not of
     # dict iteration -- see the note on set ordering in load_embedding_data.
@@ -282,6 +287,7 @@ def _aggregate_to_ddi_level(ddi_pairs, y_true, y_score):
         n_labels=("true_interaction", "nunique"),
         predicted_probability=("predicted_probability", "mean"),
     ).reset_index()
+    agg["predicted_probability"] = agg["predicted_probability"].astype(np.float32)
     conflicting = agg[agg["n_labels"] > 1]
     if len(conflicting):
         raise ValueError(
