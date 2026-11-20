@@ -9,7 +9,7 @@ dir=${1:-$(mktemp -d)}
 mkdir -p "$dir" && cd "$dir"
 nextflow run "$repo" -profile test -stub-run --outdir results -ansi-log false > run1.log
 nextflow run "$repo" -profile test -stub-run --outdir results -ansi-log false -resume \
-    --machine_learning_features aacomp,dummy,esm3_embeddings,aaencode > run2.log
+    --machine_learning_features aacomp,identity,esm3_embeddings,aaencode > run2.log
 # Model tasks submitted in the resumed run, by combo (tag ends in _<combo>).
 rerun=$(grep -E ':(NEURAL_NETWORK|RANDOM_FOREST|SVM) \(' run2.log | grep -oE '\([^)]*\)' | sort -u)
 bad=$(echo "$rerun" | grep -vE '_(aaencode|all|all_seq)\)$' || true)
@@ -18,4 +18,14 @@ if [ -z "$rerun" ] || [ -n "$bad" ]; then
     echo "$rerun" >&2
     exit 1
 fi
-echo "OK: re-ran only $(echo "$rerun" | wc -l) aaencode/_all/_all_seq model tasks"
+# The degree baseline reads only the DDI CSVs: a new feature must not re-run it
+# (the log lists submitted tasks only, like the model check above).
+if grep -E ':DEGREE_BASELINE \(' run2.log; then
+    echo "FAIL: DEGREE_BASELINE re-ran after appending a feature" >&2
+    exit 1
+fi
+if ! grep -qE ':DEGREE_BASELINE \(' run1.log; then
+    echo "FAIL: no DEGREE_BASELINE task in the first run" >&2
+    exit 1
+fi
+echo "OK: re-ran only $(echo "$rerun" | wc -l) aaencode/_all/_all_seq model tasks; DEGREE_BASELINE cached"

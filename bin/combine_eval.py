@@ -18,6 +18,8 @@ from eval_multiqc_functions import (
     AUC_COLSTOPS,
     NO_SKILL_NOTE,
     SCORE_NOTE,
+    BASELINE_NOTE,
+    RANKING_ONLY_NOTE,
     is_retired_block,
     model_of_curve_label,
     no_skill_series,
@@ -1135,7 +1137,8 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None, eval
         "model_performance_heatmap_roc_mqc.json",
         stops=AUC_COLSTOPS,
         description="Colour diverges at 0.5 (chance). Each model is scored on "
-        "its own pairs; n and prevalence are in the CI table below. " + SCORE_NOTE,
+        "its own pairs; n and prevalence are in the CI table below. " + SCORE_NOTE
+        + " " + BASELINE_NOTE,
     )
     _write_ci_table(
         "model_performance_heatmap_roc_ci",
@@ -1235,7 +1238,7 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None, eval
             "Test TPR at validation FPR ≤ 0.01",
             _rows(tpr),
             "model_performance_heatmap_tpr_fpr01_mqc.json",
-            description=TPR_DESCRIPTION,
+            description=TPR_DESCRIPTION + " " + RANKING_ONLY_NOTE,
             caveat=struct_caveat,
         )
         _write_ci_table(
@@ -1365,7 +1368,9 @@ def write_test_set_shift_blocks(sidecars, outdir, dataset_order=None) -> list:
             }
             for key, name in SHIFT_METRICS:
                 e = m[key]
-                if key == "fpr":
+                if key == "fpr" and row["fp"] is None:  # ranking-only baseline
+                    cells["FPR 1:1 (FP/neg)"] = cells["FPR 1:k (FP/neg)"] = f"n/a ({e['reason']})"
+                elif key == "fpr":
                     cells["FPR 1:1 (FP/neg)"] = f"{_fmt(e['ref'])} ({row['fp_ref']}/{row['n_ref_neg']})"
                     cells["FPR 1:k (FP/neg)"] = f"{_fmt(e['target'])} ({row['fp']}/{row['n_neg']})"
                 else:

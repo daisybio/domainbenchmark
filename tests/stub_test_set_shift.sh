@@ -61,6 +61,10 @@ for r in one + two:
             fail.append(f"{r['name']}: reference -> {ref}, target -> {tgt}")
 if not n_target:
     fail.append("no 1:10 EVAL_ONE task")
+# W-15: the ranking-only baseline stages its own same-seed 1:1 parquet too
+# (checked above with every other target task).
+if not any("_uniform_1_10_degree_baseline" in r["name"] for r in one + two):
+    fail.append("no 1:10 EVAL_ONE task for degree_baseline")
 status = {r["hash"]: r["status"] for r in two}
 fail += [f"not reused: {r['name']} {r['hash']} -> {status.get(r['hash'], 'absent')}"
          for r in one if status.get(r["hash"]) != "CACHED"]

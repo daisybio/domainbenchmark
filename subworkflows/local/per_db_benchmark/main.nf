@@ -26,6 +26,7 @@ include { NEURAL_NETWORK                                } from '../../../modules
 include { RANDOM_FOREST                                 } from '../../../modules/local/random_forest/main.nf'
 include { SVM                                           } from '../../../modules/local/svm/main.nf'
 include { GRAPH_MODEL                                   } from '../../../modules/local/graph_model/main.nf'
+include { DEGREE_BASELINE                               } from '../../../modules/local/degree_baseline/main.nf'
 include { EVAL_ONE; EVALUATION                          } from '../../../modules/local/evaluation/main.nf'
 include { VERIFY_EMBEDDINGS                             } from '../../../modules/local/verify_embeddings/main.nf'
 include { METADATA; ENRICHMENT                          } from '../../../modules/local/enrichment/main.nf'
@@ -166,8 +167,13 @@ workflow PER_DB_BENCHMARK {
         // seed: they are extracted once per seed, every other encoder once
         // with the primary seed. A new sampling encoder must be added here, or
         // every seed silently reuses the primary seed's vectors (CLAUDE.md,
-        // "Deriving per item beats drawing in a loop").
-        def seeded_features      = ['dummy']
+        // "Deriving per item beats drawing in a loop"). None draws today
+        // (`identity` replaced the random `dummy`); the mechanism stays.
+        def seeded_features      = []
+        // Encoders built against a vocabulary of the database's train +
+        // validation families: FEATURE_EXTRACTION_ONE stages both sqlite files
+        // for them as inputs of their own (extract_features.py --vocabulary_db).
+        def vocabulary_features  = ['identity']
 
         def all_ml_models        = csvToList(params.machine_learning_models)
         def ml_model_names       = all_ml_models.findAll { !skip_features.contains(it) }
@@ -213,8 +219,8 @@ workflow PER_DB_BENCHMARK {
         def graph_model_names    = all_graph_models.findAll { !skip_features.contains(it) }
 
         // One run per feature (singleton) plus two concatenations, each built
-        // when it holds >= 2 features. `dummy` is a noise control, so it gets
-        // its singleton run but joins neither.
+        // when it holds >= 2 features. `identity` is a reference (what family
+        // identity alone explains), so it gets its singleton run but joins neither.
         //   all     -- every other feature, structure ones included.
         //   all_seq -- sequence features only: no structure feature and no
         //              structure-informed embedding (params.structure_informed_features),
@@ -224,7 +230,7 @@ workflow PER_DB_BENCHMARK {
         // directory, task tag and report entry, so it must be unique.
         def structure_informed = csvToList(params.structure_informed_features)
         def feature_combos = ml_features.collect { [id: it, features: [it]] }
-        def all_combo      = ml_features.findAll { it != 'dummy' }
+        def all_combo      = ml_features.findAll { it != 'identity' }
         def all_seq_combo  = all_combo.findAll { !structure_features.contains(it) && !structure_informed.contains(it) }
         if (all_combo.size() >= 2) feature_combos << [id: 'all', features: all_combo]
         if (all_seq_combo.size() >= 2 && all_seq_combo != all_combo) feature_combos << [id: 'all_seq', features: all_seq_combo]
@@ -238,10 +244,13 @@ workflow PER_DB_BENCHMARK {
         // EVALUATION group below emit as soon as its own models are done
         // instead of waiting for the slowest model of every database.
         // ENRICHMENT sees the primary seed's predictions only, so its group
-        // has one prediction per model; EVAL_ONE's has one per (ML model, seed).
+        // has one prediction per model; EVAL_ONE's has one per (ML model, seed)
+        // plus one per seed for the degree baseline, which ENRICHMENT never
+        // sees (ranking-only, W-15): (M + 1) x S and M.
         def ml_models_per_variant = feature_combos.size() * ((nn_enabled ? 1 : 0) + (rf_enabled ? 1 : 0) + (svm_enabled ? 1 : 0))
         def models_per_variant = ml_models_per_variant + graph_model_names.size()
-        def evals_per_variant  = ml_models_per_variant * seeds.size() + graph_model_names.size()
+        def evals_per_variant  = (ml_models_per_variant + 1) * seeds.size() + graph_model_names.size()
+        // The guard counts real models only: the baseline alone is no benchmark.
         if (models_per_variant == 0) {
             error(
                 "Nothing to benchmark: no ML model, feature or graph model is left after " +
@@ -268,7 +277,8 @@ workflow PER_DB_BENCHMARK {
             def seeded = seeded_features.contains(name)
             [name: name, module: v ? v.module : name, params: v ? v.params : [:],
              structure: structure_features.contains(name),
-             seeded: seeded, seeds: seeded ? seeds : [primary_seed]]
+             seeded: seeded, seeds: seeded ? seeds : [primary_seed],
+             vocabulary: vocabulary_features.contains(name)]
         }
         def structures_file = structure_features ? structuresFile(structure_features) : null
 
@@ -348,7 +358,8 @@ workflow PER_DB_BENCHMARK {
                 def files = (extracted ?: []) + (published ?: []).collect { [null, it] }
                 tuple(db_id, files.toSorted { a, b -> (a[1].name <=> b[1].name) ?: ((a[0] == null ? -1 : a[0]) <=> (b[0] == null ? -1 : b[0])) })
             }
-        // emits: tuple(db_id, [[null, aacomp__train.h5], [42, dummy__train.h5], ..., [null, esm3_embeddings.h5], ...])
+        // emits: tuple(db_id, [[null, aacomp__train.h5], [null, identity__train.h5], ..., [null, esm3_embeddings.h5], ...])
+        // (a seeded feature's files would carry their seed instead of null)
 
         // Key DDI outputs by db_id so we can join with feature_files_per_db.
         // Joined on PREFLIGHT: every ML input is built from this channel, so
@@ -441,6 +452,28 @@ workflow PER_DB_BENCHMARK {
         GRAPH_MODEL(graph_input_ch)
 
         // ---------------------------------------------------------------
+        // Degree baseline (W-15): deg(A) x deg(B) from train's positives, a
+        // model-free ranking reference on every test split. Per seed (D-W15-2)
+        // so it sits in every seed's EVAL_ONE group like a model; the scores
+        // are the same, only the bootstrap differs.
+        // ---------------------------------------------------------------
+        DEGREE_BASELINE(
+            ddi_keyed
+                .combine(Channel.fromList(seeds))
+                .map { _id, meta, ddi_dir, seed ->
+                    def m = [
+                        id          : "${meta.id}_degree_baseline",
+                        db          : meta.db,
+                        model       : 'degree_baseline',
+                        tests       : meta.tests,
+                        seed        : seed,
+                        ranking_only: true
+                    ]
+                    tuple(m, ddi_dir)
+                }
+        )
+
+        // ---------------------------------------------------------------
         // Per-prediction evaluation (scatter)
         //
         // Each model emits one `predictions_<variant>.parquet` per test split
@@ -464,6 +497,8 @@ workflow PER_DB_BENCHMARK {
             .mix(SVM.out.predictions
                 .join(SVM.out.model.map(params_file), failOnMismatch: true, failOnDuplicate: true))
             .mix(GRAPH_MODEL.out.predictions)
+            // Ranking-only: no model_parameters.json to stage.
+            .mix(DEGREE_BASELINE.out.predictions.map { m, pred -> tuple(m, pred, []) })
             .flatMap { meta, pred, model_params ->
                 def files = pred instanceof java.util.List ? pred : [pred]
                 files.collect { f ->
@@ -484,7 +519,8 @@ workflow PER_DB_BENCHMARK {
                         model    : model_name,
                         // The model's seed: EVAL_ONE bootstraps with it.
                         seed     : meta.seed
-                    ]
+                    ] + (meta.ranking_only ? [ranking_only: true] : [:])
+                    // (only when set, so every model's meta and task hash stays as it was)
                     // W-10: the 1:1 variant this 1:k one is compared against
                     // (null otherwise). Kept out of m_eval so ENRICHMENT's
                     // meta, and with it its task hash, stays as it was.
@@ -496,7 +532,11 @@ workflow PER_DB_BENCHMARK {
                     tuple(m_eval, pf, model_params, ref)
                 }
             }
-        all_predictions_ch = scored_ch.map { m, pf, _p, _r -> tuple(m, pf) }
+        // ENRICHMENT's input: models only. The baseline's scores are products,
+        // not probabilities, and `error = 1 - p` would be meaningless (W-15).
+        all_predictions_ch = scored_ch
+            .filter { m, _pf, _p, _r -> !m.ranking_only }
+            .map { m, pf, _p, _r -> tuple(m, pf) }
 
         // W-10: a 1:k target also gets its 1:1 reference parquet -- from the
         // same model task (one task writes every variant), so same model and
@@ -600,6 +640,9 @@ workflow PER_DB_BENCHMARK {
             .map { key, meta, db_path, jsons ->
                 if (meta == null || jsons == null) {
                     error("No predictions reached evaluation for ${key}: every model for this test split failed or was skipped.")
+                }
+                if (jsons.every { it.name.startsWith('degree_baseline.seed') }) {
+                    error("Only the ranking-only baseline reached evaluation for ${key}: every model failed.")
                 }
                 tuple(key, meta, db_path, jsons)
             }

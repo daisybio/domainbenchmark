@@ -12,7 +12,8 @@ process EVAL_ONE {
 
     input:
         // model_params: the model's model_parameters.json (validation
-        // operating points), reported beside the realised test rates.
+        // operating points), reported beside the realised test rates; [] for
+        // a ranking-only prediction (meta.ranking_only, the degree baseline).
         // reference: W-10, the same model's 1:1 parquet when this is a 1:k
         // test set (meta.reference_variant), else [] -- nothing staged.
         tuple val(meta), path(predictions), path(ddi_dir), path(model_params, stageAs: 'model_parameters.json'), path(reference, stageAs: 'reference/*')
@@ -31,6 +32,15 @@ process EVAL_ONE {
             error("EVAL_ONE ${meta.id}: no test split for variant '${meta.variant}' of ${meta.db}; per-source metrics would be skipped.")
         }
         def sources_arg = "--sources ${ddi_dir}/${meta.split}_sources.csv"
+        // A ranking-only prediction (the degree baseline, W-15) has no
+        // model_parameters.json and no operating points; a model always has.
+        if (meta.ranking_only && model_params) {
+            error("EVAL_ONE ${meta.id}: a ranking-only prediction staged a model_parameters.json.")
+        }
+        if (!meta.ranking_only && !model_params) {
+            error("EVAL_ONE ${meta.id}: no model_parameters.json staged for a model's prediction.")
+        }
+        def points_arg = meta.ranking_only ? '--ranking_only' : '--model_parameters model_parameters.json'
         def reference_arg = ''
         if (meta.reference_variant) {
             if (!reference || !meta.reference_split) {
@@ -45,7 +55,7 @@ process EVAL_ONE {
             --predictions ${predictions} \\
             --model_name ${meta.model} \\
             ${sources_arg} \\
-            --model_parameters model_parameters.json \\
+            ${points_arg} \\
             ${reference_arg} \\
             --seed ${meta.seed} \\
             --out per_model/${meta.model}.seed${meta.seed}.json

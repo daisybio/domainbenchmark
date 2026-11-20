@@ -8,6 +8,7 @@ base class that neural_network.py and random_forest.py extend.
 import argparse
 import collections
 import gc
+import importlib
 import json
 import math
 import random
@@ -46,23 +47,83 @@ _LOAD_CACHE_MAX = 1
 _load_cache: "collections.OrderedDict" = collections.OrderedDict()
 
 
-# (features dir, feature name) -> (vector width, split it was first seen on). Each load infers
-# widths from its own split's files, so without this a feature extracted at
-# width 2 on train and 1 on validation (beside one going 1 -> 2) loads both
-# splits at the same total width and silently shifts columns. Survives
+# (features dir, feature name) -> (vector width, vocabulary sha1 or None,
+# split it was first seen on). Each load infers widths from its own split's
+# files, so without this a feature extracted at width 2 on train and 1 on
+# validation (beside one going 1 -> 2) loads both splits at the same total
+# width and silently shifts columns. A vocabulary encoder (identity) can keep
+# its width and still change what every column means, hence the sha1. Survives
 # clear_load_cache(): it is a contract across every split of one process.
 _feature_widths: dict = {}
 
 
-def _check_feature_widths(features_path, names, widths, dataset) -> None:
+def _check_feature_widths(features_path, names, widths, dataset, digests=None) -> None:
+    digests = digests or {}
     for name, width in zip(names, widths):
-        seen = _feature_widths.setdefault((str(Path(features_path).resolve()), name), (width, dataset))
+        digest = digests.get(name)
+        seen = _feature_widths.setdefault((str(Path(features_path).resolve()), name), (width, digest, dataset))
         if seen[0] != width:
             raise ValueError(
                 f"Feature '{name}' has width {width} on split '{dataset}' but "
-                f"{seen[0]} on split '{seen[1]}'. Every split of one feature "
+                f"{seen[0]} on split '{seen[2]}'. Every split of one feature "
                 "must have the same vector width."
             )
+        if seen[1] != digest:
+            raise ValueError(
+                f"Feature '{name}' has vocabulary {digest} on split '{dataset}' but "
+                f"{seen[1]} on split '{seen[2]}'. Every split must be encoded "
+                "against the same vocabulary."
+            )
+
+
+def declares_vocabulary(feature: str) -> bool:
+    """Whether `bin/features/<feature>.py` declares VOCABULARY_SPLITS (identity)."""
+    try:
+        module = importlib.import_module(f"features.{feature}")
+    except ImportError:
+        return False  # a published feature has no encoder module
+    return hasattr(module, "VOCABULARY_SPLITS")
+
+
+def vocabulary_digest(h5, feature: str):
+    """The file's `vocabulary_sha1`, or None for a feature without a vocabulary.
+
+    A vocabulary feature's file must be interaction layout and carry the sha1
+    and size, or it fails naming the file: without them a test file built from
+    another vocabulary of the same width would load as if it fitted.
+    """
+    digest = h5.attrs.get("vocabulary_sha1")
+    if declares_vocabulary(feature) or digest is not None:
+        missing = [a for a in ("vocabulary_sha1", "vocabulary_size") if a not in h5.attrs]
+        if missing or h5.attrs.get("layout") != "interaction":
+            raise ValueError(
+                f"{h5.filename}: '{feature}' is a vocabulary encoding and needs "
+                f"layout='interaction', vocabulary_sha1 and vocabulary_size "
+                f"(missing {missing or 'none'}, layout {h5.attrs.get('layout')!r}). Re-extract it."
+            )
+        return str(digest)
+    return None
+
+
+def feature_digests(features_path: Path, features, dataset: str) -> dict:
+    """{feature: vocabulary sha1} of the split's files, vocabulary features only."""
+    out = {}
+    for feature in features:
+        with h5py.File(resolve_feature_file(features_path, feature, dataset), "r") as h5:
+            digest = vocabulary_digest(h5, feature)
+        if digest is not None:
+            out[feature] = digest
+    return out
+
+
+def check_feature_digests(saved: dict, found: dict, dataset: str, source) -> None:
+    """Fail unless a split's vocabulary digests equal the model's `feature_digests`."""
+    if saved != found:
+        raise ValueError(
+            f"{dataset}: vocabulary digests {found} do not match the model's "
+            f"feature_digests {saved} (from {source}). The test files were "
+            "encoded against another vocabulary than the model was trained on."
+        )
 
 
 def clear_load_cache() -> None:
@@ -634,6 +695,7 @@ def load_embedding_data(
         domain_encoding_names = []
         interaction_encoding_files = []
         interaction_encoding_names = []
+        file_digests = {}
         for feature in features:
             embeddings_file = resolve_feature_file(features_path, feature, dataset)
             print(f"Loading feature file: {embeddings_file}")
@@ -648,6 +710,9 @@ def load_embedding_data(
                     file=sys.stderr,
                 )
                 layout = "interaction"
+            digest = vocabulary_digest(embeddings_file, feature)
+            if digest is not None:
+                file_digests[feature] = digest
             if layout == "interaction":
                 interaction_encoding_files.append(embeddings_file)
                 interaction_encoding_names.append(feature)
@@ -833,7 +898,13 @@ def load_embedding_data(
             for f in interaction_encoding_files
         ]
         _check_feature_widths(features_path, domain_encoding_names, domain_widths, dataset)
-        _check_feature_widths(features_path, interaction_encoding_names, interaction_widths, dataset)
+        for name, f, width in zip(interaction_encoding_names, interaction_encoding_files, interaction_widths):
+            if name in file_digests and int(f.attrs["vocabulary_size"]) != width:
+                raise ValueError(
+                    f"{f.filename}: vocabulary_size {int(f.attrs['vocabulary_size'])} "
+                    f"!= vector width {width}."
+                )
+        _check_feature_widths(features_path, interaction_encoding_names, interaction_widths, dataset, file_digests)
         n_cols = 2 * sum(domain_widths) + sum(interaction_widths)
 
         # Exact size: non-finite rows were already filtered out of `plan`, so
@@ -1145,9 +1216,10 @@ class DDIModelTrainer(ABC):
                 "Pass exactly the saved list, in order."
             )
         thresholds = read_thresholds(model_parameters, model_json_path)
-        self.predict(args, classifier, thresholds)
+        self.predict(args, classifier, thresholds,
+                     model_parameters.get("feature_digests", {}), model_json_path)
 
-    def predict(self, args, classifier, thresholds):
+    def predict(self, args, classifier, thresholds, saved_digests=None, source=None):
         """Predict on every test split with the one trained model.
 
         Every test split is scored by the same model and the same two
@@ -1163,6 +1235,10 @@ class DDIModelTrainer(ABC):
         for test_split in args.test_splits:
             variant = variant_of(test_split)
             print(f"Predicting on test data ({test_split})...")
+            # The vocabulary the model was trained on, not just the width.
+            check_feature_digests(
+                saved_digests or {}, feature_digests(args.features_path, args.features, test_split),
+                test_split, source)
             x_test, y_test, ddi_pairs = load_embedding_data(
                 args.features_path, args.features, args.ddi_path, test_split,
                 balance_classes=False, return_ddi_pairs=True, seed=args.seed,
@@ -1364,6 +1440,7 @@ class DDIModelTrainer(ABC):
         print(f"\nConfusion Matrix (DDI-level, {PRIMARY_POINT}):\n\n{confusion_matrix}\n")
 
         print("Saving the model...")
+        digests = feature_digests(args.features_path, args.features, "train")
         args.out_model_dir.mkdir(parents=True, exist_ok=True)
         self._save_model(classifier, args.out_model_dir / self.MODEL_FILE)
         params_path = args.out_model_dir / "model_parameters.json"
@@ -1380,6 +1457,9 @@ class DDIModelTrainer(ABC):
                     "selection": selection,
                     "primary": PRIMARY_POINT,
                     "thresholds": thresholds,
+                    # Only when a feature has a vocabulary (identity), so every
+                    # other model's file is unchanged.
+                    **({"feature_digests": digests} if digests else {}),
                 },
                 f,
                 indent=4,

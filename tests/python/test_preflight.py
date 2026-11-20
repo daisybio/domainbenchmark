@@ -28,8 +28,8 @@ ESM3 = DATA / "embeddings" / "esm3_domain_embeddings.h5"
 STRUCTURES = DATA / "structures" / "structures.h5"
 METADATA = DATA / "metadata"
 # The test profile's features and combos, as PER_DB_BENCHMARK builds them.
-FEATURES = ["aacomp", "dummy", "esm3_embeddings", "sasa_residue", "k_closest_distance_5k"]
-ALL = [f for f in FEATURES if f != "dummy"]
+FEATURES = ["aacomp", "identity", "esm3_embeddings", "sasa_residue", "k_closest_distance_5k"]
+ALL = [f for f in FEATURES if f != "identity"]
 
 
 @pytest.fixture(autouse=True)
@@ -51,7 +51,7 @@ def run(tmp_path, db_dir=DB_DIR, esm3=ESM3, structures=STRUCTURES, metadata=META
         "--db-dir", str(db_dir), "--report", str(report),
         *[a for f in FEATURES for a in ("--combo", f)], "--combo", ",".join(ALL),
         "--published", f"esm3_embeddings={esm3}",
-        "--extracted", "aacomp=aacomp", "--extracted", "dummy=dummy",
+        "--extracted", "aacomp=aacomp", "--extracted", "identity=identity",
         "--structure", "sasa_residue=sasa_residue",
         "--structure", "k_closest_distance_5k=k_closest_distance",
         "--structures", str(structures), "--metadata", str(metadata), *extra,

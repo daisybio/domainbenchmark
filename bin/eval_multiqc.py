@@ -24,6 +24,8 @@ from eval_multiqc_functions import (
     NO_SELF_PAIRS_NA,
     NO_SKILL_NOTE,
     SCORE_NOTE,
+    BASELINE_NOTE,
+    RANKING_ONLY_NOTE,
     analyse_database,
     aggregate_per_model_metrics,
     curve_label,
@@ -467,7 +469,7 @@ def write_multiqc_json_metrics(
                          "scale": False, "format": "{:,.3f}"},
             "ROC AUC min–max": {"title": "ROC AUC min–max", "scale": False},
         }
-    description = PAIRS_NOTE + seeds_desc + " " + SCORE_NOTE
+    description = PAIRS_NOTE + seeds_desc + " " + SCORE_NOTE + " " + BASELINE_NOTE
     if af3_models:
         description += " " + AF3_CAVEAT
     table_block = {
@@ -673,7 +675,7 @@ def write_multiqc_json_metrics(
             json.dump({
                 "id": block_id,
                 "section_name": section,
-                "description": caveat + seed_note,
+                "description": caveat + seed_note + " " + RANKING_ONLY_NOTE,
                 "plot_type": "table",
                 "pconfig": {"id": block_id, "title": section, "col1_header": "Model"},
                 "headers": _headers(spec, seed_cols),
@@ -774,10 +776,12 @@ def write_seed_blocks(seed_sets, seeds, outdir, prefix) -> None:
         aucap, _roc, _pr, df, _models = seed_sets[sd]
         summary = df.set_index("Model").to_dict(orient="index")
         for m in sorted(aucap):
+            # A ranking-only row (degree baseline) has AUC/AP only.
+            row = summary.get(m, {})
             rows.append({"Model": m, "Seed": sd,
                          "ROC AUC": float(aucap[m]["ROC_AUC"]),
                          "PR AP": float(aucap[m]["PR_AP"]),
-                         **{c: summary[m][c] for c in SEED_SUMMARY_COLS if c in summary[m]}})
+                         **{c: row[c] for c in SEED_SUMMARY_COLS if c in row}})
     rows.sort(key=lambda r: (r["Model"], seeds.index(r["Seed"])))
     with open(os.path.join(outdir, "seed_metrics.json"), "w", encoding="utf-8") as fh:
         json.dump({"seeds": list(seeds), "rows": rows}, fh, indent=1, default=float)
@@ -792,7 +796,7 @@ def write_seed_blocks(seed_sets, seeds, outdir, prefix) -> None:
                            "the raw values behind the means and SDs above. Thresholded "
                            "columns are at that model's and seed's own two operating "
                            "points: validation FPR ≤ 0.01 (val FPR≤0.01) and the "
-                           "universe-prior scenario threshold (prior).",
+                           "universe-prior scenario threshold (prior). " + RANKING_ONLY_NOTE,
             "plot_type": "table",
             "pconfig": {"id": variance_id, "title": "Per-seed results", "col1_header": "Model · seed"},
             "data": {f"{r['Model']} · seed {r['Seed']}": {k: v for k, v in r.items() if k != "Model"}
@@ -816,6 +820,20 @@ def write_seed_blocks(seed_sets, seeds, outdir, prefix) -> None:
                         "col1_header": "Model"},
             "data": order_agreement(auc_by_seed, models, len(seeds)),
         }, f, indent=2)
+
+
+def require_trained_model(primary_paths, dataset, seed) -> None:
+    """Fail when the primary seed's JSONs are all the ranking-only baseline:
+    every block built from the primary seed would hold no trained model."""
+    names = []
+    for path in primary_paths:
+        with open(path, "r", encoding="utf-8") as fh:
+            names.append(json.load(fh).get("model_name"))
+    if names and all(n == "degree_baseline" for n in names):
+        raise SystemExit(
+            f"[eval_multiqc] {dataset}: no trained model reported for the primary seed "
+            f"{seed}; only the ranking-only degree_baseline did."
+        )
 
 
 def is_structure_assisted(model, structure_features) -> bool:
@@ -1105,7 +1123,8 @@ def write_source_accuracy_sidecar(
             logging.info(f"[WARN] Could not read per-model sidecar {path}: {e}")
             continue
         per_source = obj.get("per_source") or {}
-        if not per_source:
+        # A ranking-only prediction has no label, so no per-source accuracy.
+        if not per_source or obj.get("ranking_only"):
             continue
         model = obj.get("model_name") or os.path.splitext(os.path.basename(path))[0]
         models[model] = {
@@ -1391,6 +1410,7 @@ def main():
         if not per_model_metrics:
             raise SystemExit(f"[seeds] No per-model JSON for the primary seed {seeds[0]}.")
         seed_sets = {sd: aggregate_per_model_metrics(fs) for sd, fs in by_seed.items() if fs}
+    require_trained_model(per_model_metrics, db_name, seeds[0] if seeds else None)
     metrics_auc_pr, roc_curves, pr_curves, metrics_df, model_list = (
         aggregate_per_model_metrics(per_model_metrics)
     )

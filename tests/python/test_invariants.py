@@ -62,34 +62,11 @@ def test_both_orientations_collapse_to_one_canonical_row():
     assert agg["predicted_probability"].iloc[0] == pytest.approx(0.4)
 
 
-# --- dummy is split-keyed (B5) ----------------------------------------------
-
-def _dummy(db: Path, out: Path):
-    subprocess.run(
-        [sys.executable, str(BIN / "extract_features.py"), "--db", str(db),
-         "--feature", "dummy", "--out", str(out), "--seed", "42"],
-        check=True, cwd=BIN, capture_output=True,
-        env={**os.environ, "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"},
-    )
-    with h5py.File(out) as h5:
-        return {(g, k): h5[g][k][()] for g in h5 for k in h5[g]}
+# The retired `dummy` encoder's split-keying test (B5) went with it (W-15);
+# identity's own tests are in test_identity.py.
 
 
-def test_dummy_vectors_differ_across_splits_and_repeat_within(tmp_path):
-    db = REPO / "tests/data/databases/random/train.sqlite3"
-    # Same database under two split names: only the split token differs.
-    other = tmp_path / "validation.sqlite3"
-    shutil.copy(db, other)
-    a = _dummy(db, tmp_path / "a.h5")
-    a2 = _dummy(db, tmp_path / "a2.h5")
-    b = _dummy(other, tmp_path / "b.h5")
-
-    assert a.keys() == b.keys() and a
-    assert all(np.array_equal(a[k], a2[k]) for k in a)
-    assert not any(np.array_equal(a[k], b[k]) for k in a)
-
-
-# --- results tree (B7): artefact type, RF != NN, canonical rows, no dummy in `all`
+# --- results tree (B7): artefact type, RF != NN, canonical rows, no identity in `all`
 
 RESULTS = os.environ.get("DOMAINBENCHMARK_RESULTS")
 needs_results = pytest.mark.skipif(not RESULTS, reason="DOMAINBENCHMARK_RESULTS not set")
@@ -107,7 +84,7 @@ def _model_dirs():
 
 
 @needs_results
-def test_model_artefact_matches_label_and_all_excludes_dummy():
+def test_model_artefact_matches_label_and_all_excludes_identity():
     dirs = _model_dirs()
     assert dirs
     for d in dirs:
@@ -117,7 +94,7 @@ def test_model_artefact_matches_label_and_all_excludes_dummy():
         feats = json.loads((d / "model" / "model_parameters.json").read_text())["features"]
         combo = d.name.split("_", 2)[2]
         if combo in ("all", "all_seq"):
-            assert "dummy" not in feats and len(feats) >= 2, (d, feats)
+            assert "identity" not in feats and len(feats) >= 2, (d, feats)
             if combo == "all_seq":
                 # A subset of the same model's `all` (which drops nothing it keeps).
                 all_dir = d.with_name(d.name[: -len("all_seq")] + "all")

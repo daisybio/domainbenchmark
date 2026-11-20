@@ -202,13 +202,16 @@ def _join_sources(df: pd.DataFrame, sources_path: str) -> tuple:
     preds = pd.DataFrame(
         {
             "pair": _pair_keys(df["domain_a"], df["domain_b"]),
-            "correct": (
-                df["true_interaction"].to_numpy() == df["predicted_interaction"].to_numpy()
-            ).astype(np.int8),
             "true_interaction": df["true_interaction"].to_numpy(),
             "score": df["predicted_probability"].to_numpy(),
         }
     )
+    # A ranking-only prediction (the degree baseline) has no label, so no
+    # `correct`; _per_source_metrics then reports counts and coverage only.
+    if "predicted_interaction" in df.columns:
+        preds.insert(1, "correct", (
+            df["true_interaction"].to_numpy() == df["predicted_interaction"].to_numpy()
+        ).astype(np.int8))
 
     merged = preds.merge(exploded, on="pair", how="left")
     merged["source"] = merged["source"].fillna(UNMATCHED)
@@ -272,23 +275,33 @@ def _per_source_metrics(df: pd.DataFrame, sources_path, joined: tuple = None) ->
         print("[eval_one] no --sources given; skipping per-source metrics")
         return {}
     preds, merged, totals = joined or _join_sources(df, sources_path)
+    labelled = "correct" in preds.columns
+
+    def correct_of(frame):
+        """(correct, accuracy); both null for a ranking-only prediction."""
+        if not labelled:
+            return None, None
+        n = len(frame)
+        c = int(frame["correct"].sum())
+        return c, (float(c) / n if n else float("nan"))
 
     per_source = {}
     for source, grp in merged.groupby("source", sort=True):
         n_scored = int(len(grp))
         n_pos = int((grp["true_interaction"] == 1).sum())
         ground = totals.get(source, {})
+        correct, accuracy = correct_of(grp)
         per_source[source] = {
             "n": int(ground.get("n", n_scored)),
             "n_pos": int(ground.get("n_pos", n_pos)),
             "n_neg": int(ground.get("n_neg", n_scored - n_pos)),
             "n_scored": n_scored,
-            "correct": int(grp["correct"].sum()),
-            "accuracy": float(grp["correct"].sum()) / n_scored if n_scored else float("nan"),
+            "correct": correct,
+            "accuracy": accuracy,
         }
 
     n_all = int(len(preds))
-    correct_all = int(preds["correct"].sum())
+    correct_all, accuracy_all = correct_of(preds)
     ground_all = totals.get(ALL_SOURCES, {})
     per_source[ALL_SOURCES] = {
         "n": int(ground_all.get("n", n_all)),
@@ -300,7 +313,7 @@ def _per_source_metrics(df: pd.DataFrame, sources_path, joined: tuple = None) ->
         "n_scored_pos": int((preds["true_interaction"] == 1).sum()),
         "n_scored_neg": int((preds["true_interaction"] == 0).sum()),
         "correct": correct_all,
-        "accuracy": float(correct_all) / n_all if n_all else float("nan"),
+        "accuracy": accuracy_all,
     }
 
     # `unknown` (NULL provenance) is a real bucket only when something landed
@@ -406,8 +419,8 @@ def _drop_duplicate_pairs(df: pd.DataFrame, path: str) -> pd.DataFrame:
     would invent a score no model produced. Kept rows stay in file order.
     """
     key = _pair_keys(df["domain_a"], df["domain_b"])
-    cols = ["true_interaction", "predicted_probability", "predicted_interaction"]
-    cols += [LABEL_COL[PRIOR]] if LABEL_COL[PRIOR] in df.columns else []
+    cols = ["true_interaction", "predicted_probability"]
+    cols += [c for c in LABEL_COL.values() if c in df.columns]
     is_extra = pd.Series(key).duplicated().to_numpy()
     if not is_extra.any():
         return df
@@ -429,9 +442,11 @@ def _drop_duplicate_pairs(df: pd.DataFrame, path: str) -> pd.DataFrame:
     return df.loc[~is_extra].reset_index(drop=True)
 
 
-def _read_predictions(path: str, model_name: str, points: dict = None) -> pd.DataFrame:
+def _read_predictions(path: str, model_name: str, points: dict = None,
+                      ranking_only: bool = False) -> pd.DataFrame:
     """`points` (from `_read_points`) adds the prior label column to the
-    required ones and checks both labels against their thresholds."""
+    required ones and checks both labels against their thresholds.
+    `ranking_only` (the degree baseline) requires no label column at all."""
     if path.endswith(".parquet") or path.endswith(".pq"):
         df = pd.read_parquet(path)
     else:
@@ -441,15 +456,25 @@ def _read_predictions(path: str, model_name: str, points: dict = None) -> pd.Dat
     # useless when a dozen scatter tasks fail at once. Say which prediction
     # file is malformed and how.
     required = (
-        "domain_a", "domain_b",
-        "true_interaction", "predicted_interaction", "predicted_probability",
-    ) + ((LABEL_COL[PRIOR],) if points else ())
+        ("domain_a", "domain_b", "true_interaction", "predicted_probability")
+        if ranking_only else
+        ("domain_a", "domain_b", "true_interaction", "predicted_interaction", "predicted_probability")
+        + ((LABEL_COL[PRIOR],) if points else ())
+    )
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
             f"{path}: predictions are missing {missing} (columns present: "
             f"{list(df.columns)}, {len(df)} rows). An empty frame here means the "
             "model scored no domain pairs at all -- check that upstream task's log."
+        )
+    # A ranking-only file carrying labels is a misrouted model parquet: its
+    # labels would surface as per-source accuracy with no threshold behind them.
+    labels = [c for c in df.columns if c.startswith("predicted_interaction")]
+    if ranking_only and labels:
+        raise SystemExit(
+            f"[eval_one] {path}: --ranking_only, but the predictions carry {labels}; "
+            "a ranking-only prediction has no operating point."
         )
     label_cols = [c for c in required if c.startswith(("true_", "predicted_interaction"))]
     for col in label_cols:
@@ -783,6 +808,8 @@ def _ap_baseline(pr_ap: float, y_true) -> dict:
 
 
 #: W-10 metrics, in output order: (name, class each side needs, reason).
+RANKING_ONLY_REASON = "ranking-only baseline"
+
 SHIFT_METRICS = (
     ("roc_auc", (0, 1), "needs both classes in both test sets"),
     ("tpr", (1,), "needs positives in both test sets"),
@@ -824,21 +851,23 @@ def _shift_strata(ref: pd.DataFrame, tgt: pd.DataFrame) -> list:
     return strata
 
 
-def _shift_samples(ref: pd.DataFrame, tgt: pd.DataFrame, n: int, seed: int) -> dict:
+def _shift_samples(ref: pd.DataFrame, tgt: pd.DataFrame, n: int, seed: int,
+                   ranking_only: bool = False) -> dict:
     """{metric: per-resample Δ (target - reference)} of the joint bootstrap.
 
     Each resample draws every stratum of `_shift_strata` with replacement at
     its own size, in the fixed stratum order, from one `default_rng(seed)`. A
     shared DDI drawn once enters both sets, each with its own set's score and
     decision. Class and overlap counts are therefore fixed, so a metric is
-    defined in every resample or in none (those stay NaN).
+    defined in every resample or in none (those stay NaN). `ranking_only`
+    computes AUC only; the draws are the same either way.
     """
     strata = _shift_strata(ref, tgt)
-    sides = [(ref["true_interaction"].to_numpy(), ref["predicted_probability"].to_numpy(),
-              ref["predicted_interaction"].to_numpy()),
-             (tgt["true_interaction"].to_numpy(), tgt["predicted_probability"].to_numpy(),
-              tgt["predicted_interaction"].to_numpy())]
+    decision = lambda df: None if ranking_only else df["predicted_interaction"].to_numpy()
+    sides = [(ref["true_interaction"].to_numpy(), ref["predicted_probability"].to_numpy(), decision(ref)),
+             (tgt["true_interaction"].to_numpy(), tgt["predicted_probability"].to_numpy(), decision(tgt))]
     eligible = {name: all(set(need) <= set(np.unique(side[0])) for side in sides)
+                and not (ranking_only and name != "roc_auc")
                 for name, need, _ in SHIFT_METRICS}
     rng = np.random.default_rng(seed)
     out = {name: np.full(n, np.nan) for name, _, _ in SHIFT_METRICS}
@@ -855,7 +884,8 @@ def _shift_samples(ref: pd.DataFrame, tgt: pd.DataFrame, n: int, seed: int) -> d
         rows = [np.concatenate(p) for p in picks]
         for name, _, _ in SHIFT_METRICS:
             if eligible[name]:
-                vals = [_shift_metric(name, *(a[r] for a in side)) for side, r in zip(sides, rows)]
+                vals = [_shift_metric(name, *(None if a is None else a[r] for a in side))
+                        for side, r in zip(sides, rows)]
                 out[name][i] = vals[1] - vals[0]
     return out
 
@@ -868,7 +898,9 @@ def _test_set_shift(ref: pd.DataFrame, tgt: pd.DataFrame, op: dict, reference_va
     difference target - reference and its joint-bootstrap 95% percentile CI.
     Each endpoint is computed from its own side's rows wherever that side has
     the classes it needs; Δ and its CI only where both sides do. Undefined
-    values are None."""
+    values are None. `op` None is a ranking-only prediction (the degree
+    baseline): AUC only, TPR/FPR null with reason "ranking-only baseline"."""
+    ranking_only = op is None
     def counts(df):
         y = df["true_interaction"].to_numpy()
         return int(y.sum()), int(len(y) - y.sum())
@@ -877,14 +909,18 @@ def _test_set_shift(ref: pd.DataFrame, tgt: pd.DataFrame, op: dict, reference_va
         d = df[df["true_interaction"] == label]
         return set(_pair_keys(d["domain_a"], d["domain_b"]))
 
-    samples = _shift_samples(ref, tgt, n, seed)
+    samples = _shift_samples(ref, tgt, n, seed, ranking_only)
     metrics = {}
     for name, need, reason in SHIFT_METRICS:
+        if ranking_only and name != "roc_auc":
+            metrics[name] = {"ref": None, "target": None, "delta": None, "delta_ci": [None, None],
+                             "n_valid": 0, "reason": RANKING_ONLY_REASON}
+            continue
         valid = samples[name][~np.isnan(samples[name])]
         vals = [
             _shift_metric(name, df["true_interaction"].to_numpy(),
                           df["predicted_probability"].to_numpy(),
-                          df["predicted_interaction"].to_numpy())
+                          None if ranking_only else df["predicted_interaction"].to_numpy())
             if set(need) <= set(np.unique(df["true_interaction"].to_numpy())) else None
             for df in (ref, tgt)
         ]
@@ -915,8 +951,10 @@ def _test_set_shift(ref: pd.DataFrame, tgt: pd.DataFrame, op: dict, reference_va
         "n_shared_neg": len(keyset(ref, 0) & keyset(tgt, 0)),
         "ref_pos_subset": keyset(ref, 1) <= keyset(tgt, 1),
         "ref_neg_subset": keyset(ref, 0) <= keyset(tgt, 0),
-        "fp_ref": fp(ref), "fp": fp(tgt),
+        "fp_ref": None if ranking_only else fp(ref),
+        "fp": None if ranking_only else fp(tgt),
         "point_status": (
+            RANKING_ONLY_REASON if ranking_only else
             f"validation FPR ≤ 0.01 (achieved {op['val_fpr']:.4f} on {op['val_n_neg']} neg)"
             if op["resolvable"] else UNRESOLVED[PRIMARY]
         ),
@@ -950,11 +988,18 @@ def main():
              "distributions (`score_by_source`); skipped when not given (both keys "
              "null), fatal when given but missing.",
     )
-    p.add_argument(
-        "--model_parameters", required=True,
+    points_arg = p.add_mutually_exclusive_group(required=True)
+    points_arg.add_argument(
+        "--model_parameters",
         help="The model's model_parameters.json: its two validation operating "
              "points, reported beside the realised test rates. Fatal when "
              "malformed or when a parquet label is not score >= its threshold.",
+    )
+    points_arg.add_argument(
+        "--ranking_only", action="store_true",
+        help="A model-free ranking (the degree baseline): no operating points, "
+             "no labels; `operating_points` is null, `metrics_summary` holds "
+             "Model/Samples/Prevalence, per-source correct/accuracy are null.",
     )
     p.add_argument("--max_curve_points", type=int, default=600)
     p.add_argument("--bootstrap_n", type=int, default=1000,
@@ -993,9 +1038,17 @@ def main():
     if args.run_id:
         print(f"[eval_one] run_id={args.run_id}")
 
-    points = _read_points(args.model_parameters, args.seed)
-    df = _read_predictions(args.predictions, args.model_name, points)
-    operating_points, metrics_summary = _operating_points(df, points, args.model_name)
+    if args.ranking_only:
+        points = None
+        df = _read_predictions(args.predictions, args.model_name, ranking_only=True)
+        operating_points = None
+        y = df["true_interaction"].to_numpy()
+        metrics_summary = {"Model": args.model_name, "Samples": int(len(y)),
+                           "Prevalence": float(y.mean()) if len(y) else float("nan")}
+    else:
+        points = _read_points(args.model_parameters, args.seed)
+        df = _read_predictions(args.predictions, args.model_name, points)
+        operating_points, metrics_summary = _operating_points(df, points, args.model_name)
     y_true = df["true_interaction"].to_numpy()
     y_score = df["predicted_probability"].to_numpy()
 
@@ -1044,6 +1097,8 @@ def main():
 
     payload = {
         "model_name": args.model_name,
+        # A model-free ranking (W-15): left out of every thresholded block.
+        "ranking_only": bool(args.ranking_only),
         # The training seed of the model behind these predictions (it also
         # seeds the bootstrap); eval_multiqc.py groups seeds by it.
         "seed": int(args.seed),
@@ -1088,10 +1143,11 @@ def main():
     if args.reference_predictions:
         # Validated exactly like the target: same thresholds (one model task
         # wrote both files), keys and labels against its own split's CSV.
-        ref = _read_predictions(args.reference_predictions, args.model_name, points)
+        ref = _read_predictions(args.reference_predictions, args.model_name, points,
+                                ranking_only=args.ranking_only)
         _per_source_metrics(ref, args.reference_sources)
         payload["test_set_shift"] = _test_set_shift(
-            ref, df, operating_points[PRIMARY], args.reference_variant,
+            ref, df, None if args.ranking_only else operating_points[PRIMARY], args.reference_variant,
             args.seed, args.bootstrap_n, variant=args.variant,
         )
 

@@ -40,16 +40,25 @@ The pipeline runs the following stages:
 
 1. **DDI extraction** from the database split (`DDI_EXTRACTION`).
 2. **Feature extraction** for every requested encoding computed here
-   (`aacomp`, `aaencode`, `dummy`) —
-   parallelized per `(feature × split)`.
+   (`aacomp`, `aaencode`, `identity`) —
+   parallelized per `(feature × split)`. `identity` is a one-hot slot per Pfam
+   family of the database's train ∪ validation (a pair = the sum of its two
+   sides, so a same-family pair reads 2 and an unseen family nothing): what
+   family identity alone explains. Its vocabulary files are staged as inputs of
+   their own (`--vocabulary_db`), and its sha1 is recorded in
+   `model_parameters.json` (`feature_digests`) and checked on every test split.
 3. **ML classifiers** trained on each feature individually plus up to two
    concatenation runs (gated by `--machine_learning_models`): `all` (every
-   feature except `dummy`) and `all_seq` (sequence features only: no structure
+   feature except `identity`) and `all_seq` (sequence features only: no structure
    feature and no `--structure_informed_features` embedding; built only when it
    differs from `all`):
    - `NEURAL_NETWORK` — neural network (PyTorch + skorch).
    - `RANDOM_FOREST` — RAPIDS cuML random forest on GPU.
 4. **Graph models** (`GRAPH_MODEL`): KGIDDI, DDI parsimony, KGIDDI-random.
+   **Degree baseline** (`DEGREE_BASELINE`): score(A, B) = deg(A) × deg(B), deg =
+   the family's positive DDIs in `train.csv` (unseen family 0). Model-free and
+   ranking-only: it appears in every AUC/AP table and heatmap, never in an
+   operating-point table, by-source rate or enrichment fit, and is never inverted.
 5. **Per-prediction evaluation** (`EVAL_ONE`) → tiny per-model JSONs.
 6. **Per-database aggregation** (`EVALUATION`) → MultiQC report.
 7. **Cross-database aggregation** (`COMBINE_EVAL`) when `--db_list` is set.
@@ -246,7 +255,7 @@ Used by CI and by `nf-test`.
 | `--modeljson` | `${projectDir}/assets` | Directory of model hyperparameter JSONs. |
 | `--skip` | `''` | Comma-separated feature/model names to skip. |
 | `--graph_models` | `kgiddi,ddiparsimony,kgiddi_random` | Graph models to run. |
-| `--machine_learning_features` | `dummy,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings` | Feature encodings fed to the classifiers. |
+| `--machine_learning_features` | `identity,aacomp,aaencode,esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings` | Feature encodings fed to the classifiers. |
 | `--published_features` | `esm3_embeddings,esmc_embeddings,prott5_embeddings,esm3_structure_embeddings` | Of those, the ones read from `--embeddings` instead of extracted from the databases. |
 | `--structure_informed_features` | `esm3_structure_embeddings` | Published features computed with structure input: kept out of the sequence-only `all_seq` combo. Must be a subset of `--published_features`; `none` marks nothing. |
 | `--embeddings` | `null` | domainsplit's `results/embeddings/` directory. Needed when `--published_features` is non-empty, but derived from `--input` when that is a directory (one level up, `embeddings/`). |
@@ -364,8 +373,8 @@ A full description of each output is in [`docs/output.md`](docs/output.md).
 
 `--seeds 42,43,44` trains every ML model once per seed, so the report can show
 how much of a difference between models is training noise. Seed-dependent
-tasks run once per seed (NN / RF / SVM, the `dummy` feature, per-model
-evaluation); everything else runs once. The first seed is the **primary
+tasks run once per seed (NN / RF / SVM, the degree baseline, per-model
+evaluation; no feature encoder draws from the RNG any more); everything else runs once. The first seed is the **primary
 seed**: graph models, metadata enrichment, the ROC/PR curves, the by-source
 rates, the source-pair AUC and score-distribution sections and the pairwise
 bootstrap tests use it alone, and say so.
@@ -389,7 +398,7 @@ With more than one seed:
   when it holds in every seed.
 
 Outputs of seed-dependent tasks are published under `seed<N>/`
-(`<db>/nn_output/seed43/neural_network_<combo>/…`, `<db>/data/seed43/dummy__train.h5`).
+(`<db>/nn_output/seed43/neural_network_<combo>/…`, `<db>/baseline_output/seed43/degree_baseline/…`).
 With the default single seed nothing changes: same paths, same files, same
 bytes. Use a fresh `--outdir` when changing the number of seeds. Adding a seed
 to an existing run with `-resume` reruns only the new seed's tasks and the

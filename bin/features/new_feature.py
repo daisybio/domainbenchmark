@@ -58,7 +58,7 @@ from features import embeddings
 def extract_features(conn: sqlite3.Connection, out_file: h5py.File, seed: int):
     # Every encoder takes `seed`. Draw from `derive_seed(seed, ...)` keyed on
     # the (domain, instance) pair -- never from the global RNG, and never
-    # keyed on iteration order. See features/dummy.py.
+    # keyed on iteration order. See CLAUDE.md, "Deriving per item beats drawing in a loop".
     """Extract features from the database and write them to the HDF5 file.
 
     Args:

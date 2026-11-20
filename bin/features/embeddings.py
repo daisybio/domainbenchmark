@@ -96,7 +96,7 @@ def clean_sequence(sequence, domain_key, instance_key, min_length: int = 1) -> s
     return cleaned
 
 
-def write_instance(out_file: h5py.File, domain_key: str, instance_key: str, value):
+def write_instance(out_file: h5py.File, domain_key: str, instance_key: str, value, compression=None):
     """Write one instance vector under its domain group, creating it if needed.
 
     `domain_key` is the Pfam accession (see the note above), `instance_key` the
@@ -120,4 +120,8 @@ def write_instance(out_file: h5py.File, domain_key: str, instance_key: str, valu
     else:
         domain_group = out_file[domain_key]
 
-    domain_group[instance_key] = np.asarray(value, dtype=np.float32)
+    if compression is None:
+        domain_group[instance_key] = np.asarray(value, dtype=np.float32)
+    else:
+        # identity's one-hot vectors are mostly zeros (D-W15-3).
+        domain_group.create_dataset(instance_key, data=np.asarray(value, dtype=np.float32), compression=compression)

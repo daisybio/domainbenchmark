@@ -92,7 +92,12 @@ process FEATURE_EXTRACTION_ONE {
 
     input:
         // `structures` / `sasa_cache` are [] for a non-structure feature.
-        tuple val(meta), path(database_dir, stageAs: "input_db"), path(structures, stageAs: 'structures.h5'), path(sasa_cache, stageAs: 'sasa_cache.h5')
+        // `vocabulary_dbs` is [] except for a vocabulary encoder (identity):
+        // its database's train and validation sqlite, staged as files of their
+        // own because a directory input is hashed by the directory's own
+        // path/size/mtime, not its children -- an edited validation.sqlite3
+        // would otherwise leave a stale vocabulary cached.
+        tuple val(meta), path(database_dir, stageAs: "input_db"), path(structures, stageAs: 'structures.h5'), path(sasa_cache, stageAs: 'sasa_cache.h5'), path(vocabulary_dbs, stageAs: 'vocab/*')
 
     output:
         // optional: a split absent from this database produces no file at all.
@@ -107,6 +112,7 @@ process FEATURE_EXTRACTION_ONE {
         def module_arg   = meta.module != feature_name ? "--module ${meta.module}" : ''
         def params_arg   = meta.params ? "--params '${groovy.json.JsonOutput.toJson(meta.params)}'" : ''
         def struct_arg   = structures ? '--structures structures.h5 --sasa_cache sasa_cache.h5' : ''
+        def vocab_arg    = vocabulary_dbs ? (vocabulary_dbs instanceof List ? vocabulary_dbs : [vocabulary_dbs]).collect { "--vocabulary_db ${it}" }.sort().join(' ') : ''
 
         // `database_dir` is always a directory -- datasetTuple() lists it via
         // discoverSplits() -- so there is no single-file branch.
@@ -114,7 +120,7 @@ process FEATURE_EXTRACTION_ONE {
         if [ -f "${database_dir}/${dataset}.sqlite3" ]; then
             extract_features.py \\
                 --db ${database_dir}/${dataset}.sqlite3 \\
-                --feature ${feature_name} ${module_arg} ${params_arg} ${struct_arg} \\
+                --feature ${feature_name} ${module_arg} ${params_arg} ${struct_arg} ${vocab_arg} \\
                 --out ${out} \\
                 --seed ${meta.seed}
         else
@@ -132,7 +138,8 @@ process FEATURE_EXTRACTION_ONE {
 workflow FEATURE_EXTRACTION {
     take:
         feature_ch     // queue of feature specs: [name, module, params (Map), structure (bool),
-                       //   seeded (bool), seeds (one task per seed; [primary] when seed-free)]
+                       //   seeded (bool), seeds (one task per seed; [primary] when seed-free),
+                       //   vocabulary (bool: stage the database's train + validation sqlite)]
         db_ch          // channel: tuple(meta, db_path)  — multi-DB capable
         structures     // value channel: structures.h5, or Channel.empty() without structure features
         sasa_db_ch     // db_ch gated on PREFLIGHT: the SASA build waits for every database to pass
@@ -156,7 +163,8 @@ workflow FEATURE_EXTRACTION {
                         seeded   : feat.seeded,
                         seed     : seed
                     ]
-                    tuple(m, db_path)
+                    def vocab = feat.vocabulary ? [db_path / 'train.sqlite3', db_path / 'validation.sqlite3'] : []
+                    tuple(m, db_path, vocab)
                 }
             }
 
@@ -172,12 +180,14 @@ workflow FEATURE_EXTRACTION {
         ).cache
 
         structure_tasks = per_task
-            .filter { m, _db -> m.structure }
+            .filter { m, _db, _vocab -> m.structure }
+            .map { m, db_path, _vocab -> tuple(m, db_path) }
             .combine(structures)
             .combine(sasa_cache)
+            .map { m, db_path, st, sc -> tuple(m, db_path, st, sc, []) }
         plain_tasks = per_task
-            .filter { m, _db -> !m.structure }
-            .map { m, db_path -> tuple(m, db_path, [], []) }
+            .filter { m, _db, _vocab -> !m.structure }
+            .map { m, db_path, vocab -> tuple(m, db_path, [], [], vocab) }
 
         per_split = FEATURE_EXTRACTION_ONE(plain_tasks.mix(structure_tasks))
 

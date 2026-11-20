@@ -42,6 +42,14 @@ SCORE_NOTE = (
     "scores across models."
 )
 
+#: W-15: the model-free ranking reference that sits beside every model.
+BASELINE_NOTE = (
+    "degree_baseline: deg(A) × deg(B), deg = positive train DDIs of the family; "
+    "model-free, ranking-only; ties half credit; never inverted."
+)
+#: Thresholded blocks the baseline has no row in.
+RANKING_ONLY_NOTE = "degree_baseline is ranking-only and has no operating point: n/a here."
+
 #: AUC heatmaps (combined report and the W-11 cross-source matrix): diverging,
 #: centred on chance (0.5 sits mid-scale on [0, 1]).
 _div = matplotlib.colormaps["RdYlGn"]
@@ -549,7 +557,11 @@ def aggregate_per_model_metrics(per_model_files):
         with open(fp, "r", encoding="utf-8") as fh:
             obj = json.load(fh)
         name = obj["model_name"]
-        metrics_rows.append(obj["metrics_summary"])
+        # A ranking-only prediction (the degree baseline, W-15) has no
+        # operating point: it stays out of metrics_df, i.e. out of both
+        # operating-point tables and their per-seed columns.
+        if not obj.get("ranking_only"):
+            metrics_rows.append(obj["metrics_summary"])
         entry = {
             "ROC_AUC": obj["roc_auc"],
             "PR_AP": obj["pr_ap"],
@@ -582,6 +594,8 @@ def aggregate_per_model_metrics(per_model_files):
         if coverage:
             entry["COVERAGE"] = coverage
         entry["SAMPLES"] = obj["metrics_summary"]["Samples"]
+        if obj.get("ranking_only"):
+            entry["RANKING_ONLY"] = True
         metrics_aucap[name] = entry
         roc_pairs = obj["roc"]
         pr_pairs = obj["pr"]
@@ -594,7 +608,7 @@ def aggregate_per_model_metrics(per_model_files):
             np.asarray([p[1] for p in pr_pairs], dtype=np.float32),
         )
         model_list.append(name)
-    metrics_df = pd.DataFrame(metrics_rows)
+    metrics_df = pd.DataFrame(metrics_rows, columns=None if metrics_rows else ["Model"])
     return metrics_aucap, roc_curves, pr_curves, metrics_df, model_list
 
 

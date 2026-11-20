@@ -80,7 +80,7 @@ scored by the same trained model. A database with a single `test.sqlite3`
     bounded).
   - `predictions_<variant>.parquet`: one file per test split, scored by the one
     trained model. `<combo>` is a single feature name, `all` for the
-    all-feature concatenation run (everything but `dummy`), or `all_seq` for the
+    all-feature concatenation run (everything but `identity`), or `all_seq` for the
     sequence-only one (`all` minus structure features and
     `--structure_informed_features`). One row per DDI, with `domain_a <= domain_b`:
     the loader instantiates each pair in both orientations (the feature vector is
@@ -90,6 +90,18 @@ scored by the same trained model. A database with a single `test.sqlite3`
     `predicted_interaction_prior` (at `universe_prior`; ML models only) and
     `predicted_probability`. Both thresholds come from validation and are
     applied unchanged to every test split.
+  - A model using `identity` also records `feature_digests` (the vocabulary
+    sha1) in `model_parameters.json`; scoring fails on a test file built from
+    another vocabulary. `identity__<split>.h5` carries `vocabulary_size`,
+    `vocabulary_sha1` and the pair counts `n_pairs`, `n_pairs_both_known`,
+    `n_pairs_one_unseen`, `n_pairs_zero` as attributes.
+- `<db_name>/baseline_output/degree_baseline/` (with several `--seeds`, under
+  `baseline_output/seed<N>/`)
+  - `predictions_<variant>.parquet`: deg(A) × deg(B) per test DDI, deg = the
+    family's positive DDIs in `train.csv`; columns `domain_a`, `domain_b`,
+    `true_interaction`, `predicted_probability` (the integer product). No label
+    columns and no model directory: the baseline is ranking-only and appears in
+    the AUC/AP rows of the reports only.
 - `<db_name>/graph_models/<model>/`
   - `model/`: graph-topology exports and the run record.
   - `predictions_<variant>.parquet`: one file per test split, same

@@ -32,6 +32,12 @@ if __name__ == "__main__":
         "--sasa_cache", type=Path, default=None,
         help="Merged SASA cache (bin/merge_sasa_cache.py); structure encoders only.",
     )
+    parser.add_argument(
+        "--vocabulary_db", type=Path, action="append", default=[],
+        help="A split database the encoder builds its vocabulary from (repeat). "
+             "Required by, and only accepted for, a module declaring "
+             "VOCABULARY_SPLITS (identity: train and validation).",
+    )
     parser.add_argument("--out", type=Path, required=True, help="Output file path")
     parser.add_argument(
         "--id", dest="run_id", default=None,
@@ -40,9 +46,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seed", type=int, default=42,
         help="Master RNG seed, passed to every encoder as its third argument. "
-             "Only the `dummy` encoder draws from it today, but an encoder that "
-             "samples must be reproducible like everything else downstream of "
-             "it -- and must derive per-item child seeds rather than draw from "
+             "No encoder draws from it today, but an encoder that samples must "
+             "be reproducible like everything else downstream of it -- and must "
+             "derive per-item child seeds (derive_seed) rather than draw from "
              "the global RNG in row order.",
     )
     args = parser.parse_args()
@@ -51,21 +57,35 @@ if __name__ == "__main__":
 
     seed_everything(args.seed)
 
+    feature_module = importlib.import_module(f"features.{args.module or args.feature}")
+    # Checked before the output file is opened, so a wrong staging leaves nothing behind.
+    vocabulary_splits = getattr(feature_module, "VOCABULARY_SPLITS", None)
+    given = sorted(p.stem for p in args.vocabulary_db)
+    if vocabulary_splits is None and args.vocabulary_db:
+        parser.error(f"--vocabulary_db given, but feature '{args.feature}' declares no VOCABULARY_SPLITS")
+    if vocabulary_splits is not None and given != sorted(vocabulary_splits):
+        parser.error(
+            f"feature '{args.feature}' builds its vocabulary from {sorted(vocabulary_splits)}; "
+            f"--vocabulary_db names {given}"
+        )
+
     print("Opening database and output file...")
     with (
         sqlite3.connect(args.db) as connection,
         h5py.File(args.out, "w") as output_file,
     ):
         print(f"Extracting feature '{args.feature}'...")
-        feature_module = importlib.import_module(f"features.{args.module or args.feature}")
         # Every encoder takes the seed, whether or not it draws from it today:
         # an encoder that samples must not be able to reach the global RNG.
         # The seed is keyed on the split (the db file's stem: train,
-        # validation, test_realistic, ...). Keyed on --seed alone, `dummy` gave
-        # a domain instance the identical vector in every split, so a model
-        # could memorise instances in train and recognise them in test.
+        # validation, test_realistic, ...). Keyed on --seed alone, a sampling
+        # encoder (the retired `dummy`) gave a domain instance the identical
+        # vector in every split, so a model could memorise instances in train
+        # and recognise them in test.
         split_seed = derive_seed(args.seed, "split", args.db.stem)
         kwargs = dict(args.params)
         if args.structures:
             kwargs.update(structures=str(args.structures), sasa_cache=args.sasa_cache and str(args.sasa_cache))
+        if vocabulary_splits is not None:
+            kwargs.update(vocabulary_dbs=[str(p) for p in sorted(args.vocabulary_db, key=lambda p: p.stem)])
         feature_module.extract_features(connection, output_file, split_seed, **kwargs)
