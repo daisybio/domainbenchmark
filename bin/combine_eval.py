@@ -1016,12 +1016,14 @@ def model_performance_heatmap(combined_metrics, outdir, dataset_order=None, eval
             if hp is not None:
                 het_pr_mean.setdefault(model, {})[db_name] = hp
             het_ci.setdefault(model, {})[db_name] = _cell(
-                hv, row.get("Hetero ROC AUC CI"), h_n, h_pi)
+                hv, row.get("Hetero ROC AUC CI"), h_n, h_pi,
+                _seed_extra(row, "Hetero ROC AUC SD"))
             # Hetero lift against the hetero prevalence: the full-set lift
             # does not carry over when the two prevalences differ.
             het_pr_ci.setdefault(model, {})[db_name] = _cell(
                 hp, row.get("Hetero PR AP CI"), h_n, h_pi,
-                f" · lift={hp / h_pi:.2f}×" if hp is not None and h_pi else "")
+                (f" · lift={hp / h_pi:.2f}×" if hp is not None and h_pi else "")
+                + _seed_extra(row, "Hetero PR AP SD"))
             roc_ci.setdefault(model, {})[db_name] = _cell(
                 rv, row.get("ROC AUC CI"), n, pi, _seed_extra(row, "ROC AUC SD"))
             pr_ci.setdefault(model, {})[db_name] = _cell(

@@ -457,7 +457,7 @@ def write_multiqc_json_metrics(
             table_data,
             {sd: {m: _table_row(m, a[0][m]) for m in a[0]} for sd, a in seed_sets.items()},
             len(seeds),
-            spread=("ROC AUC", "PR AP"),
+            spread=("ROC AUC", "PR AP", "Hetero ROC AUC", "Hetero PR AP"),
             minmax="ROC AUC",
         )
         seed_headers = {
@@ -468,6 +468,10 @@ def write_multiqc_json_metrics(
             "PR AP SD": {"title": "PR AP SD", "description": "Sample SD over seeds.",
                          "scale": False, "format": "{:,.3f}"},
             "ROC AUC min–max": {"title": "ROC AUC min–max", "scale": False},
+            "Hetero ROC AUC SD": {"title": "Hetero ROC AUC SD", "description": "Sample SD over seeds.",
+                                  "scale": False, "format": "{:,.3f}"},
+            "Hetero PR AP SD": {"title": "Hetero PR AP SD", "description": "Sample SD over seeds.",
+                                "scale": False, "format": "{:,.3f}"},
         }
     description = PAIRS_NOTE + seeds_desc + " " + SCORE_NOTE + " " + BASELINE_NOTE
     if af3_models:

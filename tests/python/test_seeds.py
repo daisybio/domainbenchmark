@@ -107,6 +107,10 @@ def test_two_seeds_mean_sd_and_primary_blocks(monkeypatch, tmp_path):
     sd = np.std([auc(m, 42), auc(m, 43)], ddof=1)
     assert sd > 0 and row["ROC AUC SD"] == pytest.approx(sd)
     assert row["Seeds"] == "2/2"
+    # Hetero metrics get the same seed spread as the full-set ones.
+    for col in ("Hetero ROC AUC", "Hetero PR AP"):
+        assert f"{col} SD" in row
+        assert col not in table["headers"] or f"{col} SD" in table["headers"]
     p_row = json.loads((primary / "combined_metrics_table_mqc.json").read_text())["data"][m]
     o_row = json.loads((other_seed / "combined_metrics_table_mqc.json").read_text())["data"][m]
     assert p_row["ROC AUC CI"] != o_row["ROC AUC CI"]
@@ -219,6 +223,26 @@ def test_combined_ci_cell_carries_seed_sd(tmp_path):
     assert "means over 2 training seeds" in ci["description"]
     heat = json.loads((tmp_path / "model_performance_heatmap_roc_mqc.json").read_text())
     assert "not added" in heat["description"]
+
+
+def test_combined_hetero_ci_cell_carries_seed_sd(tmp_path):
+    row = {"Pairs": 100, "Prevalence": 0.5, "ROC AUC": 0.7, "ROC AUC CI": "[0.6, 0.8]",
+           "PR AP": 0.6, "PR AP CI": "[0.5, 0.7]", "Hetero pairs": 90,
+           "Hetero positives": 45, "Hetero ROC AUC": 0.65, "Hetero ROC AUC CI": "[0.55, 0.75]",
+           "Hetero PR AP": 0.55, "Hetero PR AP CI": "[0.45, 0.65]"}
+    block = {"id": "combined_metrics_table_ds", "data": {"m": dict(row)}}
+    combine_eval.model_performance_heatmap({block["id"]: block}, str(tmp_path))
+    roc = json.loads((tmp_path / "model_performance_heatmap_hetero_roc_ci_mqc.json").read_text())
+    assert roc["data"]["m"]["ds"] == "0.650 [0.55, 0.75] · n=90 · π=0.500"
+
+    block["data"]["m"].update({"Seeds": "2/2", "ROC AUC SD": 0.01, "PR AP SD": 0.02,
+                               "Hetero ROC AUC SD": 0.0234, "Hetero PR AP SD": 0.0345})
+    combine_eval.model_performance_heatmap({block["id"]: block}, str(tmp_path))
+    roc = json.loads((tmp_path / "model_performance_heatmap_hetero_roc_ci_mqc.json").read_text())
+    pr = json.loads((tmp_path / "model_performance_heatmap_hetero_pr_ci_mqc.json").read_text())
+    assert roc["data"]["m"]["ds"] == "0.650 [0.55, 0.75] · n=90 · π=0.500 ± 0.023 over 2 seeds"
+    assert pr["data"]["m"]["ds"].endswith(" · lift=1.10× ± 0.035 over 2 seeds")
+    assert "means over 2 training seeds" in roc["description"]
 
 
 def test_enrichment_status_says_primary_seed_only(tmp_path):
