@@ -218,3 +218,6 @@ run_eval_multiqc_single.sh
 
 # nf-test working directory.
 .nf-test/
+
+# Local AI review handoff; keep out of commits.
+/CodexReview.md

@@ -12,11 +12,15 @@ orders and writes both orientations in the interaction layout protdcal uses.
 
 Degenerate input follows one rule: a value that is genuinely zero (no
 interface contact, no clash) is written as zero; anything undefined (missing
-chain, non-standard residue, missing atom, empty denominator) raises naming
-the pair. Nothing is filled with NaN or 0.0 to keep going.
+chain, a chain without any standard residue, missing atom, empty denominator)
+raises naming the pair. Nothing is filled with NaN or 0.0 to keep going. The
+one exception is a non-standard residue (UNK, MSE, a ligand): `parse_complex`
+drops it, logs it, and the features are defined over the standard residues
+(its atoms neither shield SASA nor make contacts).
 """
 import gzip
 import io
+import sys
 from collections import defaultdict
 
 import h5py
@@ -136,12 +140,23 @@ def parse_complex(blob, label):
     if chain_ids != list(CHAINS):
         raise ValueError(f"{label}: expected exactly chains A and B, found {chain_ids}")
     for chain in model:
+        if not list(chain):
+            raise ValueError(f"{label}: chain {chain.id} has no residues")
+        # Anything outside the standard 20 (AF3's UNK for selenocysteine, MSE,
+        # water, ligands) is dropped by identity, like clean_sequence does for
+        # sequences; a standard residue written as HETATM stays. Numbering keeps
+        # the gap. Both the SASA cache and every encoder parse here, so the
+        # dropped set is the same everywhere.
+        dropped = [res for res in chain if not is_aa(res, standard=True)]
+        for res in dropped:
+            chain.detach_child(res.id)
+        if dropped:
+            print(f"{label}: chain {chain.id} dropped {len(dropped)} non-standard residue(s): "
+                  + ", ".join(f"{r.get_resname()} {r.id[1]}" for r in dropped), file=sys.stderr)
         residues = list(chain)
         if not residues:
-            raise ValueError(f"{label}: chain {chain.id} has no residues")
+            raise ValueError(f"{label}: chain {chain.id} has no standard amino acid")
         for res in residues:
-            if not is_aa(res, standard=True) or res.id[0] != " ":
-                raise ValueError(f"{label}: chain {chain.id} residue {res.id} {res.get_resname()} is not a standard amino acid")
             missing = [name for name in BACKBONE if name not in res]
             if missing:
                 raise ValueError(f"{label}: chain {chain.id} residue {res.id} lacks backbone atom(s) {missing}")

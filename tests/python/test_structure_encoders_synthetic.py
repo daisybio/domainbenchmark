@@ -274,3 +274,24 @@ def test_insertion_codes_rejected_for_bands():
     chain.add(Residue((" ", 10, "A"), "ALA", " "))
     with pytest.raises(ValueError, match="insertion codes"):
         su.residue_numbers(chain)
+
+
+# ------------------------------------------------------------- parse_complex
+
+
+def test_parse_complex_drops_nonstandard_keeps_hetatm_standard(capsys):
+    """AF3 writes selenocysteine as HETATM UNK: dropped, gap kept; a standard HETATM residue stays."""
+    residues = _chain("A", [0.0, 4.0, 8.0], 0.0) + _chain("B", [0.0, 4.0], 6.0)
+    residues[1] = (residues[1][0], residues[1][1], "UNK", residues[1][3])
+    lines, serial = [], 1
+    for i, (chain, resseq, resname, atoms) in enumerate(residues):
+        for name, xyz in atoms.items():
+            line = _line(serial, name, resname, chain, resseq, xyz)
+            lines.append("HETATM" + line[6:] if i in (1, 3) else line)
+            serial += 1
+    blob = np.frombuffer(gzip.compress(("\n".join(lines) + "\nEND\n").encode(), mtime=0), dtype=np.uint8)
+    a, b = su.parse_complex(blob, "sec")
+    assert [r.id[1] for r in a] == [1, 3]
+    assert [r.get_resname() for r in b] == ["ALA", "ALA"] and b.child_list[0].id[0] == "H_ALA"
+    assert "chain A dropped 1 non-standard residue(s): UNK 2" in capsys.readouterr().err
+    su.compute_sasa(a, b)

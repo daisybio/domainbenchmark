@@ -99,13 +99,18 @@ def _nonstandard(group, dataset, lines):
                             for ln in lines]
 
 
+def _nonstandard_chain(group, dataset, lines):
+    return group, dataset, [ln[:17] + "UNK" + ln[20:] if ln.startswith("ATOM") and ln[21] == "A" else ln
+                            for ln in lines]
+
+
 def _drop_backbone_o(group, dataset, lines):
     return group, dataset, [ln for ln in lines if not (ln.startswith("ATOM") and ln[12:16].strip() == "O")]
 
 
 @pytest.mark.parametrize("transform, message", [
     (_extra_chain, "expected exactly chains A and B"),
-    (_nonstandard, "MSE is not a standard amino acid"),
+    (_nonstandard_chain, "chain A has no standard amino acid"),
     (_drop_backbone_o, "lacks backbone atom"),
 ])
 def test_malformed_complex(tmp_path, transform, message):
@@ -113,6 +118,13 @@ def test_malformed_complex(tmp_path, transform, message):
     _rewrite_structures(STRUCTURES, broken, transform)
     rc, report = run(tmp_path, structures=broken)
     assert rc == 1 and message in report
+
+
+def test_nonstandard_residue_is_dropped(tmp_path):
+    one_mse = tmp_path / "structures.h5"
+    _rewrite_structures(STRUCTURES, one_mse, _nonstandard)
+    rc, report = run(tmp_path, structures=one_mse)
+    assert rc == 0, report
 
 
 def test_cys_without_sg_only_matters_with_disulfide(tmp_path):
